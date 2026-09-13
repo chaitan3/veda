@@ -1,0 +1,9 @@
+/target
+/dist
+/data
+/.models
+/.pdfium
+*.db
+*.db-wal
+*.db-shm
+.env

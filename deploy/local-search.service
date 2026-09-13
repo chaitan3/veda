@@ -1,0 +1,34 @@
+# local-search systemd unit (template — adjust paths and user).
+#
+# The service is read-only; ingestion runs separately (see docs/PRODUCTION.md),
+# typically from a systemd timer or cron.
+
+[Unit]
+Description=local-search (text + image search service)
+Documentation=file:/opt/local-search/docs/PRODUCTION.md
+After=network.target
+
+[Service]
+Type=simple
+User=locals
+Group=locals
+WorkingDirectory=/opt/local-search
+EnvironmentFile=/opt/local-search/.env
+ExecStart=/opt/local-search/local-search serve
+Restart=on-failure
+RestartSec=2
+
+# All service state is the SQLite database (absolute path in LS_DB_PATH).
+ReadWritePaths=/var/lib/local-search
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
