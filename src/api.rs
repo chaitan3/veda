@@ -260,7 +260,7 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
     let documents = store.count_documents().await.map_err(|e| e.to_string())?;
     let chunks = store.count_chunks().await.map_err(|e| e.to_string())?;
     let corpus_version = store.corpus_version().await.map_err(|e| e.to_string())?;
-    let pipeline_version = store.pipeline_version().await.map_err(|e| e.to_string())?;
+    let fp = pipeline.fingerprints();
     Ok(serde_json::json!({
         "status": "ok",
         "embedder": pipeline.embedder().id(),
@@ -271,7 +271,11 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
         "documents": documents,
         "chunks": chunks,
         "corpus_version": corpus_version,
-        "pipeline_version": pipeline_version,
+        "fingerprints": {
+            "extract": fp.extract,
+            "text_embed": fp.text_embed,
+            "image_embed": fp.image_embed,
+        },
     }))
 }
 
@@ -410,10 +414,8 @@ async fn search_image(
     }
 }
 
-/// Serve an image chunk's bytes from its source document.
-///
-/// Nothing is stored: a standalone image chunk points at its source file. (PDF
-/// figure chunks will render from `locator` here once figure extraction lands.)
+/// Serve an image chunk's bytes from its source document (standalone image
+/// files only; nothing is stored).
 async fn media(State(state): State<AppState>, Path(chunk_id): Path<String>) -> Response {
     let store = state.pipeline.store();
     let chunk = match store.get_chunk(&chunk_id).await {

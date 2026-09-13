@@ -1,6 +1,6 @@
 # local-search — production notes
 
-Phase 0 deployment: a single CLI/service binary over a SQLite database. Ingest
+Deployment notes: a single CLI/service binary over a SQLite database. Ingest
 runs as a CLI; the service only reads.
 
 ## Package
@@ -18,7 +18,7 @@ The packaged directory is the service's **working directory** — docling resolv
 |---|---|---|
 | `local-search` | yes | the product binary |
 | `libonnxruntime_providers_*.so` | GPU only | next to the binary; CPU runs fine without them (logs a fallback) |
-| `.models/` | yes | ~640 MB; docling assets + ONNX embedder (+ ~700 MB SigLIP2 towers when the image channel is on) |
+| `.models/` | yes | ~2 GB: docling assets, ONNX text embedder, SigLIP2 towers, CodeFormulaV2 |
 | `.pdfium/lib/libpdfium.so` | yes (PDF) | ~7.5 MB |
 | SQLite DB (`*.db`, `-wal`, `-shm`) | yes | all state |
 | CUDA runtime + cuDNN 9 | GPU only | must match the ONNX Runtime build |
@@ -32,9 +32,10 @@ cargo build --release --no-default-features --features docling-extract,onnx-embe
 ## Models
 
 ```bash
-./local-search download-models              # docling assets + bge-small embedder + SigLIP2
+./local-search download-models              # docling + bge-small + SigLIP2 + CodeFormulaV2
 ./local-search download-models --no-embed   # skip the 133 MB text embedder
 ./local-search download-models --no-image   # skip the ~700 MB SigLIP2 towers
+./local-search download-models --no-enrich  # skip the ~0.8 GB CodeFormulaV2 models
 ```
 
 Idempotent. Mirrors: `DOCLING_RS_MODELS_URL`, `LS_ONNX_MODELS_URL`, `LS_IMAGE_MODELS_URL`.
@@ -112,9 +113,11 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 | `/documents` | ingest source | mount read-only |
 | `/config` | optional `.env` | Docker env vars take precedence |
 
-- **Models** are not baked in; the entrypoint runs `download-models` when the
-  volume is empty. Set `LS_SKIP_MODEL_DOWNLOAD=1` for a pre-provisioned volume,
-  a remote-VLM (`LS_EXTRACT_PIPELINE=vlm`) or `LS_EMBED_PROVIDER=llamacpp` setup.
+- **Models** are not baked in; the entrypoint runs `download-models` on every
+  start (idempotent — files already present are skipped without network, so it
+  also pulls models added by newer versions). The first run pulls ~2 GB. Set
+  `LS_SKIP_MODEL_DOWNLOAD=1` for a pre-provisioned volume, a remote-VLM
+  (`LS_EXTRACT_PIPELINE=vlm`) or `LS_EMBED_PROVIDER=llamacpp` setup.
 - **Non-root**: the entrypoint runs as root only to prepare volumes, then drops
   to `PUID:PGID` (default `1000:1000`). Match a bind-mounted host directory with
   `docker build --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .`
@@ -148,24 +151,30 @@ the fallback is logged. Force either side with `DOCLING_RS_EP=cuda|cpu`.
 
 ## Upgrades and the database
 
-There is **no need to rebuild the database from scratch** for a new pipeline
-(such as Phase 1 adding image/caption channels):
+There is **no need to rebuild the database from scratch** for a new pipeline:
 
 - Schema changes are additive (`CREATE TABLE IF NOT EXISTS`), applied
   automatically on startup.
-- The database records a `PIPELINE_VERSION` (`meta` table, shown by
-  `local-search stats`). When the binary's version differs, `ingest`
-  automatically **reprocesses the whole corpus** instead of skipping via the
-  content hash. That is the upgrade path: ship the new binary, run `ingest`.
-- `ingest --force` does the same on demand.
+- Each document records a fingerprint per ingest stage (`extract`,
+  `text_embed`, `image_embed`) in `document_stages`; the current fingerprints are
+  shown by `local-search stats` and `/api/stats`. `ingest` re-runs **only the
+  stages whose fingerprint changed**, per document. So switching extraction
+  (e.g. onnx → vlm) re-extracts text but leaves image embeddings untouched, and
+  changing the text embedder re-embeds text only.
+- `ingest --stages extract|text_embed|image_embed` targets specific stages;
+  `ingest --force` forces just the targeted ones.
 
-The one operation that genuinely requires a rebuild is changing the **text
-embedding model or dimension**: vectors cannot be mixed, so the index is
-resized and the corpus must be re-ingested. Phase 1 adds a *separate* image
-vector space, so it does not disturb existing text vectors.
+Changing an embedding **dimension** is structural: the affected `vec0` table is
+dropped and recreated, and that stage re-runs for every document. The text and
+image spaces are independent, so a text-dimension change does not disturb image
+vectors (or vice versa).
 
-## Not in Phase 0
+Models are identified via `<models_dir>/models.lock` (sha256), written by
+`download-models`, with a `path:size` fallback — so swapping a model file is
+detected as a change.
 
-No media/thumbnail serving, no metrics endpoint, no graceful-shutdown hook, no
-folder watcher, static API keys only, no reranker/Multi-Query/HyDE, no eval
-harness. See the README for the roadmap.
+## Not yet
+
+No PDF figure extraction, no image captioning, no metrics endpoint, no
+graceful-shutdown hook, no folder watcher, static API keys only, no
+reranker/Multi-Query/HyDE, no eval harness.

@@ -6,6 +6,7 @@ use crate::config::{ChunkerKind, Config, ExtractPipeline};
 use crate::convert;
 use crate::embed::image::ImageEmbedder;
 use crate::embed::{self, Embedder};
+use crate::fingerprint::{self, Fingerprints};
 use crate::metrics::{ProcessingMetrics, Timings};
 use crate::model::{Chunk, Document, RetrievalMode, Scored, content_hash, stem};
 use crate::retrieve::Retriever;
@@ -19,11 +20,60 @@ use std::time::Instant;
 /// Largest embedding batch sent at once.
 const EMBED_BATCH: usize = 32;
 
-/// Bump when the ingest pipeline changes what it produces (new extraction,
-/// chunking, or embedding channels). Ingest reprocesses the whole corpus when
-/// the stored version differs, so adding Phase 1's image/caption channels
-/// upgrades an existing database without a reset.
-pub const PIPELINE_VERSION: u32 = 1;
+/// Which ingest stages a run targets. Reprocessing is scoped to the stages
+/// whose fingerprint changed; `--force` forces only the targeted ones.
+#[derive(Debug, Clone, Copy)]
+pub struct StageSet {
+    pub extract: bool,
+    pub text_embed: bool,
+    pub image_embed: bool,
+}
+
+impl StageSet {
+    /// Every stage (the default when no `--stages` is given).
+    pub fn all() -> Self {
+        StageSet {
+            extract: true,
+            text_embed: true,
+            image_embed: true,
+        }
+    }
+
+    pub fn wants(&self, stage: &str) -> bool {
+        match stage {
+            "extract" => self.extract,
+            "text_embed" => self.text_embed,
+            "image_embed" => self.image_embed,
+            _ => false,
+        }
+    }
+
+    /// Parse a comma-separated stage list; empty or `all` means every stage.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() || spec.eq_ignore_ascii_case("all") {
+            return Ok(Self::all());
+        }
+        let mut set = StageSet {
+            extract: false,
+            text_embed: false,
+            image_embed: false,
+        };
+        for part in spec.split(',') {
+            match part.trim() {
+                "extract" => set.extract = true,
+                "text_embed" => set.text_embed = true,
+                "image_embed" => set.image_embed = true,
+                other => {
+                    return Err(Error::config(format!(
+                        "unknown stage '{other}' (extract|text_embed|image_embed)"
+                    )));
+                }
+            }
+        }
+        Ok(set)
+    }
+}
 
 /// What happened to one document during ingestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +115,8 @@ pub struct Pipeline {
     image: Option<Arc<dyn ImageEmbedder>>,
     store: Arc<dyn VectorStore>,
     chunker: Chunker,
+    /// Current per-stage fingerprints (compared against each document's rows).
+    fingerprints: Fingerprints,
 }
 
 impl Pipeline {
@@ -74,13 +126,20 @@ impl Pipeline {
         let image = embed::image::from_config(cfg)?;
         let store = store::from_config(cfg).await?;
         let chunker = Chunker::from_config(cfg)?;
+        let fingerprints = fingerprint::compute(cfg);
         Ok(Pipeline {
             cfg: cfg.clone(),
             embedder,
             image,
             store,
             chunker,
+            fingerprints,
         })
+    }
+
+    /// The current per-stage fingerprints.
+    pub fn fingerprints(&self) -> &Fingerprints {
+        &self.fingerprints
     }
 
     pub fn config(&self) -> &Config {
@@ -120,24 +179,17 @@ impl Pipeline {
     ///
     /// With `sync`, stored documents whose source files no longer exist are
     /// removed afterwards (mark-and-sweep).
-    pub async fn ingest_all(&self, sync: bool, force: bool) -> Result<IngestReport> {
+    pub async fn ingest_all(
+        &self,
+        sync: bool,
+        force: bool,
+        stages: StageSet,
+    ) -> Result<IngestReport> {
         let src = source::from_config(&self.cfg);
         let roots = src.canonical_roots()?;
         let refs = src.list()?;
         let mut report = IngestReport::default();
         let mut current: Vec<String> = Vec::with_capacity(refs.len());
-
-        // A pipeline change (e.g. Phase 1 adding image/caption channels) makes
-        // every stored document stale, so ignore content-hash dedup for this run.
-        let stored_version = self.store.pipeline_version().await?;
-        if stored_version != PIPELINE_VERSION {
-            tracing::info!(
-                from = stored_version,
-                to = PIPELINE_VERSION,
-                "ingest pipeline changed; reprocessing all documents"
-            );
-        }
-        let force = force || stored_version != PIPELINE_VERSION;
 
         for r in &refs {
             current.push(r.uri.clone());
@@ -154,7 +206,9 @@ impl Pipeline {
                     continue;
                 }
             };
-            let outcome = self.ingest_bytes(&r.uri, &r.name, bytes, force).await;
+            let outcome = self
+                .ingest_bytes(&r.uri, &r.name, bytes, force, stages)
+                .await;
             let secs = started.elapsed().as_secs_f64();
             let stats = report.by_type.entry(kind).or_default();
             stats.secs += secs;
@@ -192,20 +246,19 @@ impl Pipeline {
             self.store.bump_corpus_version().await?;
         }
 
-        self.store.set_pipeline_version(PIPELINE_VERSION).await?;
         Ok(report)
     }
 
-    /// Ingest a single document from in-memory bytes.
-    ///
-    /// Conversion, chunking and embedding all run before any database mutation,
-    /// so a failed conversion leaves the store untouched.
+    /// Ingest a single document, running only the stages that are stale (or
+    /// forced). Unchanged content keeps its document id, so per-document stage
+    /// rows and content-addressed image vectors persist across runs.
     pub async fn ingest_bytes(
         &self,
         source_uri: &str,
         name: &str,
         bytes: Vec<u8>,
         force: bool,
+        stages: StageSet,
     ) -> Result<IngestOutcome> {
         let started = Instant::now();
         let method = self.method_label(name);
@@ -220,126 +273,154 @@ impl Pipeline {
         );
 
         let hash = content_hash(&bytes);
-        if !force && self.store.find_document_by_hash(&hash).await?.is_some() {
-            tracing::info!(name = name, "unchanged; skipping");
+        let fp = &self.fingerprints;
+
+        // Unchanged content reuses the existing document (its id, stage rows and
+        // content-addressed image vectors); changed content replaces the prior
+        // version.
+        let doc_id = match self.store.find_document_by_hash(&hash).await? {
+            Some(id) => id,
+            None => {
+                self.store.delete_documents_by_source(source_uri).await?;
+                let doc = Document::new(source_uri, stem(name), format!("pending:{hash}"));
+                self.store.upsert_document(&doc).await?;
+                doc.id
+            }
+        };
+
+        let force_extract = force && stages.wants("extract");
+        let force_text = force && stages.wants("text_embed");
+        let force_image = force && stages.wants("image_embed");
+        let mut did_work = false;
+        let mut n_chunks = 0usize;
+
+        // --- extract: convert + chunk (coupled, since we cache no conversion)
+        let has_text = self.store.count_text_chunks_for(&doc_id).await? > 0;
+        let want_extract = stages.wants("extract") || (stages.wants("text_embed") && !has_text);
+        let extract_fp = self.store.document_stage(&doc_id, "extract").await?;
+        let mut extract_ran = false;
+        if want_extract
+            && (force_extract || extract_fp.as_deref() != Some(fp.extract.as_str()) || !has_text)
+        {
+            let t = Instant::now();
+            let converted = convert::convert(&self.cfg, name, &bytes)?;
+            let parse_secs = t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let text_chunks = self.chunk_converted(&doc_id, &converted)?;
+            let chunk_secs = t.elapsed().as_secs_f64();
+            self.store
+                .replace_text_chunks(&doc_id, &text_chunks)
+                .await?;
+            self.store
+                .set_document_stage(&doc_id, "extract", &fp.extract)
+                .await?;
+            self.store
+                .clear_document_stage(&doc_id, "text_embed")
+                .await?;
+
+            let words = converted.markdown.split_whitespace().count();
+            let title = first_heading(&converted.markdown).unwrap_or_else(|| stem(name));
+            let metrics = ProcessingMetrics::compute(
+                bytes.len() as u64,
+                converted.pages,
+                words,
+                text_chunks.len(),
+                words,
+                Timings {
+                    parse_secs,
+                    chunk_secs,
+                    embed_secs: 0.0,
+                },
+            );
+            let mut doc = self
+                .store
+                .get_document(&doc_id)
+                .await?
+                .ok_or_else(|| Error::store("document vanished mid-ingest"))?;
+            doc.title = title;
+            doc.hash = hash.clone();
+            doc.metadata = serde_json::json!({
+                "source": source_uri,
+                "metrics": metrics,
+                "markdown": converted.markdown,
+            });
+            self.store.upsert_document(&doc).await?;
+
+            extract_ran = true;
+            did_work = true;
+            n_chunks += text_chunks.len();
+        }
+
+        // --- text_embed: (re)embed the stored text chunks in place
+        let text_fp = self.store.document_stage(&doc_id, "text_embed").await?;
+        let run_text = (stages.wants("text_embed") || extract_ran)
+            && (extract_ran || force_text || text_fp.as_deref() != Some(fp.text_embed.as_str()));
+        if run_text {
+            let chunks = self.store.text_chunks(&doc_id).await?;
+            let mut pairs: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
+            for batch in chunks.chunks(EMBED_BATCH) {
+                let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+                let vectors = self.embedder.embed(&texts).await?;
+                if vectors.len() != batch.len() {
+                    return Err(Error::embedding(format!(
+                        "embedding count mismatch: sent {}, got {}",
+                        batch.len(),
+                        vectors.len()
+                    )));
+                }
+                for (chunk, vector) in batch.iter().zip(vectors) {
+                    pairs.push((chunk.id.clone(), vector));
+                }
+            }
+            self.store.set_text_vectors(&pairs).await?;
+            self.store
+                .set_document_stage(&doc_id, "text_embed", &fp.text_embed)
+                .await?;
+            did_work = true;
+        }
+
+        // --- image_embed: one content-addressed image chunk for an image file
+        if let Some(embedder) = &self.image
+            && is_image_name(name)
+        {
+            let image_fp = self.store.document_stage(&doc_id, "image_embed").await?;
+            if stages.wants("image_embed")
+                && (force_image || image_fp.as_deref() != Some(fp.image_embed.as_str()))
+            {
+                let mut vectors = embedder.embed_images(std::slice::from_ref(&bytes)).await?;
+                let vector = vectors
+                    .pop()
+                    .ok_or_else(|| Error::embedding("image embedder returned no vector"))?;
+                // Content-addressed id: stable across reprocessing, so the
+                // image vector is reused rather than recomputed on text changes.
+                let mut chunk = Chunk::new(&doc_id, 0, "", 0);
+                chunk.id = hash.clone();
+                chunk.kind = crate::model::ChunkKind::Image;
+                chunk.ordinal = self.store.count_text_chunks_for(&doc_id).await? as i64;
+                chunk.metadata = serde_json::json!({ "mime": image_mime(name) });
+                self.store.upsert_image_chunk(&chunk, &vector).await?;
+                self.store
+                    .set_document_stage(&doc_id, "image_embed", &fp.image_embed)
+                    .await?;
+                did_work = true;
+                n_chunks += 1;
+            }
+        }
+
+        if !did_work {
+            tracing::info!(name = name, "up to date; skipping");
             return Ok(IngestOutcome::Skipped);
         }
-        let file_bytes = bytes.len() as u64;
 
-        // The document row is written with a *pending* hash first and the real
-        // hash only after every chunk is stored, so an interrupted ingest can
-        // never satisfy the dedup check above.
-        let mut doc = Document::new(source_uri, stem(name), format!("pending:{hash}"));
-
-        // --- conversion
-        let t = Instant::now();
-        let converted = convert::convert(&self.cfg, name, &bytes)?;
-        let parse_secs = t.elapsed().as_secs_f64();
-
-        // --- chunking
-        let t = Instant::now();
-        let mut chunks = self.chunk_converted(&doc.id, &converted)?;
-        let chunk_secs = t.elapsed().as_secs_f64();
-
-        // --- embedding
-        let t = Instant::now();
-        let mut embedded_words = 0usize;
-        for batch in chunks.chunks_mut(EMBED_BATCH) {
-            let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-            let vectors = self.embedder.embed(&texts).await?;
-            if vectors.len() != batch.len() {
-                return Err(Error::embedding(format!(
-                    "embedding count mismatch: sent {}, got {}",
-                    batch.len(),
-                    vectors.len()
-                )));
-            }
-            for (chunk, vector) in batch.iter_mut().zip(vectors) {
-                embedded_words += chunk.text.split_whitespace().count();
-                chunk.embedding = Some(vector);
-            }
-        }
-        let embed_secs = t.elapsed().as_secs_f64();
-
-        // --- image chunk (standalone image files only, for now)
-        let t = Instant::now();
-        let image_chunks = self
-            .image_chunks(&doc.id, name, &bytes, chunks.len())
-            .await?;
-        let image_secs = t.elapsed().as_secs_f64();
-
-        // --- persist (replace any prior version of this source)
-        let words = converted.markdown.split_whitespace().count();
-        let title = first_heading(&converted.markdown).unwrap_or_else(|| stem(name));
-        let metrics = ProcessingMetrics::compute(
-            file_bytes,
-            converted.pages,
-            words,
-            chunks.len() + image_chunks.len(),
-            embedded_words,
-            Timings {
-                parse_secs,
-                chunk_secs,
-                embed_secs,
-            },
-        );
-        self.store.delete_documents_by_source(source_uri).await?;
-        self.store.upsert_document(&doc).await?;
-        let n = chunks.len();
-        let n_images = image_chunks.len();
-        self.store.insert_chunks(&chunks).await?;
-        self.store.insert_image_chunks(&image_chunks).await?;
-
-        doc.title = title;
-        doc.hash = hash;
-        doc.metadata = serde_json::json!({
-            "source": source_uri,
-            "metrics": metrics,
-            "markdown": converted.markdown,
-        });
-        self.store.upsert_document(&doc).await?;
         self.store.bump_corpus_version().await?;
-
         tracing::info!(
             name = name,
             uri = source_uri,
-            pages = ?converted.pages,
-            words,
-            chunks = n,
-            images = n_images,
-            image_secs,
-            parse_wps = metrics.parse_words_per_sec(),
-            embed_wps = metrics.embed_words_per_sec(),
+            chunks = n_chunks,
             secs = started.elapsed().as_secs_f64(),
             "ingested"
         );
-        Ok(IngestOutcome::Ingested(n + n_images))
-    }
-
-    /// Build the image chunk for a standalone image file, when the image channel
-    /// is enabled. PDFs and other formats are not figure-extracted yet.
-    async fn image_chunks(
-        &self,
-        doc_id: &str,
-        name: &str,
-        bytes: &[u8],
-        ordinal: usize,
-    ) -> Result<Vec<Chunk>> {
-        let Some(embedder) = &self.image else {
-            return Ok(Vec::new());
-        };
-        if !is_image_name(name) {
-            return Ok(Vec::new());
-        }
-        let mut chunk = Chunk::new(doc_id, ordinal as i64, "", 0);
-        chunk.kind = crate::model::ChunkKind::Image;
-        chunk.metadata = serde_json::json!({ "mime": image_mime(name) });
-        let mut vectors = embedder.embed_images(&[bytes.to_vec()]).await?;
-        let vector = vectors
-            .pop()
-            .ok_or_else(|| Error::embedding("image embedder returned no vector"))?;
-        chunk.embedding = Some(vector);
-        Ok(vec![chunk])
+        Ok(IngestOutcome::Ingested(n_chunks))
     }
 
     /// Human-readable extraction method for a file (text passthrough vs a
@@ -443,5 +524,23 @@ mod tests {
             Some("Real Title".into())
         );
         assert_eq!(first_heading("no headings here"), None);
+    }
+
+    #[test]
+    fn stage_set_parsing() {
+        let all = StageSet::all();
+        assert!(all.extract && all.text_embed && all.image_embed);
+
+        let s = StageSet::parse("text_embed").unwrap();
+        assert!(!s.extract && s.text_embed && !s.image_embed);
+
+        let s = StageSet::parse("extract,image_embed").unwrap();
+        assert!(s.extract && !s.text_embed && s.image_embed);
+
+        // Empty and "all" both mean every stage.
+        assert!(StageSet::parse("").unwrap().extract);
+        assert!(StageSet::parse("all").unwrap().image_embed);
+
+        assert!(StageSet::parse("nope").is_err());
     }
 }

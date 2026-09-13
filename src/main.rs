@@ -3,6 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use local_search::api::AppState;
+use local_search::pipeline::StageSet;
 use local_search::{Config, Pipeline, RetrievalMode};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -30,9 +31,13 @@ enum Command {
         /// (scoped to the roots given on this command line).
         #[arg(long)]
         sync: bool,
-        /// Reprocess every document, ignoring the content-hash dedup.
+        /// Force the targeted stages to re-run, ignoring their fingerprints.
         #[arg(long)]
         force: bool,
+        /// Comma-separated stages to run (default: all):
+        /// extract | text_embed | image_embed.
+        #[arg(long, value_name = "STAGES")]
+        stages: Option<String>,
     },
     /// Run a search query.
     Query {
@@ -49,7 +54,8 @@ enum Command {
     Stats,
     /// Remove documents left with no chunks.
     Prune,
-    /// Download the default local model set (docling assets + ONNX embedder).
+    /// Download the default model set (docling assets, text + image embedders,
+    /// code/formula).
     DownloadModels {
         /// Skip the local ONNX text embedder (bge-small-en-v1.5).
         #[arg(long)]
@@ -57,6 +63,9 @@ enum Command {
         /// Skip the SigLIP2 image+text towers (~700 MB).
         #[arg(long)]
         no_image: bool,
+        /// Skip the CodeFormulaV2 code/formula models (~0.8 GB).
+        #[arg(long)]
+        no_enrich: bool,
     },
     /// Serve the read-only search API.
     Serve,
@@ -85,10 +94,19 @@ async fn main() -> anyhow::Result<()> {
             println!("initialized database: {}", cfg.db_path);
         }
 
-        Command::Ingest { paths, sync, force } => {
+        Command::Ingest {
+            paths,
+            sync,
+            force,
+            stages,
+        } => {
             if !paths.is_empty() {
                 cfg.source_paths = paths;
             }
+            let stages = match stages {
+                Some(spec) => StageSet::parse(&spec)?,
+                None => StageSet::all(),
+            };
             let pipeline = Pipeline::from_config(&cfg).await?;
             println!("source:     {}", cfg.source_paths.join(", "));
             println!(
@@ -99,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let started = std::time::Instant::now();
-            let report = pipeline.ingest_all(sync, force).await?;
+            let report = pipeline.ingest_all(sync, force, stages).await?;
             let wall = started.elapsed().as_secs_f64();
 
             println!(
@@ -149,19 +167,11 @@ async fn main() -> anyhow::Result<()> {
             }
             for (i, hit) in hits.iter().enumerate() {
                 let snippet: String = hit.chunk.text.chars().take(240).collect();
-                let page = hit
-                    .chunk
-                    .locator
-                    .as_ref()
-                    .and_then(|l| l.page)
-                    .map(|p| format!(" p.{p}"))
-                    .unwrap_or_default();
                 println!(
-                    "{:>2}. [{:.4}] {}{}  ({})",
+                    "{:>2}. [{:.4}] {}  ({})",
                     i + 1,
                     hit.score,
                     hit.chunk.kind.as_str(),
-                    page,
                     hit.chunk.doc_id
                 );
                 println!("    {snippet}");
@@ -186,7 +196,11 @@ async fn main() -> anyhow::Result<()> {
             println!("documents:      {}", store.count_documents().await?);
             println!("chunks:         {}", store.count_chunks().await?);
             println!("corpus version: {}", store.corpus_version().await?);
-            println!("pipeline ver.:  {}", store.pipeline_version().await?);
+            let fp = pipeline.fingerprints();
+            println!(
+                "fingerprints:   extract={} text_embed={} image_embed={}",
+                fp.extract, fp.text_embed, fp.image_embed
+            );
         }
 
         Command::Prune => {
@@ -195,8 +209,12 @@ async fn main() -> anyhow::Result<()> {
             println!("removed {removed} document(s) with no chunks");
         }
 
-        Command::DownloadModels { no_embed, no_image } => {
-            local_search::download::download_models(&cfg, !no_embed, !no_image).await?;
+        Command::DownloadModels {
+            no_embed,
+            no_image,
+            no_enrich,
+        } => {
+            local_search::download::download_models(&cfg, !no_embed, !no_image, !no_enrich).await?;
         }
 
         Command::Serve => {

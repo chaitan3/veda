@@ -1,5 +1,6 @@
 //! End-to-end store test: proves the bundled SQLite has FTS5 and that
-//! keyword + vector search work over inserted chunks.
+//! keyword + vector search work over inserted chunks, and that the text and
+//! image spaces stay separate.
 
 use local_search::embed::{Embedder, hash::HashEmbedder};
 use local_search::model::{Chunk, ChunkKind, Document};
@@ -19,6 +20,32 @@ async fn temp_store() -> SqliteStore {
     store
 }
 
+/// Insert text chunks and their text-space vectors.
+async fn insert_text(store: &SqliteStore, doc: &Document, texts: &[&str], dim: usize) {
+    let embedder = HashEmbedder::new(dim);
+    let mut chunks = Vec::new();
+    for (i, text) in texts.iter().enumerate() {
+        chunks.push(Chunk::new(
+            &doc.id,
+            i as i64,
+            *text,
+            text.split_whitespace().count() as i64,
+        ));
+    }
+    store.replace_text_chunks(&doc.id, &chunks).await.unwrap();
+    let mut pairs = Vec::new();
+    for (chunk, text) in chunks.iter().zip(texts.iter()) {
+        let vector = embedder
+            .embed(&[text.to_string()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        pairs.push((chunk.id.clone(), vector));
+    }
+    store.set_text_vectors(&pairs).await.unwrap();
+}
+
 #[tokio::test]
 async fn fts5_and_vector_search() {
     let store = temp_store().await;
@@ -31,25 +58,7 @@ async fn fts5_and_vector_search() {
 
     let doc = Document::new("file:///sample.txt", "sample", "deadbeef");
     store.upsert_document(&doc).await.unwrap();
-
-    let mut chunks = Vec::new();
-    for (i, text) in texts.iter().enumerate() {
-        let mut chunk = Chunk::new(
-            &doc.id,
-            i as i64,
-            *text,
-            text.split_whitespace().count() as i64,
-        );
-        let vector = embedder
-            .embed(&[text.to_string()])
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        chunk.embedding = Some(vector);
-        chunks.push(chunk);
-    }
-    store.insert_chunks(&chunks).await.unwrap();
+    insert_text(&store, &doc, &texts, 64).await;
     assert_eq!(store.count_chunks().await.unwrap(), 3);
 
     // FTS5 keyword search
@@ -71,10 +80,13 @@ async fn fts5_and_vector_search() {
     let before = store.corpus_version().await.unwrap();
     assert_eq!(store.bump_corpus_version().await.unwrap(), before + 1);
 
-    // Pipeline version round-trips (used to trigger re-ingest on upgrades).
-    assert_eq!(store.pipeline_version().await.unwrap(), 0);
-    store.set_pipeline_version(7).await.unwrap();
-    assert_eq!(store.pipeline_version().await.unwrap(), 7);
+    // Generic meta round-trips (stage fingerprints live here).
+    assert_eq!(store.get_meta("fp.extract").await.unwrap(), None);
+    store.set_meta("fp.extract", "abc").await.unwrap();
+    assert_eq!(
+        store.get_meta("fp.extract").await.unwrap().as_deref(),
+        Some("abc")
+    );
 
     // Deleting the source removes its chunks and FTS rows.
     store
@@ -108,10 +120,13 @@ async fn image_space_is_separate_from_text() {
     store.upsert_document(&doc).await.unwrap();
 
     let mut image = Chunk::new(&doc.id, 0, "", 0);
+    image.id = "img-hash".to_string(); // content-addressed in the real pipeline
     image.kind = ChunkKind::Image;
     image.metadata = serde_json::json!({ "mime": "image/png" });
-    image.embedding = Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    store.insert_image_chunks(&[image.clone()]).await.unwrap();
+    store
+        .upsert_image_chunk(&image, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        .await
+        .unwrap();
 
     // It is retrievable by id and by image-space KNN.
     let got = store.get_chunk(&image.id).await.unwrap().unwrap();
@@ -135,6 +150,7 @@ async fn image_space_is_separate_from_text() {
             .is_empty()
     );
 }
+
 #[tokio::test]
 async fn deleting_a_document_purges_its_image_vectors() {
     let mut path = std::env::temp_dir();
@@ -148,10 +164,10 @@ async fn deleting_a_document_purges_its_image_vectors() {
         .unwrap();
     store.migrate().await.unwrap();
 
-    let image_chunk = |doc_id: &str, vector: Vec<f32>| {
+    let image_chunk = |doc_id: &str| {
         let mut c = Chunk::new(doc_id, 0, "", 0);
+        c.id = format!("img:{doc_id}");
         c.kind = ChunkKind::Image;
-        c.embedding = Some(vector);
         c
     };
 
@@ -159,10 +175,10 @@ async fn deleting_a_document_purges_its_image_vectors() {
     let a = Document::new("file:///a.png", "a", "ha");
     store.upsert_document(&a).await.unwrap();
     store
-        .insert_image_chunks(&[image_chunk(
-            &a.id,
-            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        )])
+        .upsert_image_chunk(
+            &image_chunk(&a.id),
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
         .await
         .unwrap();
     store.delete_document(&a.id).await.unwrap();
@@ -171,10 +187,10 @@ async fn deleting_a_document_purges_its_image_vectors() {
     let b = Document::new("file:///b.png", "b", "hb");
     store.upsert_document(&b).await.unwrap();
     store
-        .insert_image_chunks(&[image_chunk(
-            &b.id,
-            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        )])
+        .upsert_image_chunk(
+            &image_chunk(&b.id),
+            &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
         .await
         .unwrap();
 
@@ -187,6 +203,7 @@ async fn deleting_a_document_purges_its_image_vectors() {
     assert_eq!(hits.len(), 1, "A's image vector must have been purged");
     assert_eq!(hits[0].chunk.doc_id, b.id);
 }
+
 #[tokio::test]
 async fn document_and_chunk_lookups() {
     let store = temp_store().await;
@@ -199,7 +216,7 @@ async fn document_and_chunk_lookups() {
         .enumerate()
         .map(|(i, t)| Chunk::new(&doc.id, i as i64, *t, 1))
         .collect();
-    store.insert_chunks(&chunks).await.unwrap();
+    store.replace_text_chunks(&doc.id, &chunks).await.unwrap();
 
     // Single lookup.
     let got = store.get_document(&doc.id).await.unwrap().unwrap();
@@ -212,6 +229,16 @@ async fn document_and_chunk_lookups() {
     assert_eq!(map.len(), 1);
     assert!(map.contains_key(&doc.id));
     assert!(store.get_documents_by_ids(&[]).await.unwrap().is_empty());
+
+    // Text chunks are readable in order.
+    let read: Vec<String> = store
+        .text_chunks(&doc.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.text)
+        .collect();
+    assert_eq!(read, vec!["alpha", "beta", "gamma"]);
 
     // Chunk slice is ordered by ordinal and clamps out-of-range offsets.
     let page = store.get_chunks_range(&doc.id, 1, 2).await.unwrap();

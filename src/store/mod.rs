@@ -1,11 +1,11 @@
 //! Pluggable vector store.
 //!
-//! A store persists [`Document`]s (metadata) and their [`Chunk`]s (text +
-//! embedding) and answers dense vector search plus keyword (FTS5/BM25) search.
-//!
-//! Phase 0 ships the SQLite backend only. The trait is deliberately shaped like
-//! docling-rag's so the Phase 1 image space (a second vector table with its own
-//! dimensionality) can be added as additional methods rather than a redesign.
+//! A store persists [`Document`]s (metadata) and their [`Chunk`]s (text or
+//! image) and answers dense vector search in two spaces (text and image) plus
+//! keyword (FTS5/BM25) search. The ingest pipeline drives it stage by stage:
+//! `replace_text_chunks` + `set_text_vectors` for the text side,
+//! `upsert_image_chunk` for the image side, and `document_stage` rows to record
+//! which stage fingerprint each document was last built under.
 
 pub mod sqlite;
 
@@ -28,17 +28,29 @@ pub trait VectorStore: Send + Sync {
     /// Return the id of an existing document with this content hash, if any.
     async fn find_document_by_hash(&self, hash: &str) -> Result<Option<String>>;
 
-    /// Bulk-insert chunks (each must carry a populated `embedding`).
-    async fn insert_chunks(&self, chunks: &[Chunk]) -> Result<()>;
+    /// Replace a document's **text** chunks: drop its existing text chunks
+    /// (rows, FTS and text vectors) and insert the new ones (rows + FTS). The
+    /// text vectors are written separately by [`Self::set_text_vectors`].
+    async fn replace_text_chunks(&self, doc_id: &str, chunks: &[Chunk]) -> Result<()>;
 
-    /// Dense search: the `k` chunks whose embeddings are most cosine-similar.
+    /// Insert or replace text-space vectors for the given chunk ids.
+    async fn set_text_vectors(&self, pairs: &[(String, Vec<f32>)]) -> Result<()>;
+
+    /// A document's text chunks, ordered by `ordinal` (no vectors).
+    async fn text_chunks(&self, doc_id: &str) -> Result<Vec<Chunk>>;
+
+    /// Number of text chunks stored for one document.
+    async fn count_text_chunks_for(&self, doc_id: &str) -> Result<usize>;
+
+    /// Insert or replace an **image** chunk and its image-space vector. Image
+    /// chunk ids are content-addressed, so re-running this for the same image
+    /// is idempotent.
+    async fn upsert_image_chunk(&self, chunk: &Chunk, embedding: &[f32]) -> Result<()>;
+
+    /// Dense search in the text space.
     async fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>>;
 
-    /// Insert image chunks: their rows plus their vector in the **image space**
-    /// (no FTS row — image chunks carry no text in this phase).
-    async fn insert_image_chunks(&self, chunks: &[Chunk]) -> Result<()>;
-
-    /// Dense search in the image space (query vector from the image embedder).
+    /// Dense search in the image space.
     async fn image_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>>;
 
     /// Keyword search over the FTS5 index (BM25), best first.
@@ -47,7 +59,7 @@ pub trait VectorStore: Send + Sync {
     /// Total number of stored chunks.
     async fn count_chunks(&self) -> Result<usize>;
 
-    /// Number of chunks stored for one document.
+    /// Number of chunks stored for one document (any kind).
     async fn count_chunks_for(&self, doc_id: &str) -> Result<usize>;
 
     /// Total number of stored documents.
@@ -59,13 +71,10 @@ pub trait VectorStore: Send + Sync {
     /// Load a single document by id.
     async fn get_document(&self, doc_id: &str) -> Result<Option<Document>>;
 
-    /// Load several documents by id, keyed by id (one query, for hydrating
-    /// search hits without an N+1 lookup).
+    /// Load several documents by id, keyed by id.
     async fn get_documents_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Document>>;
 
     /// A contiguous slice of one document's chunks, ordered by `ordinal`.
-    /// `offset` is an ordinal-space index; out-of-range offsets yield an empty
-    /// slice rather than an error.
     async fn get_chunks_range(
         &self,
         doc_id: &str,
@@ -79,7 +88,7 @@ pub trait VectorStore: Send + Sync {
     /// Every stored `source_uri` (for `--sync` deletion sweeps).
     async fn all_source_uris(&self) -> Result<Vec<String>>;
 
-    /// Delete one document and all of its chunks.
+    /// Delete one document and all of its chunks, vectors and stage rows.
     async fn delete_document(&self, doc_id: &str) -> Result<()>;
 
     /// Delete every document (and chunks) originating from `source_uri`.
@@ -89,20 +98,29 @@ pub trait VectorStore: Send + Sync {
     async fn clear(&self) -> Result<()>;
 
     /// Monotonic corpus version, bumped by every successful ingest transaction.
-    /// The service polls this to invalidate warm caches across processes.
     async fn corpus_version(&self) -> Result<i64>;
 
     /// Increment and return the corpus version.
     async fn bump_corpus_version(&self) -> Result<i64>;
 
-    /// Version of the ingest pipeline that produced the current corpus.
-    /// Ingest reprocesses everything when this differs from the binary's
-    /// [`crate::pipeline::PIPELINE_VERSION`], so enabling new extraction /
-    /// embedding channels upgrades an existing database without a reset.
-    async fn pipeline_version(&self) -> Result<u32>;
+    /// Read a `meta` entry.
+    async fn get_meta(&self, key: &str) -> Result<Option<String>>;
 
-    /// Record the current pipeline version.
-    async fn set_pipeline_version(&self, version: u32) -> Result<()>;
+    /// Write a `meta` entry.
+    async fn set_meta(&self, key: &str, value: &str) -> Result<()>;
+
+    /// The fingerprint a document was last built under for `stage`.
+    async fn document_stage(&self, doc_id: &str, stage: &str) -> Result<Option<String>>;
+
+    /// Record a document's stage fingerprint.
+    async fn set_document_stage(&self, doc_id: &str, stage: &str, fingerprint: &str) -> Result<()>;
+
+    /// Forget a document's stage fingerprint (forces that stage to re-run).
+    async fn clear_document_stage(&self, doc_id: &str, stage: &str) -> Result<()>;
+
+    /// Forget a stage fingerprint for every document (e.g. after a dimension
+    /// change recreated that space).
+    async fn clear_stage_all(&self, stage: &str) -> Result<()>;
 }
 
 /// Build and connect the store selected by `cfg`.

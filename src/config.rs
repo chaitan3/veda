@@ -151,6 +151,8 @@ pub struct Config {
     pub embed: EmbedConfig,
     pub image: ImageEmbedConfig,
     pub extract: ExtractPipeline,
+    /// Run docling's CodeFormulaV2 enrichment (code blocks + display formulas).
+    pub code_formula: bool,
     pub chunker: ChunkerKind,
     /// Window chunk size, in words.
     pub chunk_size: usize,
@@ -170,6 +172,18 @@ fn var(name: &str) -> Option<String> {
 
 fn var_or(name: &str, default: &str) -> String {
     var(name).unwrap_or_else(|| default.to_string())
+}
+
+/// Parse a boolean env var (`1/true/yes/on` vs `0/false/no/off`), falling back
+/// to `default` when unset or empty.
+fn bool_or(name: &str, default: bool) -> bool {
+    match var(name) {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => default,
+    }
 }
 
 /// Parse a path-separated path list (`LS_SOURCE_PATH`), keeping the platform
@@ -220,7 +234,7 @@ impl Config {
         let image_dir = format!("{models_dir}/image");
 
         let image = ImageEmbedConfig {
-            provider: ImageEmbedProvider::parse(&var_or("LS_IMAGE_EMBED_PROVIDER", "off"))?,
+            provider: ImageEmbedProvider::parse(&var_or("LS_IMAGE_EMBED_PROVIDER", "siglip"))?,
             dim: var("LS_IMAGE_EMBED_DIM")
                 .map(|v| v.parse::<usize>())
                 .transpose()
@@ -255,6 +269,7 @@ impl Config {
             },
             image,
             extract,
+            code_formula: bool_or("LS_EXTRACT_CODE_FORMULA", true),
             chunker,
             chunk_size: var("LS_CHUNK_SIZE")
                 .map(|v| v.parse::<usize>())

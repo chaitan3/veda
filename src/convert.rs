@@ -68,13 +68,26 @@ mod docling_backend {
     /// reloading all ONNX models each time; holding one amortizes that across
     /// the run. pdfium is not thread-safe, so access is serialized by the mutex
     /// (our ingestion is sequential anyway).
-    fn ml_pipeline() -> Result<&'static Mutex<docling_pdf::Pipeline>> {
+    fn ml_pipeline(cfg: &Config) -> Result<&'static Mutex<docling_pdf::Pipeline>> {
         static PIPELINE: OnceLock<Mutex<docling_pdf::Pipeline>> = OnceLock::new();
         if PIPELINE.get().is_none() {
             let pipeline = docling_pdf::Pipeline::new().map_err(|e| {
                 Error::conversion(format!("initialising the docling PDF pipeline: {e}"))
             })?;
+            // Opt-in enrichment passes (docling's do_code_enrichment /
+            // do_formula_enrichment). A missing model warns once and is skipped,
+            // so enabling is safe before the models are downloaded.
+            let pipeline = if cfg.code_formula {
+                pipeline.enrichments(docling_pdf::EnrichmentOptions {
+                    picture_classification: false,
+                    code: true,
+                    formula: true,
+                })
+            } else {
+                pipeline
+            };
             tracing::info!(
+                code_formula = cfg.code_formula,
                 "docling PDF/image pipeline created; ONNX models stay warm for this process"
             );
             let _ = PIPELINE.set(Mutex::new(pipeline));
@@ -84,8 +97,10 @@ mod docling_backend {
             .ok_or_else(|| Error::conversion("docling pipeline missing after init"))
     }
 
-    fn lock_pipeline() -> Result<std::sync::MutexGuard<'static, docling_pdf::Pipeline>> {
-        ml_pipeline()?
+    fn lock_pipeline(
+        cfg: &Config,
+    ) -> Result<std::sync::MutexGuard<'static, docling_pdf::Pipeline>> {
+        ml_pipeline(cfg)?
             .lock()
             .map_err(|_| Error::conversion("docling pipeline mutex poisoned"))
     }
@@ -96,7 +111,7 @@ mod docling_backend {
         let source = SourceDocument::from_bytes(name.to_string(), fmt, bytes.to_vec());
 
         let document = match cfg.extract {
-            ExtractPipeline::Onnx => convert_local(&fmt, source)?,
+            ExtractPipeline::Onnx => convert_local(cfg, &fmt, source)?,
             ExtractPipeline::Vlm => {
                 let opts = VlmOptions::resolve(None, None)
                     .map_err(|e| Error::conversion(e.to_string()))?;
@@ -116,15 +131,16 @@ mod docling_backend {
     /// Local ONNX conversion: the warm pipeline for PDF/image, the lightweight
     /// per-format backends (no ML models) for everything else.
     fn convert_local(
+        cfg: &Config,
         fmt: &InputFormat,
         source: SourceDocument,
     ) -> Result<docling::DoclingDocument> {
         if matches!(fmt, InputFormat::Pdf) {
-            lock_pipeline()?
+            lock_pipeline(cfg)?
                 .convert(&source.bytes, None, &source.name)
                 .map_err(|e| Error::conversion(format!("pdf: {e}")))
         } else if matches!(fmt, InputFormat::Image) {
-            lock_pipeline()?
+            lock_pipeline(cfg)?
                 .convert_image(&source.bytes, &source.name)
                 .map_err(|e| Error::conversion(format!("image: {e}")))
         } else {

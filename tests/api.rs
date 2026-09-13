@@ -41,6 +41,7 @@ fn config(db: &str) -> Config {
             tokenizer: None,
             preprocessor: None,
         },
+        code_formula: false,
         chunker: ChunkerKind::Window,
         chunk_size: 100,
         chunk_overlap: 0.0,
@@ -87,7 +88,16 @@ async fn setup() -> (axum::Router, String) {
         );
         chunks.push(chunk);
     }
-    pipeline.store().insert_chunks(&chunks).await.unwrap();
+    pipeline
+        .store()
+        .replace_text_chunks(&doc.id, &chunks)
+        .await
+        .unwrap();
+    let pairs: Vec<(String, Vec<f32>)> = chunks
+        .iter()
+        .map(|c| (c.id.clone(), c.embedding.clone().unwrap()))
+        .collect();
+    pipeline.store().set_text_vectors(&pairs).await.unwrap();
     pipeline.store().bump_corpus_version().await.unwrap();
 
     let state = AppState {

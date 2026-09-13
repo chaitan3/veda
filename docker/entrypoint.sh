@@ -24,21 +24,18 @@ if [ ! -e /app/.pdfium ]; then
     ln -s "$MODELS_DIR/.pdfium" /app/.pdfium
 fi
 
-# First-run bootstrap of the docling assets + bge-small embedder (~650 MB).
-# Skip for a pre-provisioned volume or a remote-VLM / llama.cpp setup.
-downloaded=0
-if [ ! -f "$MODELS_DIR/embed/bge-small-en-v1.5.onnx" ] \
-    && [ "${LS_SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
-    echo "[entrypoint] no model tree in $MODELS_DIR; downloading (one-time, ~650 MB)" >&2
+# Ensure the model tree: docling assets + bge-small + SigLIP2 + CodeFormulaV2.
+# Idempotent — files already present are skipped without any network use, so an
+# existing volume only fetches models added by a newer version. Skip entirely
+# for a pre-provisioned volume or a remote-VLM / llama.cpp setup.
+if [ "${LS_SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
+    echo "[entrypoint] ensuring model tree in $MODELS_DIR (idempotent)" >&2
     /app/local-search download-models
-    downloaded=1
 fi
 
 if [ "$(id -u)" = "0" ]; then
-    # Files created above are root-owned; hand them to the service user. Only
-    # walk the tree when we actually wrote it, to keep restarts fast.
-    chown "$PUID:$PGID" /data "$MODELS_DIR" 2>/dev/null || true
-    [ "$downloaded" = "1" ] && chown -R "$PUID:$PGID" "$MODELS_DIR" 2>/dev/null || true
+    # The model tree is a few dozen files; hand them to the service user.
+    chown -R "$PUID:$PGID" /data "$MODELS_DIR" 2>/dev/null || true
     exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
         /app/local-search "$@"
 fi

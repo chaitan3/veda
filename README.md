@@ -11,29 +11,31 @@ seams — while the data model is shaped for the image channel from day one.
 
 ## Status
 
-**Working (Phase 0):**
+**Working:**
 
-- **Extraction** via docling.rs: PDF (text layer + layout + TableFormer
-  tables), DOCX, and PNG/JPEG/… via **OCR**, using the local ONNX pipeline by
-  default or the optional remote **VLM** pipeline.
+- **Extraction** via docling.rs: PDF (text layer + layout + TableFormer tables
+  + CodeFormulaV2 code/formula enrichment), DOCX, and PNG/JPEG/… via **OCR**,
+  using the local ONNX pipeline by default or the optional remote **VLM**
+  pipeline.
 - **Execution provider**: CUDA when usable, with an automatic CPU fallback that
   is reported in the log (see below).
 - **Embeddings**: in-process ONNX sentence encoder (default, bge-small-en-v1.5),
   an OpenAI-compatible llama.cpp endpoint, or a deterministic `hash` embedder.
-- **Store**: SQLite (documents + chunks + FTS5), WAL, corpus versioning.
-- **Retrieval**: vector (`sqlite-vec` `vec0` cosine KNN), BM25 (FTS5), and
-  Hybrid via RRF.
+  Standalone images additionally get a **SigLIP2** embedding in a shared
+  image+text space.
+- **Store**: SQLite (documents + chunks + FTS5 + two `vec0` spaces), WAL,
+  corpus versioning, per-document stage fingerprints.
+- **Retrieval**: text vector (`vec0` cosine KNN), BM25 (FTS5), Hybrid via RRF
+  with an image channel; query-by-image.
 - **Chunking**: `hybrid` (default) and `hierarchical` via docling's
   structure-aware chunkers, plus `window` (and the plain-text fallback).
-- **CLI**: `init-db`, `ingest` (`--sync`), `query`, `stats`, `prune`,
-  `download-models`, `serve`.
-- **Service**: read-only `/api/search`, `/api/stats`, `/api/documents`,
-  `/api/documents/{id}`, `/health`; optional API-key auth (off by default);
-  search hits are self-contained (chunk + ordinal + hydrated document) and
-  `/api/documents/{id}` pages a document's chunks.
+- **CLI**: `init-db`, `ingest` (`--sync`, `--force`, `--stages`), `query`,
+  `stats`, `prune`, `download-models`, `serve`.
+- **Service**: read-only `/api/search`, `/api/search/image`, `/api/stats`,
+  `/api/documents`, `/api/documents/{id}`, `/api/media/{chunk_id}`, `/health`;
+  optional API-key auth.
 
-**Phase 1 (planned):** image captioning (VLM via llama.cpp), CLIP image
-embeddings, the image retrieval channel, media-serving routes.
+**Not yet:** PDF figure extraction, image captioning, Multi-Query/HyDE.
 
 ## Quick start
 
@@ -47,6 +49,7 @@ cargo run --release -- download-models
 cargo run --release -- init-db
 cargo run --release -- ingest ./docs ./more-docs
 cargo run --release -- ingest ./docs ./more-docs --sync   # also drop deleted files
+cargo run --release -- ingest --stages text_embed         # re-embed text only
 cargo run --release -- prune                  # drop docs with no chunks
 
 # 3. query
@@ -113,11 +116,15 @@ source folder ──ingest CLI──▶ docling convert → chunk → embed → 
 ```
 
 - **Documents vs images.** One `Document` (asset) fans out to many `Chunk`
-  fragments. A chunk carries a `kind` (`text` | `image`), an optional media
-  reference and a locator (page/bbox). Phase 0 stores text; Phase 1 adds image
-  fragments without a schema change.
-- **Two vector spaces, kept apart.** Text and CLIP have different
-  dimensionality, so Phase 1 adds a second vector table rather than mixing.
+  fragments. A chunk is `text` or `image`; an image chunk is a standalone image
+  file (content-addressed), served from its source on demand.
+- **Two vector spaces, kept apart.** Text and image embeddings have different
+  dimensionality and live in two `vec0` tables, so a text query reaches images
+  through SigLIP's shared space without mixing the vectors.
+- **Stage-scoped ingest.** Each document records a fingerprint per stage
+  (`extract` / `text_embed` / `image_embed`); `ingest` re-runs only the stages
+  whose configuration or models changed. `--stages` targets specific stages and
+  `--force` forces just those.
 - **Out-of-process ingest.** The service never ingests, so it is
   side-effect-free. Every successful ingest bumps a `corpus_version`, the seam
   for cross-process cache invalidation.
@@ -134,8 +141,9 @@ See `.env.example` for the full list. Key RAG-layer settings:
 | `LS_SOURCE_PATH` | `docs` | folder(s) the ingest CLI walks; path-separated |
 | `LS_MODELS_DIR` | `.models` | model tree; fans out to docling's `DOCLING_*` vars |
 | `LS_EXTRACT_PIPELINE` | `onnx` | `onnx` (local) or `vlm` (remote, llama.cpp) |
+| `LS_EXTRACT_CODE_FORMULA` | `true` | CodeFormulaV2 code/formula enrichment (skipped if models absent) |
 | `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `llamacpp` \| `hash` |
-| `LS_IMAGE_EMBED_PROVIDER` | `off` | `off` \| `siglip` \| `hash` — image channel (SigLIP2 shared space) |
+| `LS_IMAGE_EMBED_PROVIDER` | `siglip` | `siglip` \| `off` \| `hash` — image channel (SigLIP2 shared space) |
 | `LS_EMBED_DIM` | `384` | must match the embedder; sizes the `vec0` index |
 | `LS_ONNX_MODEL` | `.models/embed/bge-small-en-v1.5.onnx` | ONNX embedder graph |
 | `LS_ONNX_TOKENIZER` | `.models/embed/tokenizer.json` | ONNX embedder tokenizer |
@@ -225,18 +233,21 @@ scripts/package.sh dist/local-search
 ```
 
 `deploy/local-search.service` is a systemd unit template. Upgrades need no
-database reset: the DB records a `pipeline_version`, and `ingest` automatically
-reprocesses the corpus when the binary's pipeline version differs.
+database reset: each document records a per-stage fingerprint, so `ingest`
+re-runs only the stages whose configuration or models changed.
 
 ## Notes
 
-- **Image search** (SigLIP2, images only for now): set
-  `LS_IMAGE_EMBED_PROVIDER=siglip`, run `download-models` (adds ~700 MB), and
-  re-ingest. Standalone PNG/JPG/… get an image chunk in a shared image+text
-  space, so `mode=hybrid` text queries also match images and `POST
-  /api/search/image` does query-by-image. Image chunks carry a `media_url`
-  served by `GET /api/media/{chunk_id}` (from the source file; nothing is
-  stored). PDF figure extraction is not implemented yet.
+- **Image search** (SigLIP2, images only for now): **on by default**
+  (`LS_IMAGE_EMBED_PROVIDER=siglip`; set `off` to disable). Standalone
+  PNG/JPG/… get an image chunk in a shared image+text space, so `mode=hybrid`
+  text queries also match images and `POST /api/search/image` does
+  query-by-image. Image chunks carry a `media_url` served by
+  `GET /api/media/{chunk_id}` (from the source file; nothing is stored). PDF
+  figure extraction is not implemented yet.
+- **Code/formula enrichment** (CodeFormulaV2): **on by default**
+  (`LS_EXTRACT_CODE_FORMULA=true`). Requires the models fetched by
+  `download-models`; if they're missing the pass is skipped with a warning.
 - `LS_EMBED_PROVIDER=hash` is deterministic but **not semantic** — for smoke
   tests only.
 - BM25 scores are zero on very small corpora (FTS5's IDF collapses); ranking

@@ -1,10 +1,9 @@
 //! Core data types shared across the pipeline: documents, chunks, scored hits.
 //!
 //! The model mirrors `docling-rag`'s `Document`/`Chunk` shape, extended with a
-//! [`ChunkKind`] and a [`Locator`] so image fragments and provenance (page /
-//! bounding box) are first-class from day one — even though Phase 0 only stores
-//! text chunks. Image bytes are not stored: a fragment is addressed by its
-//! document plus its [`Locator`], and rendered from the source on demand.
+//! [`ChunkKind`] so image fragments share the chunk table and retrieval path
+//! with text. Image bytes are never stored: an image chunk is a standalone
+//! image file, addressed by its owning [`Document`] and served from the source.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -54,10 +53,10 @@ impl Document {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkKind {
-    /// A passage of text (document text, OCR, or a caption in Phase 1).
+    /// A passage of text (document text or OCR).
     #[default]
     Text,
-    /// An image / page raster (Phase 1).
+    /// A standalone image file's embedding.
     Image,
 }
 
@@ -82,21 +81,11 @@ impl FromStr for ChunkKind {
     }
 }
 
-/// Where a fragment sits in its source: the 1-based page and an optional
-/// bounding box (page points, top-left origin). Image fragments are rendered
-/// from the source on demand rather than stored, so this is their address.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Locator {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bbox: Option<[f32; 4]>,
-}
-
 /// One retrievable fragment of a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
-    /// Stable id (UUID v4, hyphenated) — primary key.
+    /// Stable id: a UUID v4 for text chunks, the content hash for image chunks
+    /// (so an image vector survives a text-only reprocess).
     pub id: String,
     /// Owning [`Document::id`].
     pub doc_id: String,
@@ -109,13 +98,11 @@ pub struct Chunk {
     /// Text or image fragment.
     #[serde(default)]
     pub kind: ChunkKind,
-    /// Provenance within the source (page / bbox); the image address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locator: Option<Locator>,
     /// Arbitrary per-chunk metadata (heading path, source item refs, …).
     #[serde(default)]
     pub metadata: serde_json::Value,
-    /// The embedding vector; `None` until embedded / when loaded without it.
+    /// The embedding vector — transient: vectors live in the store's `vec0`
+    /// tables and are never persisted on the chunk row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 }
@@ -141,7 +128,6 @@ impl Chunk {
             text: text.into(),
             token_count,
             kind: ChunkKind::Text,
-            locator: None,
             metadata: serde_json::Value::Null,
             embedding: None,
         }

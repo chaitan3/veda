@@ -1,5 +1,5 @@
-//! Document sources. Phase 0 ships the local folder source; FTP/SFTP are out of
-//! scope. A source can span **several roots** (`LS_SOURCE_PATH` is a
+//! Document sources. The local folder source ships by default; FTP/SFTP are out
+//! of scope. A source can span **several roots** (`LS_SOURCE_PATH` is a
 //! path-separated list, and `ingest` accepts multiple paths).
 
 use crate::config::Config;
