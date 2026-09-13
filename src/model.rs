@@ -112,7 +112,7 @@ pub struct Chunk {
     /// Provenance within the source (page / bbox); the image address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<Locator>,
-    /// Arbitrary per-chunk metadata (heading path, …).
+    /// Arbitrary per-chunk metadata (heading path, source item refs, …).
     #[serde(default)]
     pub metadata: serde_json::Value,
     /// The embedding vector; `None` until embedded / when loaded without it.

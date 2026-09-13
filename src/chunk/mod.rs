@@ -66,9 +66,15 @@ impl Chunker {
             .map(|(i, dc)| {
                 let mut chunk = Chunk::new(doc_id, i as i64, dc.text.clone(), 0);
                 chunk.token_count = dc.text.split_whitespace().count().max(1) as i64;
-                if let Some(headings) = dc.headings {
-                    chunk.metadata = serde_json::json!({ "headings": headings });
-                }
+                // docling-rag parity: keep the heading path *and* the source item
+                // refs (`#/texts/12`, `#/tables/0`, …). The refs are the pointers
+                // that resolve to the document's per-item provenance (page/bbox).
+                let doc_items: Vec<String> =
+                    dc.doc_items.iter().map(|d| d.self_ref.clone()).collect();
+                chunk.metadata = serde_json::json!({
+                    "headings": dc.headings,
+                    "doc_items": doc_items,
+                });
                 chunk
             })
             .collect())
@@ -129,5 +135,44 @@ mod tests {
     #[test]
     fn empty_markdown_yields_no_chunks() {
         assert!(chunker(4, 0.0).window("d", "   \n  ").is_empty());
+    }
+
+    /// docling-rag parity: docling chunks carry both the heading path and the
+    /// source item refs (`self_ref`s) in metadata.
+    #[cfg(feature = "docling-extract")]
+    #[test]
+    fn docling_chunks_store_headings_and_doc_items() {
+        let md = "# Guide\n\n## Setup\n\nInstall the tools.\n\n- clone\n- build\n";
+        let src = docling::SourceDocument::from_bytes(
+            "t.md",
+            docling::InputFormat::Md,
+            md.as_bytes().to_vec(),
+        );
+        let doc = docling::DocumentConverter::new()
+            .convert(src)
+            .expect("convert")
+            .document;
+
+        let chunker = Chunker {
+            kind: ChunkerKind::Hierarchical,
+            size: 300,
+            overlap: 0.0,
+        };
+        let chunks = chunker.chunk_document("d", &doc).expect("chunk");
+        assert!(!chunks.is_empty());
+
+        let setup = chunks
+            .iter()
+            .find(|c| c.text.contains("Install"))
+            .expect("setup chunk");
+        assert_eq!(setup.metadata["headings"][1], "Setup");
+        assert!(
+            setup.metadata["doc_items"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("#/"),
+            "doc_items should hold the source self_refs: {}",
+            setup.metadata
+        );
     }
 }
