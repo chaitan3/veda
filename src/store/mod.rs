@@ -34,6 +34,13 @@ pub trait VectorStore: Send + Sync {
     /// Dense search: the `k` chunks whose embeddings are most cosine-similar.
     async fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>>;
 
+    /// Insert image chunks: their rows plus their vector in the **image space**
+    /// (no FTS row — image chunks carry no text in this phase).
+    async fn insert_image_chunks(&self, chunks: &[Chunk]) -> Result<()>;
+
+    /// Dense search in the image space (query vector from the image embedder).
+    async fn image_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>>;
+
     /// Keyword search over the FTS5 index (BM25), best first.
     async fn keyword_search(&self, query: &str, k: usize) -> Result<Vec<Scored>>;
 
@@ -66,6 +73,9 @@ pub trait VectorStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Chunk>>;
 
+    /// Load a single chunk by id (used by the media route).
+    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<Chunk>>;
+
     /// Every stored `source_uri` (for `--sync` deletion sweeps).
     async fn all_source_uris(&self) -> Result<Vec<String>>;
 
@@ -97,8 +107,9 @@ pub trait VectorStore: Send + Sync {
 
 /// Build and connect the store selected by `cfg`.
 pub async fn from_config(cfg: &Config) -> Result<Arc<dyn VectorStore>> {
+    let image_dim = cfg.image.enabled().then_some(cfg.image.dim);
     let store: Arc<dyn VectorStore> =
-        Arc::new(sqlite::SqliteStore::connect(&cfg.db_path, cfg.embed.dim).await?);
+        Arc::new(sqlite::SqliteStore::connect(&cfg.db_path, cfg.embed.dim, image_dim).await?);
     store.migrate().await?;
     Ok(store)
 }

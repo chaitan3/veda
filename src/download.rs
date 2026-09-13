@@ -15,6 +15,8 @@ use tokio::io::AsyncWriteExt;
 const DEFAULT_MODELS_BASE: &str =
     "https://github.com/docling-project/docling.rs/releases/download/models-v1";
 const DEFAULT_EMBED_BASE: &str = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main";
+const DEFAULT_IMAGE_BASE: &str =
+    "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main";
 
 struct Asset {
     dest: PathBuf,
@@ -23,10 +25,12 @@ struct Asset {
 }
 
 /// Download the default model set. `with_embed` also fetches the local ONNX
-/// text embedder (bge-small-en-v1.5, ~130 MB).
-pub async fn download_models(cfg: &Config, with_embed: bool) -> Result<()> {
+/// text embedder (bge-small-en-v1.5, ~130 MB); `with_images` the SigLIP2
+/// image+text towers (~700 MB) used by `LS_IMAGE_EMBED_PROVIDER=siglip`.
+pub async fn download_models(cfg: &Config, with_embed: bool, with_images: bool) -> Result<()> {
     let base = env_or("DOCLING_RS_MODELS_URL", DEFAULT_MODELS_BASE);
     let embed_base = env_or("LS_ONNX_MODELS_URL", DEFAULT_EMBED_BASE);
+    let image_base = env_or("LS_IMAGE_MODELS_URL", DEFAULT_IMAGE_BASE);
     let models = PathBuf::from(&cfg.models_dir);
 
     let docling = |rel: &str| models.join(rel);
@@ -90,6 +94,30 @@ pub async fn download_models(cfg: &Config, with_embed: bool) -> Result<()> {
         assets.push(Asset {
             dest: docling("embed/tokenizer.json"),
             urls: vec![format!("{embed_base}/tokenizer.json")],
+            optional: false,
+        });
+    }
+
+    if with_images {
+        let image = |rel: &str| models.join("image").join(rel);
+        assets.push(Asset {
+            dest: image("vision_model.onnx"),
+            urls: vec![format!("{image_base}/onnx/vision_model.onnx")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: image("text_model.onnx"),
+            urls: vec![format!("{image_base}/onnx/text_model.onnx")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: image("tokenizer.json"),
+            urls: vec![format!("{image_base}/tokenizer.json")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: image("preprocessor_config.json"),
+            urls: vec![format!("{image_base}/preprocessor_config.json")],
             optional: false,
         });
     }

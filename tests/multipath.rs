@@ -1,6 +1,9 @@
 //! Multi-root ingestion and `--sync` scoping.
 
-use local_search::config::{ChunkerKind, Config, EmbedConfig, EmbedProvider, ExtractPipeline};
+use local_search::config::{
+    ChunkerKind, Config, EmbedConfig, EmbedProvider, ExtractPipeline, ImageEmbedConfig,
+    ImageEmbedProvider,
+};
 use local_search::pipeline::Pipeline;
 use std::path::PathBuf;
 
@@ -19,8 +22,6 @@ fn config(db: &str, roots: Vec<PathBuf>) -> Config {
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
-        documents_output: None,
-        blob_root: temp_base("blobs").to_string_lossy().to_string(),
         models_dir: ".models".to_string(),
         embed: EmbedConfig {
             provider: EmbedProvider::Hash,
@@ -34,6 +35,14 @@ fn config(db: &str, roots: Vec<PathBuf>) -> Config {
             onnx_tokenizer: None,
         },
         extract: ExtractPipeline::Onnx,
+        image: ImageEmbedConfig {
+            provider: ImageEmbedProvider::Off,
+            dim: 768,
+            vision_model: None,
+            text_model: None,
+            tokenizer: None,
+            preprocessor: None,
+        },
         chunker: ChunkerKind::Window,
         chunk_size: 100,
         chunk_overlap: 0.0,

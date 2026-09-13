@@ -5,7 +5,7 @@
 //! to expose on loopback. Authentication is optional and disabled when
 //! `LS_API_KEYS` is empty.
 
-use crate::model::{Chunk, Document, RetrievalMode};
+use crate::model::{Chunk, ChunkKind, Document, RetrievalMode, Scored};
 use crate::pipeline::Pipeline;
 use axum::{
     Json, Router,
@@ -13,8 +13,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -36,9 +37,11 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/search", get(search_get).post(search_post))
+        .route("/api/search/image", post(search_image))
         .route("/api/stats", get(stats))
         .route("/api/documents", get(documents))
         .route("/api/documents/{id}", get(document_by_id))
+        .route("/api/media/{chunk_id}", get(media))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
 
     Router::new()
@@ -117,13 +120,21 @@ impl From<&Document> for DocumentRef {
     }
 }
 
-/// One search hit: the chunk, its score, and its source document, so the result
-/// is self-contained and directly citable.
+/// One search hit: the chunk, its score, its source document, and (for image
+/// chunks) a URL to the bytes, so the result is self-contained and citable.
 #[derive(Serialize)]
 struct SearchResult {
     chunk: Chunk,
     score: f32,
     document: DocumentRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_url: Option<String>,
+}
+
+/// Where an image chunk's bytes are served from. Nothing is stored: the route
+/// resolves the source document (standalone image files, for now).
+fn media_url(chunk: &Chunk) -> Option<String> {
+    (chunk.kind == ChunkKind::Image).then(|| format!("/api/media/{}", chunk.id))
 }
 
 #[derive(Serialize)]
@@ -135,47 +146,59 @@ struct SearchResponse {
     corpus_version: i64,
 }
 
+/// Strip embeddings and hydrate each hit's parent document (one batched lookup).
+async fn hydrate(
+    state: &AppState,
+    mut hits: Vec<Scored>,
+) -> std::result::Result<Vec<SearchResult>, (StatusCode, String)> {
+    // Embeddings are an internal detail; don't ship them to clients.
+    for hit in hits.iter_mut() {
+        hit.chunk.embedding = None;
+    }
+    let store = state.pipeline.store();
+    let mut ids: Vec<String> = hits.iter().map(|h| h.chunk.doc_id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    let documents = store
+        .get_documents_by_ids(&ids)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(hits
+        .into_iter()
+        .filter_map(|hit| {
+            documents
+                .get(&hit.chunk.doc_id)
+                .map(|document| SearchResult {
+                    media_url: media_url(&hit.chunk),
+                    chunk: hit.chunk,
+                    score: hit.score,
+                    document: DocumentRef::from(document),
+                })
+        })
+        .collect())
+}
+
+async fn respond(state: &AppState, query: String, mode: String, hits: Vec<Scored>) -> Response {
+    let corpus_version = state.pipeline.store().corpus_version().await.unwrap_or(0);
+    match hydrate(state, hits).await {
+        Ok(results) => Json(SearchResponse {
+            query,
+            mode,
+            count: results.len(),
+            results,
+            corpus_version,
+        })
+        .into_response(),
+        Err((status, msg)) => err(status, msg),
+    }
+}
+
 async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, k: usize) -> Response {
     if query.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "query must not be empty");
     }
     match state.pipeline.query(mode, query, k).await {
-        Ok(mut hits) => {
-            // Embeddings are an internal detail; don't ship them to clients.
-            for hit in hits.iter_mut() {
-                hit.chunk.embedding = None;
-            }
-            let store = state.pipeline.store();
-            // Hydrate each hit's parent document with a single batched lookup.
-            let mut ids: Vec<String> = hits.iter().map(|h| h.chunk.doc_id.clone()).collect();
-            ids.sort();
-            ids.dedup();
-            let documents = match store.get_documents_by_ids(&ids).await {
-                Ok(d) => d,
-                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            let corpus_version = store.corpus_version().await.unwrap_or(0);
-            let results: Vec<SearchResult> = hits
-                .into_iter()
-                .filter_map(|hit| {
-                    documents
-                        .get(&hit.chunk.doc_id)
-                        .map(|document| SearchResult {
-                            chunk: hit.chunk,
-                            score: hit.score,
-                            document: DocumentRef::from(document),
-                        })
-                })
-                .collect();
-            Json(SearchResponse {
-                query: query.to_string(),
-                mode: mode.to_string(),
-                count: results.len(),
-                results,
-                corpus_version,
-            })
-            .into_response()
-        }
+        Ok(hits) => respond(state, query.to_string(), mode.to_string(), hits).await,
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -242,6 +265,8 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
         "status": "ok",
         "embedder": pipeline.embedder().id(),
         "embed_dim": pipeline.embedder().dim(),
+        "image_embedder": pipeline.image_embedder().map(|e| e.id()).unwrap_or("off"),
+        "image_embed_dim": pipeline.image_embedder().map(|e| e.dim()).unwrap_or(0),
         "extract_pipeline": format!("{:?}", pipeline.config().extract).to_lowercase(),
         "documents": documents,
         "chunks": chunks,
@@ -348,6 +373,78 @@ async fn document_by_id(
         "corpus_version": store.corpus_version().await.unwrap_or(0),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct ImageSearchBody {
+    /// Base64-encoded query image bytes (PNG/JPEG/…).
+    image_base64: String,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    k: Option<usize>,
+}
+
+/// Query-by-image: embed the posted image and search the image space.
+async fn search_image(
+    State(state): State<AppState>,
+    Json(body): Json<ImageSearchBody>,
+) -> Response {
+    let k = body.top_k.or(body.k).unwrap_or(5).clamp(1, 100);
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(body.image_base64.as_bytes())
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("image_base64 is not valid base64: {e}"),
+            );
+        }
+    };
+    if bytes.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "image is empty");
+    }
+    match state.pipeline.query_image(&bytes, k).await {
+        Ok(hits) => respond(&state, String::new(), "image".to_string(), hits).await,
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Serve an image chunk's bytes from its source document.
+///
+/// Nothing is stored: a standalone image chunk points at its source file. (PDF
+/// figure chunks will render from `locator` here once figure extraction lands.)
+async fn media(State(state): State<AppState>, Path(chunk_id): Path<String>) -> Response {
+    let store = state.pipeline.store();
+    let chunk = match store.get_chunk(&chunk_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no such chunk"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    if chunk.kind != ChunkKind::Image {
+        return err(StatusCode::NOT_FOUND, "chunk is not an image");
+    }
+    let document = match store.get_document(&chunk.doc_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "document is missing"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let bytes = match tokio::fs::read(&document.source_uri).await {
+        Ok(b) => b,
+        Err(e) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("source image unreadable: {e}"),
+            );
+        }
+    };
+    let mime = chunk
+        .metadata
+        .get("mime")
+        .and_then(|m| m.as_str())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    ([(axum::http::header::CONTENT_TYPE, mime)], bytes).into_response()
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {

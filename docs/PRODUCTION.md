@@ -18,7 +18,7 @@ The packaged directory is the service's **working directory** — docling resolv
 |---|---|---|
 | `local-search` | yes | the product binary |
 | `libonnxruntime_providers_*.so` | GPU only | next to the binary; CPU runs fine without them (logs a fallback) |
-| `.models/` | yes | ~640 MB; docling assets + ONNX embedder |
+| `.models/` | yes | ~640 MB; docling assets + ONNX embedder (+ ~700 MB SigLIP2 towers when the image channel is on) |
 | `.pdfium/lib/libpdfium.so` | yes (PDF) | ~7.5 MB |
 | SQLite DB (`*.db`, `-wal`, `-shm`) | yes | all state |
 | CUDA runtime + cuDNN 9 | GPU only | must match the ONNX Runtime build |
@@ -32,11 +32,12 @@ cargo build --release --no-default-features --features docling-extract,onnx-embe
 ## Models
 
 ```bash
-./local-search download-models              # docling assets + bge-small embedder
-./local-search download-models --no-embed   # skip the 133 MB embedder
+./local-search download-models              # docling assets + bge-small embedder + SigLIP2
+./local-search download-models --no-embed   # skip the 133 MB text embedder
+./local-search download-models --no-image   # skip the ~700 MB SigLIP2 towers
 ```
 
-Idempotent. Mirrors: `DOCLING_RS_MODELS_URL`, `LS_ONNX_MODELS_URL`.
+Idempotent. Mirrors: `DOCLING_RS_MODELS_URL`, `LS_ONNX_MODELS_URL`, `LS_IMAGE_MODELS_URL`.
 
 ## Configuration
 
@@ -106,7 +107,7 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 
 | Mount | Holds | Notes |
 |---|---|---|
-| `/data` | SQLite DB + blobs | named volume; the only mutable state |
+| `/data` | SQLite DB | named volume; the only mutable state |
 | `/models` | docling assets + embedder | downloaded on first run (~650 MB); must be writable |
 | `/documents` | ingest source | mount read-only |
 | `/config` | optional `.env` | Docker env vars take precedence |

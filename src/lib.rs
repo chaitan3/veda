@@ -24,5 +24,5 @@ pub mod store;
 
 pub use config::Config;
 pub use error::{Error, Result};
-pub use model::{Chunk, ChunkKind, Document, Locator, MediaRef, RetrievalMode, Scored};
+pub use model::{Chunk, ChunkKind, Document, Locator, RetrievalMode, Scored};
 pub use pipeline::Pipeline;

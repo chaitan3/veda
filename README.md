@@ -81,7 +81,7 @@ docker run -d --name local-search --gpus all -p 8080:8080 \
   -v /host/documents:/documents:ro local-search serve
 ```
 
-Volumes: `/data` (DB + blobs), `/models` (downloaded model tree), `/documents`
+Volumes: `/data` (SQLite DB), `/models` (downloaded model tree), `/documents`
 (ingest source), `/config` (optional `.env`). Drop `--gpus all` for a CPU-only
 host. Build with `--build-arg PUID=$(id -u) --build-arg PGID=$(id -g)` to match
 bind-mounted host directories. See `docker/.env.example` and
@@ -135,6 +135,7 @@ See `.env.example` for the full list. Key RAG-layer settings:
 | `LS_MODELS_DIR` | `.models` | model tree; fans out to docling's `DOCLING_*` vars |
 | `LS_EXTRACT_PIPELINE` | `onnx` | `onnx` (local) or `vlm` (remote, llama.cpp) |
 | `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `llamacpp` \| `hash` |
+| `LS_IMAGE_EMBED_PROVIDER` | `off` | `off` \| `siglip` \| `hash` — image channel (SigLIP2 shared space) |
 | `LS_EMBED_DIM` | `384` | must match the embedder; sizes the `vec0` index |
 | `LS_ONNX_MODEL` | `.models/embed/bge-small-en-v1.5.onnx` | ONNX embedder graph |
 | `LS_ONNX_TOKENIZER` | `.models/embed/tokenizer.json` | ONNX embedder tokenizer |
@@ -196,6 +197,8 @@ document (no silent drops).
 | GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
 | GET | `/api/documents?offset=&limit=` | stored documents (paged) |
 | GET | `/api/documents/{id}?offset=&limit=` | one document + a bounded, pageable chunk slice |
+| POST | `/api/search/image` | query-by-image: `{"image_base64","top_k"}` (needs `LS_IMAGE_EMBED_PROVIDER`) |
+| GET | `/api/media/{chunk_id}` | bytes of an image chunk (from its source document) |
 
 Each search hit carries its `chunk` (including the `ordinal`), its `score`, and
 a hydrated `document` reference (`id`, `title`, `source_uri`, `created_at`), so
@@ -227,6 +230,13 @@ reprocesses the corpus when the binary's pipeline version differs.
 
 ## Notes
 
+- **Image search** (SigLIP2, images only for now): set
+  `LS_IMAGE_EMBED_PROVIDER=siglip`, run `download-models` (adds ~700 MB), and
+  re-ingest. Standalone PNG/JPG/… get an image chunk in a shared image+text
+  space, so `mode=hybrid` text queries also match images and `POST
+  /api/search/image` does query-by-image. Image chunks carry a `media_url`
+  served by `GET /api/media/{chunk_id}` (from the source file; nothing is
+  stored). PDF figure extraction is not implemented yet.
 - `LS_EMBED_PROVIDER=hash` is deterministic but **not semantic** — for smoke
   tests only.
 - BM25 scores are zero on very small corpora (FTS5's IDF collapses); ranking

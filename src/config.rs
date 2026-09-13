@@ -50,6 +50,50 @@ pub struct EmbedConfig {
     pub onnx_tokenizer: Option<String>,
 }
 
+/// How images are embedded for cross-modal search (text→image, image→image).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageEmbedProvider {
+    /// No image channel (default); the store has no image vector space.
+    Off,
+    /// Deterministic hashing — offline smoke tests only.
+    Hash,
+    /// In-process SigLIP ONNX (feature `image-embed`).
+    Siglip,
+}
+
+impl ImageEmbedProvider {
+    fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "off" | "none" => Ok(ImageEmbedProvider::Off),
+            "hash" => Ok(ImageEmbedProvider::Hash),
+            "siglip" | "siglip2" | "siglip-2" | "onnx" => Ok(ImageEmbedProvider::Siglip),
+            other => Err(Error::config(format!(
+                "LS_IMAGE_EMBED_PROVIDER must be off|hash|siglip, got '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Image-embedding backend settings.
+#[derive(Debug, Clone)]
+pub struct ImageEmbedConfig {
+    pub provider: ImageEmbedProvider,
+    /// Image/text embedding dimensionality (SigLIP2 base = 768).
+    pub dim: usize,
+    /// Shared image+text embedding space, so a text query can match images.
+    pub vision_model: Option<String>,
+    pub text_model: Option<String>,
+    pub tokenizer: Option<String>,
+    pub preprocessor: Option<String>,
+}
+
+impl ImageEmbedConfig {
+    /// Whether the image channel is active (any provider other than `Off`).
+    pub fn enabled(&self) -> bool {
+        self.provider != ImageEmbedProvider::Off
+    }
+}
+
 /// How source documents are converted to Markdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractPipeline {
@@ -102,13 +146,10 @@ pub struct Config {
     pub db_path: String,
     /// Folders ingested by the CLI (from `LS_SOURCE_PATH`, a path-separated list).
     pub source_paths: Vec<String>,
-    /// Optional local Markdown mirror of converted documents.
-    pub documents_output: Option<String>,
-    /// Blob root for extracted media (Phase 1).
-    pub blob_root: String,
     /// Root holding docling models (`.models`) and the embedder model.
     pub models_dir: String,
     pub embed: EmbedConfig,
+    pub image: ImageEmbedConfig,
     pub extract: ExtractPipeline,
     pub chunker: ChunkerKind,
     /// Window chunk size, in words.
@@ -176,12 +217,28 @@ impl Config {
 
         let models_dir = var("LS_MODELS_DIR").unwrap_or_else(|| ".models".to_string());
         let embed_dir = format!("{models_dir}/embed");
+        let image_dir = format!("{models_dir}/image");
+
+        let image = ImageEmbedConfig {
+            provider: ImageEmbedProvider::parse(&var_or("LS_IMAGE_EMBED_PROVIDER", "off"))?,
+            dim: var("LS_IMAGE_EMBED_DIM")
+                .map(|v| v.parse::<usize>())
+                .transpose()
+                .map_err(|_| Error::config("LS_IMAGE_EMBED_DIM must be an integer"))?
+                .unwrap_or(768),
+            vision_model: var("LS_SIGLIP_VISION_MODEL")
+                .or_else(|| Some(format!("{image_dir}/vision_model.onnx"))),
+            text_model: var("LS_SIGLIP_TEXT_MODEL")
+                .or_else(|| Some(format!("{image_dir}/text_model.onnx"))),
+            tokenizer: var("LS_SIGLIP_TOKENIZER")
+                .or_else(|| Some(format!("{image_dir}/tokenizer.json"))),
+            preprocessor: var("LS_SIGLIP_PREPROCESSOR")
+                .or_else(|| Some(format!("{image_dir}/preprocessor_config.json"))),
+        };
 
         Ok(Config {
             db_path: var_or("LS_DB_PATH", "data/local-search.db"),
             source_paths: parse_path_list(&var_or("LS_SOURCE_PATH", "docs")),
-            documents_output: var("LS_DOCUMENTS_OUTPUT"),
-            blob_root: var_or("LS_BLOB_ROOT", "data/blobs"),
             models_dir,
             embed: EmbedConfig {
                 provider,
@@ -196,6 +253,7 @@ impl Config {
                 onnx_tokenizer: var("LS_ONNX_TOKENIZER")
                     .or_else(|| Some(format!("{embed_dir}/tokenizer.json"))),
             },
+            image,
             extract,
             chunker,
             chunk_size: var("LS_CHUNK_SIZE")

@@ -6,7 +6,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use local_search::api::{AppState, router};
-use local_search::config::{ChunkerKind, Config, EmbedConfig, EmbedProvider, ExtractPipeline};
+use local_search::config::{
+    ChunkerKind, Config, EmbedConfig, EmbedProvider, ExtractPipeline, ImageEmbedConfig,
+    ImageEmbedProvider,
+};
 use local_search::embed::{Embedder, hash::HashEmbedder};
 use local_search::model::{Chunk, Document};
 use local_search::pipeline::Pipeline;
@@ -17,11 +20,6 @@ fn config(db: &str) -> Config {
     Config {
         db_path: db.to_string(),
         source_paths: vec!["docs".to_string()],
-        documents_output: None,
-        blob_root: std::env::temp_dir()
-            .join("ls-api-blobs")
-            .to_string_lossy()
-            .to_string(),
         models_dir: ".models".to_string(),
         embed: EmbedConfig {
             provider: EmbedProvider::Hash,
@@ -35,6 +33,14 @@ fn config(db: &str) -> Config {
             onnx_tokenizer: None,
         },
         extract: ExtractPipeline::Onnx,
+        image: ImageEmbedConfig {
+            provider: ImageEmbedProvider::Off,
+            dim: 768,
+            vision_model: None,
+            text_model: None,
+            tokenizer: None,
+            preprocessor: None,
+        },
         chunker: ChunkerKind::Window,
         chunk_size: 100,
         chunk_overlap: 0.0,

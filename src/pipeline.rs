@@ -4,9 +4,10 @@
 use crate::chunk::Chunker;
 use crate::config::{ChunkerKind, Config, ExtractPipeline};
 use crate::convert;
+use crate::embed::image::ImageEmbedder;
 use crate::embed::{self, Embedder};
 use crate::metrics::{ProcessingMetrics, Timings};
-use crate::model::{Document, RetrievalMode, Scored, content_hash, stem};
+use crate::model::{Chunk, Document, RetrievalMode, Scored, content_hash, stem};
 use crate::retrieve::Retriever;
 use crate::source;
 use crate::store::{self, VectorStore};
@@ -60,6 +61,8 @@ pub struct IngestReport {
 pub struct Pipeline {
     cfg: Config,
     embedder: Arc<dyn Embedder>,
+    /// Image→text embedder; `None` when the image channel is off.
+    image: Option<Arc<dyn ImageEmbedder>>,
     store: Arc<dyn VectorStore>,
     chunker: Chunker,
 }
@@ -68,11 +71,13 @@ impl Pipeline {
     /// Build every component from config.
     pub async fn from_config(cfg: &Config) -> Result<Self> {
         let embedder = embed::from_config(cfg)?;
+        let image = embed::image::from_config(cfg)?;
         let store = store::from_config(cfg).await?;
         let chunker = Chunker::from_config(cfg)?;
         Ok(Pipeline {
             cfg: cfg.clone(),
             embedder,
+            image,
             store,
             chunker,
         })
@@ -90,9 +95,20 @@ impl Pipeline {
         &self.embedder
     }
 
+    /// The image→text embedder, when the image channel is enabled.
+    pub fn image_embedder(&self) -> Option<&Arc<dyn ImageEmbedder>> {
+        self.image.as_ref()
+    }
+
     /// A retriever over this pipeline's store and embedder.
     pub fn retriever(&self) -> Retriever {
         Retriever::new(self.store.clone(), self.embedder.clone(), self.cfg.rrf_k)
+            .with_image(self.image.clone())
+    }
+
+    /// Retrieve images most similar to a query image (image→image).
+    pub async fn query_image(&self, image: &[u8], k: usize) -> Result<Vec<Scored>> {
+        self.retriever().retrieve_image(image, k).await
     }
 
     /// Retrieve the top `k` chunks for a query under `mode`.
@@ -245,6 +261,13 @@ impl Pipeline {
         }
         let embed_secs = t.elapsed().as_secs_f64();
 
+        // --- image chunk (standalone image files only, for now)
+        let t = Instant::now();
+        let image_chunks = self
+            .image_chunks(&doc.id, name, &bytes, chunks.len())
+            .await?;
+        let image_secs = t.elapsed().as_secs_f64();
+
         // --- persist (replace any prior version of this source)
         let words = converted.markdown.split_whitespace().count();
         let title = first_heading(&converted.markdown).unwrap_or_else(|| stem(name));
@@ -252,7 +275,7 @@ impl Pipeline {
             file_bytes,
             converted.pages,
             words,
-            chunks.len(),
+            chunks.len() + image_chunks.len(),
             embedded_words,
             Timings {
                 parse_secs,
@@ -263,7 +286,9 @@ impl Pipeline {
         self.store.delete_documents_by_source(source_uri).await?;
         self.store.upsert_document(&doc).await?;
         let n = chunks.len();
+        let n_images = image_chunks.len();
         self.store.insert_chunks(&chunks).await?;
+        self.store.insert_image_chunks(&image_chunks).await?;
 
         doc.title = title;
         doc.hash = hash;
@@ -281,12 +306,40 @@ impl Pipeline {
             pages = ?converted.pages,
             words,
             chunks = n,
+            images = n_images,
+            image_secs,
             parse_wps = metrics.parse_words_per_sec(),
             embed_wps = metrics.embed_words_per_sec(),
             secs = started.elapsed().as_secs_f64(),
             "ingested"
         );
-        Ok(IngestOutcome::Ingested(n))
+        Ok(IngestOutcome::Ingested(n + n_images))
+    }
+
+    /// Build the image chunk for a standalone image file, when the image channel
+    /// is enabled. PDFs and other formats are not figure-extracted yet.
+    async fn image_chunks(
+        &self,
+        doc_id: &str,
+        name: &str,
+        bytes: &[u8],
+        ordinal: usize,
+    ) -> Result<Vec<Chunk>> {
+        let Some(embedder) = &self.image else {
+            return Ok(Vec::new());
+        };
+        if !is_image_name(name) {
+            return Ok(Vec::new());
+        }
+        let mut chunk = Chunk::new(doc_id, ordinal as i64, "", 0);
+        chunk.kind = crate::model::ChunkKind::Image;
+        chunk.metadata = serde_json::json!({ "mime": image_mime(name) });
+        let mut vectors = embedder.embed_images(&[bytes.to_vec()]).await?;
+        let vector = vectors
+            .pop()
+            .ok_or_else(|| Error::embedding("image embedder returned no vector"))?;
+        chunk.embedding = Some(vector);
+        Ok(vec![chunk])
     }
 
     /// Human-readable extraction method for a file (text passthrough vs a
@@ -342,6 +395,27 @@ pub fn file_type(name: &str) -> String {
         .map(|e| e.to_ascii_lowercase())
         .filter(|e| !e.is_empty())
         .unwrap_or_else(|| "other".to_string())
+}
+
+/// Whether a file name is a standalone image we index in the image space.
+fn is_image_name(name: &str) -> bool {
+    matches!(
+        file_type(name).as_str(),
+        "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp" | "gif"
+    )
+}
+
+/// MIME type for a standalone image by extension.
+fn image_mime(name: &str) -> &'static str {
+    match file_type(name).as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "tif" | "tiff" => "image/tiff",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
 }
 
 /// First `# `/`## ` heading text in a Markdown string.

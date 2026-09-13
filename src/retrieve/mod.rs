@@ -2,6 +2,7 @@
 
 use crate::Result;
 use crate::embed::Embedder;
+use crate::embed::image::ImageEmbedder;
 use crate::model::{RetrievalMode, Scored};
 use crate::store::VectorStore;
 use std::collections::HashMap;
@@ -11,6 +12,8 @@ use std::sync::Arc;
 pub struct Retriever {
     store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
+    /// Image→text embedder; adds the image channel to hybrid search.
+    image: Option<Arc<dyn ImageEmbedder>>,
     rrf_k: f32,
 }
 
@@ -19,8 +22,15 @@ impl Retriever {
         Retriever {
             store,
             embedder,
+            image: None,
             rrf_k,
         }
+    }
+
+    /// Attach the image embedder so hybrid search also queries the image space.
+    pub fn with_image(mut self, image: Option<Arc<dyn ImageEmbedder>>) -> Self {
+        self.image = image;
+        self
     }
 
     /// Retrieve the top `k` chunks for `query` under `mode`.
@@ -48,7 +58,29 @@ impl Retriever {
         let q = self.embedder.embed_query(query).await?;
         let dense = self.store.vector_search(&q, wide).await?;
         let sparse = self.store.keyword_search(query, wide).await?;
-        Ok(rrf_fuse(&[dense, sparse], self.rrf_k, k))
+        let mut lists = vec![dense, sparse];
+        // The image channel: the same text query, embedded by the shared-space
+        // text tower, against image chunks. Fused by rank, so the incomparable
+        // score scales don't matter.
+        if let Some(image) = &self.image {
+            let iq = image.embed_query_text(query).await?;
+            lists.push(self.store.image_search(&iq, wide).await?);
+        }
+        Ok(rrf_fuse(&lists, self.rrf_k, k))
+    }
+
+    /// Image→image: embed the query image and search the image space.
+    pub async fn retrieve_image(&self, image: &[u8], k: usize) -> Result<Vec<Scored>> {
+        let embedder = self.image.as_ref().ok_or_else(|| {
+            crate::Error::config(
+                "image search needs an image embedder (LS_IMAGE_EMBED_PROVIDER is off)",
+            )
+        })?;
+        let mut vectors = embedder.embed_images(&[image.to_vec()]).await?;
+        let query = vectors
+            .pop()
+            .ok_or_else(|| crate::Error::embedding("image embedder returned no vector"))?;
+        self.store.image_search(&query, k).await
     }
 }
 

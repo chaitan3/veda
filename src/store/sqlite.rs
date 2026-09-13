@@ -11,7 +11,7 @@
 
 use super::VectorStore;
 use crate::math;
-use crate::model::{Chunk, ChunkKind, Document, Locator, MediaRef, Scored};
+use crate::model::{Chunk, ChunkKind, Document, Locator, Scored};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -21,8 +21,10 @@ use std::sync::{Arc, Mutex, Once};
 /// SQLite-backed [`VectorStore`].
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
-    /// Embedding dimensionality the `vec0` table was created for.
+    /// Embedding dimensionality the text `vec0` table was created for.
     dim: usize,
+    /// Image-space dimensionality, when the image channel is enabled.
+    image_dim: Option<usize>,
 }
 
 const SCHEMA: &str = r#"
@@ -48,7 +50,6 @@ CREATE TABLE IF NOT EXISTS chunks (
     text        TEXT NOT NULL,
     token_count INTEGER NOT NULL,
     kind        TEXT NOT NULL DEFAULT 'text',
-    media       TEXT,
     locator     TEXT,
     metadata    TEXT NOT NULL DEFAULT 'null',
     embedding   BLOB
@@ -86,8 +87,9 @@ fn register_sqlite_vec() {
 
 impl SqliteStore {
     /// Open (creating if needed) the database at `path`, with a vector index
-    /// sized for `dim`-dimensional embeddings.
-    pub async fn connect(path: &str, dim: usize) -> Result<Self> {
+    /// sized for `dim`-dimensional text embeddings and, optionally, a second
+    /// index for `image_dim`-dimensional image embeddings.
+    pub async fn connect(path: &str, dim: usize, image_dim: Option<usize>) -> Result<Self> {
         register_sqlite_vec();
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.as_os_str().is_empty()
@@ -99,6 +101,7 @@ impl SqliteStore {
         Ok(SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             dim: dim.max(1),
+            image_dim: image_dim.map(|d| d.max(1)),
         })
     }
 
@@ -113,7 +116,7 @@ impl SqliteStore {
     /// Best-effort: a dimensionality mismatch leaves the index empty and warns.
     fn backfill_vectors(conn: &Connection) -> Result<()> {
         let stored: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL",
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND kind = 'text'",
             [],
             |r| r.get(0),
         )?;
@@ -124,8 +127,9 @@ impl SqliteStore {
         }
         conn.execute("DELETE FROM chunk_vectors", [])?;
         let rows: Vec<(String, Vec<u8>)> = {
-            let mut stmt =
-                conn.prepare("SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL AND kind = 'text'",
+            )?;
             let mapped = stmt.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })?;
@@ -148,10 +152,6 @@ fn parse_locator(raw: Option<String>) -> Option<Locator> {
     raw.and_then(|s| serde_json::from_str(&s).ok())
 }
 
-fn parse_media(raw: Option<String>) -> Option<MediaRef> {
-    raw.and_then(|s| serde_json::from_str(&s).ok())
-}
-
 /// Columns selected for [`Document`] rows, in [`row_to_document`] order.
 const DOCUMENT_COLS: &str = "id, source_uri, title, hash, metadata, created_at";
 
@@ -169,9 +169,8 @@ fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
 
 fn row_to_chunk_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
     let kind: String = row.get(5)?;
-    let media: Option<String> = row.get(6)?;
-    let locator: Option<String> = row.get(7)?;
-    let metadata: String = row.get(8)?;
+    let locator: Option<String> = row.get(6)?;
+    let metadata: String = row.get(7)?;
     Ok(Chunk {
         id: row.get(0)?,
         doc_id: row.get(1)?,
@@ -179,14 +178,13 @@ fn row_to_chunk_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
         text: row.get(3)?,
         token_count: row.get(4)?,
         kind: kind.parse().unwrap_or(ChunkKind::Text),
-        media: parse_media(media),
         locator: parse_locator(locator),
         metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
         embedding: None,
     })
 }
 
-const CHUNK_COLS_QUALIFIED: &str = "chunks.id, chunks.doc_id, chunks.ordinal, chunks.text, chunks.token_count, chunks.kind, chunks.media, chunks.locator, chunks.metadata";
+const CHUNK_COLS_QUALIFIED: &str = "chunks.id, chunks.doc_id, chunks.ordinal, chunks.text, chunks.token_count, chunks.kind, chunks.locator, chunks.metadata";
 
 #[async_trait]
 impl VectorStore for SqliteStore {
@@ -202,6 +200,16 @@ impl VectorStore for SqliteStore {
             self.dim
         ))
         .map_err(|e| Error::store(format!("creating vector index failed: {e}")))?;
+        if let Some(image_dim) = self.image_dim {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS image_vectors USING vec0(
+                     chunk_id TEXT PRIMARY KEY,
+                     embedding float[{}] distance_metric=cosine
+                 );",
+                image_dim
+            ))
+            .map_err(|e| Error::store(format!("creating image vector index failed: {e}")))?;
+        }
         if let Err(e) = Self::backfill_vectors(&conn) {
             tracing::warn!(
                 error = %e,
@@ -254,18 +262,14 @@ impl VectorStore for SqliteStore {
         {
             let mut ins = tx.prepare(
                 "INSERT OR REPLACE INTO chunks
-                   (id, doc_id, ordinal, text, token_count, kind, media, locator, metadata, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                   (id, doc_id, ordinal, text, token_count, kind, locator, metadata, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             let mut fts = tx.prepare("INSERT INTO chunks_fts (chunk_id, text) VALUES (?1, ?2)")?;
             let mut vec_del = tx.prepare("DELETE FROM chunk_vectors WHERE chunk_id = ?1")?;
             let mut vec_ins =
                 tx.prepare("INSERT INTO chunk_vectors(chunk_id, embedding) VALUES (?1, ?2)")?;
             for c in chunks {
-                let media = match &c.media {
-                    Some(m) => Some(serde_json::to_string(m)?),
-                    None => None,
-                };
                 let locator = match &c.locator {
                     Some(l) => Some(serde_json::to_string(l)?),
                     None => None,
@@ -289,7 +293,6 @@ impl VectorStore for SqliteStore {
                     c.text,
                     c.token_count,
                     c.kind.as_str(),
-                    media,
                     locator,
                     metadata,
                     embedding
@@ -304,6 +307,97 @@ impl VectorStore for SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    async fn insert_image_chunks(&self, chunks: &[Chunk]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let image_dim = self.image_dim.ok_or_else(|| {
+            Error::store("image chunks require an image vector space (LS_IMAGE_EMBED_PROVIDER)")
+        })?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR REPLACE INTO chunks
+                   (id, doc_id, ordinal, text, token_count, kind, locator, metadata, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let mut vec_del = tx.prepare("DELETE FROM image_vectors WHERE chunk_id = ?1")?;
+            let mut vec_ins =
+                tx.prepare("INSERT INTO image_vectors(chunk_id, embedding) VALUES (?1, ?2)")?;
+            for c in chunks {
+                let locator = match &c.locator {
+                    Some(l) => Some(serde_json::to_string(l)?),
+                    None => None,
+                };
+                let metadata = serde_json::to_string(&c.metadata)?;
+                let embedding = c.embedding.as_deref().map(math::to_bytes);
+                if let Some(blob) = &embedding
+                    && blob.len() != image_dim * 4
+                {
+                    return Err(Error::store(format!(
+                        "image embedding has {} dimensions but the image index expects {} \
+                         (LS_IMAGE_EMBED_DIM); re-ingest after fixing the image embedder",
+                        blob.len() / 4,
+                        image_dim
+                    )));
+                }
+                // The image vector lives only in `image_vectors`; the chunks row's
+                // `embedding` stays NULL so the text-space backfill never sees a
+                // 768-d vector in the 64-d text column.
+                ins.execute(params![
+                    c.id,
+                    c.doc_id,
+                    c.ordinal,
+                    c.text,
+                    c.token_count,
+                    c.kind.as_str(),
+                    locator,
+                    metadata,
+                    Option::<Vec<u8>>::None
+                ])?;
+                if let Some(blob) = embedding {
+                    vec_del.execute(params![c.id])?;
+                    vec_ins.execute(params![c.id, blob])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    async fn image_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>> {
+        let image_dim = self
+            .image_dim
+            .ok_or_else(|| Error::store("image search requires an image vector space"))?;
+        if query.len() != image_dim {
+            return Err(Error::store(format!(
+                "image query vector has {} dimensions but the index expects {} \
+                 (LS_IMAGE_EMBED_DIM)",
+                query.len(),
+                image_dim
+            )));
+        }
+        let blob = math::to_bytes(query);
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHUNK_COLS_QUALIFIED}, v.distance
+             FROM image_vectors v JOIN chunks ON chunks.id = v.chunk_id
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance"
+        ))?;
+        let rows = stmt.query_map(params![blob, k as i64], |row| {
+            let distance: f64 = row.get(8)?;
+            let chunk = row_to_chunk_base(row)?;
+            Ok(Scored::new(chunk, (1.0 - distance) as f32))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     async fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>> {
@@ -323,7 +417,7 @@ impl VectorStore for SqliteStore {
              ORDER BY v.distance"
         ))?;
         let rows = stmt.query_map(params![blob, k as i64], |row| {
-            let distance: f64 = row.get(9)?;
+            let distance: f64 = row.get(8)?;
             let chunk = row_to_chunk_base(row)?;
             // vec0's cosine distance is 1 - cosine similarity; report similarity.
             Ok(Scored::new(chunk, (1.0 - distance) as f32))
@@ -348,7 +442,7 @@ impl VectorStore for SqliteStore {
              LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![match_expr, k as i64], |row| {
-            let rank: f64 = row.get(9)?;
+            let rank: f64 = row.get(8)?;
             let chunk = row_to_chunk_base(row)?;
             Ok(Scored::new(chunk, (-rank) as f32))
         })?;
@@ -444,6 +538,17 @@ impl VectorStore for SqliteStore {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    async fn get_chunk(&self, chunk_id: &str) -> Result<Option<Chunk>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHUNK_COLS_QUALIFIED} FROM chunks WHERE id = ?1"
+        ))?;
+        let chunk = stmt
+            .query_row(params![chunk_id], row_to_chunk_base)
+            .optional()?;
+        Ok(chunk)
     }
 
     async fn all_source_uris(&self) -> Result<Vec<String>> {

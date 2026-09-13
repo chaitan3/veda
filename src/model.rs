@@ -1,9 +1,10 @@
 //! Core data types shared across the pipeline: documents, chunks, scored hits.
 //!
 //! The model mirrors `docling-rag`'s `Document`/`Chunk` shape, extended with a
-//! [`ChunkKind`], an optional [`MediaRef`] and a [`Locator`] so image fragments
-//! and provenance (page / bounding box) are first-class from day one — even
-//! though Phase 0 only stores text chunks.
+//! [`ChunkKind`] and a [`Locator`] so image fragments and provenance (page /
+//! bounding box) are first-class from day one — even though Phase 0 only stores
+//! text chunks. Image bytes are not stored: a fragment is addressed by its
+//! document plus its [`Locator`], and rendered from the source on demand.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -81,14 +82,9 @@ impl FromStr for ChunkKind {
     }
 }
 
-/// A pointer to blobs on disk (relative to the configured blob root). Phase 1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MediaRef {
-    pub path: String,
-    pub mime: String,
-}
-
-/// Where a fragment sits in its source (Phase 0: page for PDFs).
+/// Where a fragment sits in its source: the 1-based page and an optional
+/// bounding box (page points, top-left origin). Image fragments are rendered
+/// from the source on demand rather than stored, so this is their address.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Locator {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,10 +109,7 @@ pub struct Chunk {
     /// Text or image fragment.
     #[serde(default)]
     pub kind: ChunkKind,
-    /// Blob pointer for image fragments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media: Option<MediaRef>,
-    /// Provenance within the source.
+    /// Provenance within the source (page / bbox); the image address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locator: Option<Locator>,
     /// Arbitrary per-chunk metadata (heading path, …).
@@ -148,7 +141,6 @@ impl Chunk {
             text: text.into(),
             token_count,
             kind: ChunkKind::Text,
-            media: None,
             locator: None,
             metadata: serde_json::Value::Null,
             embedding: None,

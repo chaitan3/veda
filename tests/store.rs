@@ -2,7 +2,7 @@
 //! keyword + vector search work over inserted chunks.
 
 use local_search::embed::{Embedder, hash::HashEmbedder};
-use local_search::model::{Chunk, Document};
+use local_search::model::{Chunk, ChunkKind, Document};
 use local_search::store::{VectorStore, sqlite::SqliteStore};
 
 async fn temp_store() -> SqliteStore {
@@ -12,7 +12,7 @@ async fn temp_store() -> SqliteStore {
         .unwrap()
         .as_nanos();
     path.push(format!("ls-test-{}-{nanos}.db", std::process::id()));
-    let store = SqliteStore::connect(path.to_str().unwrap(), 64)
+    let store = SqliteStore::connect(path.to_str().unwrap(), 64, None)
         .await
         .unwrap();
     store.migrate().await.unwrap();
@@ -91,6 +91,50 @@ async fn fts5_and_vector_search() {
     );
 }
 
+#[tokio::test]
+async fn image_space_is_separate_from_text() {
+    let mut path = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("ls-img-{}-{nanos}.db", std::process::id()));
+    let store = SqliteStore::connect(path.to_str().unwrap(), 64, Some(8))
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+
+    let doc = Document::new("file:///a.png", "a", "h1");
+    store.upsert_document(&doc).await.unwrap();
+
+    let mut image = Chunk::new(&doc.id, 0, "", 0);
+    image.kind = ChunkKind::Image;
+    image.metadata = serde_json::json!({ "mime": "image/png" });
+    image.embedding = Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    store.insert_image_chunks(&[image.clone()]).await.unwrap();
+
+    // It is retrievable by id and by image-space KNN.
+    let got = store.get_chunk(&image.id).await.unwrap().unwrap();
+    assert_eq!(got.kind, ChunkKind::Image);
+    let hits = store
+        .image_search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 5)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].chunk.id, image.id);
+
+    // The text space is untouched: image chunks are not in the text FTS/vec.
+    assert_eq!(store.count_chunks().await.unwrap(), 1);
+    let text_q = vec![1.0f32; 64];
+    assert!(store.vector_search(&text_q, 5).await.unwrap().is_empty());
+    assert!(
+        store
+            .keyword_search("anything", 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
 #[tokio::test]
 async fn document_and_chunk_lookups() {
     let store = temp_store().await;

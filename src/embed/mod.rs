@@ -7,6 +7,7 @@
 //! or Gemini backend by design.
 
 pub mod hash;
+pub mod image;
 pub mod llamacpp;
 
 #[cfg(feature = "onnx-embed")]

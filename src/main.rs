@@ -54,6 +54,9 @@ enum Command {
         /// Skip the local ONNX text embedder (bge-small-en-v1.5).
         #[arg(long)]
         no_embed: bool,
+        /// Skip the SigLIP2 image+text towers (~700 MB).
+        #[arg(long)]
+        no_image: bool,
     },
     /// Serve the read-only search API.
     Serve,
@@ -172,6 +175,13 @@ async fn main() -> anyhow::Result<()> {
             println!("source (cfg):   {}", cfg.source_paths.join(", "));
             println!("embedder:       {}", pipeline.embedder().id());
             println!("embed dim:      {}", pipeline.embedder().dim());
+            match pipeline.image_embedder() {
+                Some(image) => {
+                    println!("image embedder: {}", image.id());
+                    println!("image dim:      {}", image.dim());
+                }
+                None => println!("image embedder: off"),
+            }
             println!("extract:        {:?}", cfg.extract);
             println!("documents:      {}", store.count_documents().await?);
             println!("chunks:         {}", store.count_chunks().await?);
@@ -185,8 +195,8 @@ async fn main() -> anyhow::Result<()> {
             println!("removed {removed} document(s) with no chunks");
         }
 
-        Command::DownloadModels { no_embed } => {
-            local_search::download::download_models(&cfg, !no_embed).await?;
+        Command::DownloadModels { no_embed, no_image } => {
+            local_search::download::download_models(&cfg, !no_embed, !no_image).await?;
         }
 
         Command::Serve => {
