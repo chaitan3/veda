@@ -5,11 +5,11 @@
 //! to expose on loopback. Authentication is optional and disabled when
 //! `LS_API_KEYS` is empty.
 
-use crate::model::{Document, RetrievalMode, Scored};
+use crate::model::{Chunk, Document, RetrievalMode};
 use crate::pipeline::Pipeline;
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -17,6 +17,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Chunks returned by the item endpoint when `limit` is not given; also its cap.
+const DEFAULT_CHUNK_WINDOW: usize = 20;
+const MAX_CHUNK_WINDOW: usize = 100;
+/// Documents returned by the collection endpoint when `limit` is not given.
+const DEFAULT_DOC_PAGE: usize = 100;
+const MAX_DOC_PAGE: usize = 1000;
 
 /// Shared service state.
 #[derive(Clone)]
@@ -31,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/search", get(search_get).post(search_post))
         .route("/api/stats", get(stats))
         .route("/api/documents", get(documents))
+        .route("/api/documents/{id}", get(document_by_id))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
 
     Router::new()
@@ -85,12 +93,46 @@ fn presented_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// A compact document reference exposed by the API.
+///
+/// Deliberately omits `metadata` — which can hold the full converted text and
+/// per-file metrics — and the internal content hash, so search hits stay
+/// token-bounded. Full metadata lives in the store, never on the wire.
+#[derive(Serialize)]
+struct DocumentRef {
+    id: String,
+    title: String,
+    source_uri: String,
+    created_at: String,
+}
+
+impl From<&Document> for DocumentRef {
+    fn from(doc: &Document) -> Self {
+        DocumentRef {
+            id: doc.id.clone(),
+            title: doc.title.clone(),
+            source_uri: doc.source_uri.clone(),
+            created_at: doc.created_at.clone(),
+        }
+    }
+}
+
+/// One search hit: the chunk, its score, and its source document, so the result
+/// is self-contained and directly citable.
+#[derive(Serialize)]
+struct SearchResult {
+    chunk: Chunk,
+    score: f32,
+    document: DocumentRef,
+}
+
 #[derive(Serialize)]
 struct SearchResponse {
     query: String,
     mode: String,
     count: usize,
-    results: Vec<Scored>,
+    results: Vec<SearchResult>,
+    corpus_version: i64,
 }
 
 async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, k: usize) -> Response {
@@ -98,16 +140,39 @@ async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, k: usize
         return err(StatusCode::BAD_REQUEST, "query must not be empty");
     }
     match state.pipeline.query(mode, query, k).await {
-        Ok(mut results) => {
+        Ok(mut hits) => {
             // Embeddings are an internal detail; don't ship them to clients.
-            for hit in results.iter_mut() {
+            for hit in hits.iter_mut() {
                 hit.chunk.embedding = None;
             }
+            let store = state.pipeline.store();
+            // Hydrate each hit's parent document with a single batched lookup.
+            let mut ids: Vec<String> = hits.iter().map(|h| h.chunk.doc_id.clone()).collect();
+            ids.sort();
+            ids.dedup();
+            let documents = match store.get_documents_by_ids(&ids).await {
+                Ok(d) => d,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            let corpus_version = store.corpus_version().await.unwrap_or(0);
+            let results: Vec<SearchResult> = hits
+                .into_iter()
+                .filter_map(|hit| {
+                    documents
+                        .get(&hit.chunk.doc_id)
+                        .map(|document| SearchResult {
+                            chunk: hit.chunk,
+                            score: hit.score,
+                            document: DocumentRef::from(document),
+                        })
+                })
+                .collect();
             Json(SearchResponse {
                 query: query.to_string(),
                 mode: mode.to_string(),
                 count: results.len(),
                 results,
+                corpus_version,
             })
             .into_response()
         }
@@ -185,21 +250,104 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
     }))
 }
 
+#[derive(Deserialize)]
+struct PageParams {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct DocumentsResponse {
     count: usize,
-    documents: Vec<Document>,
+    offset: usize,
+    limit: usize,
+    total: usize,
+    next: Option<usize>,
+    documents: Vec<DocumentRef>,
 }
 
-async fn documents(State(state): State<AppState>) -> Response {
-    match state.pipeline.store().list_documents().await {
-        Ok(documents) => Json(DocumentsResponse {
-            count: documents.len(),
-            documents,
-        })
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+async fn documents(State(state): State<AppState>, Query(p): Query<PageParams>) -> Response {
+    let store = state.pipeline.store();
+    let total = match store.count_documents().await {
+        Ok(n) => n,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let limit = p.limit.unwrap_or(DEFAULT_DOC_PAGE).clamp(1, MAX_DOC_PAGE);
+    let offset = p.offset.unwrap_or(0);
+    let documents: Vec<DocumentRef> = match store.list_documents().await {
+        Ok(all) => all
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(DocumentRef::from)
+            .collect(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let next = (offset + documents.len() < total).then_some(offset + documents.len());
+    Json(DocumentsResponse {
+        count: documents.len(),
+        offset,
+        limit,
+        total,
+        next,
+        documents,
+    })
+    .into_response()
+}
+
+/// Fetch one document plus a bounded, pageable slice of its chunks.
+///
+/// This is the single expansion call: with no params it returns the first
+/// `limit` chunks; callers page with `offset`/`next`. Chunk `ordinal`s come from
+/// search hits, so a caller wanting context around a hit passes
+/// `offset = ordinal - radius`.
+async fn document_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(p): Query<PageParams>,
+) -> Response {
+    let store = state.pipeline.store();
+    let document = match store.get_document(&id).await {
+        Ok(Some(doc)) => DocumentRef::from(&doc),
+        Ok(None) => return err(StatusCode::NOT_FOUND, format!("no document with id '{id}'")),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let total = match store.count_chunks_for(&id).await {
+        Ok(n) => n,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let limit = p
+        .limit
+        .unwrap_or(DEFAULT_CHUNK_WINDOW)
+        .clamp(1, MAX_CHUNK_WINDOW);
+    let offset = p.offset.unwrap_or(0);
+    if offset >= total {
+        return Json(serde_json::json!({
+            "document": document,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "chunks": [],
+            "next": null,
+            "corpus_version": store.corpus_version().await.unwrap_or(0),
+        }))
+        .into_response();
     }
+    let chunks = match store.get_chunks_range(&id, offset, limit).await {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let next = (offset + chunks.len() < total).then_some(offset + chunks.len());
+    Json(serde_json::json!({
+        "document": document,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "chunks": chunks,
+        "next": next,
+        "corpus_version": store.corpus_version().await.unwrap_or(0),
+    }))
+    .into_response()
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {

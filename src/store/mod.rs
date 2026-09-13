@@ -13,6 +13,7 @@ use crate::Result;
 use crate::config::Config;
 use crate::model::{Chunk, Document, Scored};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A document + chunk store with dense vector and keyword search.
@@ -47,6 +48,23 @@ pub trait VectorStore: Send + Sync {
 
     /// Every stored document with its metadata.
     async fn list_documents(&self) -> Result<Vec<Document>>;
+
+    /// Load a single document by id.
+    async fn get_document(&self, doc_id: &str) -> Result<Option<Document>>;
+
+    /// Load several documents by id, keyed by id (one query, for hydrating
+    /// search hits without an N+1 lookup).
+    async fn get_documents_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Document>>;
+
+    /// A contiguous slice of one document's chunks, ordered by `ordinal`.
+    /// `offset` is an ordinal-space index; out-of-range offsets yield an empty
+    /// slice rather than an error.
+    async fn get_chunks_range(
+        &self,
+        doc_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Chunk>>;
 
     /// Every stored `source_uri` (for `--sync` deletion sweeps).
     async fn all_source_uris(&self) -> Result<Vec<String>>;

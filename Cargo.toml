@@ -51,3 +51,8 @@ required-features = ["docling-extract"]
 [[example]]
 name = "docling_dump"
 required-features = ["docling-extract"]
+
+[dev-dependencies]
+# Drive the axum router in-process (versions already in the dependency graph).
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

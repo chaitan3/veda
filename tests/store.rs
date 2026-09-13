@@ -90,3 +90,45 @@ async fn fts5_and_vector_search() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn document_and_chunk_lookups() {
+    let store = temp_store().await;
+    let doc = Document::new("file:///sample.txt", "sample", "cafe");
+    store.upsert_document(&doc).await.unwrap();
+
+    let texts = ["alpha", "beta", "gamma"];
+    let chunks: Vec<Chunk> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Chunk::new(&doc.id, i as i64, *t, 1))
+        .collect();
+    store.insert_chunks(&chunks).await.unwrap();
+
+    // Single lookup.
+    let got = store.get_document(&doc.id).await.unwrap().unwrap();
+    assert_eq!(got.source_uri, "file:///sample.txt");
+    assert!(store.get_document("missing").await.unwrap().is_none());
+
+    // Batched lookup, keyed by id, ignoring unknown ids.
+    let ids = vec![doc.id.clone(), "missing".to_string()];
+    let map = store.get_documents_by_ids(&ids).await.unwrap();
+    assert_eq!(map.len(), 1);
+    assert!(map.contains_key(&doc.id));
+    assert!(store.get_documents_by_ids(&[]).await.unwrap().is_empty());
+
+    // Chunk slice is ordered by ordinal and clamps out-of-range offsets.
+    let page = store.get_chunks_range(&doc.id, 1, 2).await.unwrap();
+    assert_eq!(
+        page.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+        vec!["beta", "gamma"]
+    );
+    assert_eq!(store.count_chunks_for(&doc.id).await.unwrap(), 3);
+    assert!(
+        store
+            .get_chunks_range(&doc.id, 99, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

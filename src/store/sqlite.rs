@@ -15,6 +15,7 @@ use crate::model::{Chunk, ChunkKind, Document, Locator, MediaRef, Scored};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Once};
 
 /// SQLite-backed [`VectorStore`].
@@ -149,6 +150,21 @@ fn parse_locator(raw: Option<String>) -> Option<Locator> {
 
 fn parse_media(raw: Option<String>) -> Option<MediaRef> {
     raw.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Columns selected for [`Document`] rows, in [`row_to_document`] order.
+const DOCUMENT_COLS: &str = "id, source_uri, title, hash, metadata, created_at";
+
+fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
+    let metadata: String = row.get(4)?;
+    Ok(Document {
+        id: row.get(0)?,
+        source_uri: row.get(1)?,
+        title: row.get(2)?,
+        hash: row.get(3)?,
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(5)?,
+    })
 }
 
 fn row_to_chunk_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chunk> {
@@ -368,21 +384,61 @@ impl VectorStore for SqliteStore {
 
     async fn list_documents(&self) -> Result<Vec<Document>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, source_uri, title, hash, metadata, created_at
-             FROM documents ORDER BY created_at DESC",
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DOCUMENT_COLS} FROM documents ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([], row_to_document)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    async fn get_document(&self, doc_id: &str) -> Result<Option<Document>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DOCUMENT_COLS} FROM documents WHERE id = ?1"
+        ))?;
+        let doc = stmt
+            .query_row(params![doc_id], row_to_document)
+            .optional()?;
+        Ok(doc)
+    }
+
+    async fn get_documents_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Document>> {
+        let mut out = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.lock()?;
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DOCUMENT_COLS} FROM documents WHERE id IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), row_to_document)?;
+        for r in rows {
+            let doc = r?;
+            out.insert(doc.id.clone(), doc);
+        }
+        Ok(out)
+    }
+
+    async fn get_chunks_range(
+        &self,
+        doc_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Chunk>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {CHUNK_COLS_QUALIFIED} FROM chunks
+             WHERE doc_id = ?1 ORDER BY ordinal LIMIT ?2 OFFSET ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![doc_id, limit as i64, offset as i64],
+            row_to_chunk_base,
         )?;
-        let rows = stmt.query_map([], |row| {
-            let metadata: String = row.get(4)?;
-            Ok(Document {
-                id: row.get(0)?,
-                source_uri: row.get(1)?,
-                title: row.get(2)?,
-                hash: row.get(3)?,
-                metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
-                created_at: row.get(5)?,
-            })
-        })?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
