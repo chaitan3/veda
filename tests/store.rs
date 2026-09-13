@@ -136,6 +136,58 @@ async fn image_space_is_separate_from_text() {
     );
 }
 #[tokio::test]
+async fn deleting_a_document_purges_its_image_vectors() {
+    let mut path = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("ls-imgdel-{}-{nanos}.db", std::process::id()));
+    let store = SqliteStore::connect(path.to_str().unwrap(), 64, Some(8))
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+
+    let image_chunk = |doc_id: &str, vector: Vec<f32>| {
+        let mut c = Chunk::new(doc_id, 0, "", 0);
+        c.kind = ChunkKind::Image;
+        c.embedding = Some(vector);
+        c
+    };
+
+    // Document A: an image whose vector matches the query exactly.
+    let a = Document::new("file:///a.png", "a", "ha");
+    store.upsert_document(&a).await.unwrap();
+    store
+        .insert_image_chunks(&[image_chunk(
+            &a.id,
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )])
+        .await
+        .unwrap();
+    store.delete_document(&a.id).await.unwrap();
+
+    // Document B: an image further from the query.
+    let b = Document::new("file:///b.png", "b", "hb");
+    store.upsert_document(&b).await.unwrap();
+    store
+        .insert_image_chunks(&[image_chunk(
+            &b.id,
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )])
+        .await
+        .unwrap();
+
+    // k=1: vec0 ranks before the JOIN, so a leftover A row would occupy the
+    // single slot and be dropped by the chunks JOIN, yielding zero results.
+    let hits = store
+        .image_search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "A's image vector must have been purged");
+    assert_eq!(hits[0].chunk.doc_id, b.id);
+}
+#[tokio::test]
 async fn document_and_chunk_lookups() {
     let store = temp_store().await;
     let doc = Document::new("file:///sample.txt", "sample", "cafe");

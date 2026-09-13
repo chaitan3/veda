@@ -573,6 +573,14 @@ impl VectorStore for SqliteStore {
             "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = ?1)",
             params![doc_id],
         )?;
+        // The image space only exists when the channel is enabled; vec0 tables
+        // have no FK, so they must be purged explicitly before the chunks go.
+        if self.image_dim.is_some() {
+            tx.execute(
+                "DELETE FROM image_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = ?1)",
+                params![doc_id],
+            )?;
+        }
         tx.execute("DELETE FROM chunks WHERE doc_id = ?1", params![doc_id])?;
         tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])?;
         tx.commit()?;
@@ -601,6 +609,9 @@ impl VectorStore for SqliteStore {
         conn.execute_batch(
             "DELETE FROM chunk_vectors; DELETE FROM chunks_fts; DELETE FROM chunks; DELETE FROM documents;",
         )?;
+        if self.image_dim.is_some() {
+            conn.execute("DELETE FROM image_vectors", [])?;
+        }
         Ok(())
     }
 
