@@ -240,6 +240,10 @@ impl Config {
             ("DOCLING_TABLEFORMER_BBOX", "tableformer/bbox.onnx"),
             ("DOCLING_OCR_REC_ONNX", "ocr_rec_en.onnx"),
             ("DOCLING_OCR_DICT", "en_dict.txt"),
+            // The hybrid/hierarchical chunker reads this one directly
+            // (chunk/mod.rs); without it a non-default model dir breaks
+            // structure-aware chunking.
+            ("DOCLING_CHUNK_TOKENIZER", "chunk/tokenizer.json"),
         ];
         for (key, rel) in per_model {
             let path = dir.join(rel);

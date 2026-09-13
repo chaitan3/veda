@@ -28,8 +28,9 @@ seams — while the data model is shaped for the image channel from day one.
 - **CLI**: `init-db`, `ingest` (`--sync`), `query`, `stats`, `prune`,
   `download-models`, `serve`.
 - **Service**: read-only `/api/search`, `/api/stats`, `/api/documents`,
-  `/health`; optional API-key auth (off by default); media/embedding internals
-  stripped from responses.
+  `/api/documents/{id}`, `/health`; optional API-key auth (off by default);
+  search hits are self-contained (chunk + ordinal + hydrated document) and
+  `/api/documents/{id}` pages a document's chunks.
 
 **Phase 1 (planned):** image captioning (VLM via llama.cpp), CLIP image
 embeddings, the image retrieval channel, media-serving routes.
@@ -59,6 +60,33 @@ curl 'localhost:8080/api/search?q=mountain+lake&k=5'
 Default end-to-end is fully local/ONNX: docling's ONNX extraction plus the
 in-process bge-small embedder. No network or extra services needed after
 `download-models`.
+
+### Docker
+
+The image compiles the binary inside NVIDIA's CUDA 13 + cuDNN 9 image (so the
+glibc matches) and downloads the models into a volume on first run. GPU runs
+need [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/).
+
+```bash
+docker build -t local-search .
+
+# ingest (one-shot; shares the data + model volumes with the server)
+docker run --rm --gpus all \
+  -v local-search-data:/data -v local-search-models:/models \
+  -v /host/documents:/documents:ro local-search ingest
+
+# serve
+docker run -d --name local-search --gpus all -p 8080:8080 \
+  -v local-search-data:/data -v local-search-models:/models \
+  -v /host/documents:/documents:ro local-search serve
+```
+
+Volumes: `/data` (DB + blobs), `/models` (downloaded model tree), `/documents`
+(ingest source), `/config` (optional `.env`). Drop `--gpus all` for a CPU-only
+host. Build with `--build-arg PUID=$(id -u) --build-arg PGID=$(id -g)` to match
+bind-mounted host directories. See `docker/.env.example` and
+[`docs/PRODUCTION.md`](docs/PRODUCTION.md).
+
 
 `ingest` logs each file with its extraction method and chunker, then prints a
 per-type summary of files, chunks and elapsed time:
@@ -166,7 +194,19 @@ document (no silent drops).
 | GET | `/api/search?q=&mode=&k=` | search (`vector` \| `bm25` \| `hybrid`) |
 | POST | `/api/search` | `{"query","mode","top_k"}` |
 | GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
-| GET | `/api/documents` | stored documents with metadata |
+| GET | `/api/documents?offset=&limit=` | stored documents (paged) |
+| GET | `/api/documents/{id}?offset=&limit=` | one document + a bounded, pageable chunk slice |
+
+Each search hit carries its `chunk` (including the `ordinal`), its `score`, and
+a hydrated `document` reference (`id`, `title`, `source_uri`, `created_at`), so
+results are self-contained and citable in one call. The reference is
+deliberately compact: `metadata` — which can embed the full converted text — and
+the internal content hash are never sent.
+
+`/api/documents/{id}` is the **single expansion call**: with no params it returns
+the first 20 chunks, and callers page with `offset`/`next` (capped at 100). An
+offset past the end returns an empty `chunks` list, not an error — so a caller
+can always pass `offset = ordinal - radius` for context around a hit.
 
 Auth is disabled unless `LS_API_KEYS` is set; then send `X-Api-Key`,
 `Authorization: Bearer`, or `?api_key=`.

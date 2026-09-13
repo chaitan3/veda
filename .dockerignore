@@ -1,0 +1,14 @@
+# Build context for the container image. Everything not needed to compile the
+# binary is excluded; models are downloaded into a volume at run time instead of
+# being copied in, so the ~800 MB dist/ and ~650 MB model trees stay out.
+target/
+dist/
+.git/
+.gitignore
+.models/
+.pdfium/
+data/
+*.db
+*.db-wal
+*.db-shm
+.env

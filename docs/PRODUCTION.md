@@ -80,6 +80,49 @@ Docling passthrough (names unchanged): `DOCLING_RS_OCR_LANG`, `DOCLING_RS_EP`
 - Content-hash dedup skips unchanged files; exit code **2** if any file failed.
 - Schedule it (systemd timer / cron); there is no folder watcher.
 
+## Docker
+
+The image is a two-stage build: `local-search` is compiled inside
+`nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04` so it links glibc 2.39, matching the
+Ubuntu 24.04 runtime image (`nvidia/cuda:13.0.0-cudnn-runtime-ubuntu24.04`).
+Do **not** copy a host-built binary into the image: one built on a rolling
+distro requires `GLIBC_2.43` (re-versioned libm functions) and will not load.
+
+```bash
+docker build -t local-search .
+
+# one-off ingest (same volumes as the server)
+docker run --rm --gpus all \
+  -v local-search-data:/data -v local-search-models:/models \
+  -v /srv/documents:/documents:ro local-search ingest
+
+# server
+docker run -d --name local-search --restart unless-stopped --gpus all \
+  -p 8080:8080 \
+  -v local-search-data:/data -v local-search-models:/models \
+  -v /srv/documents:/documents:ro \
+  local-search serve
+```
+
+| Mount | Holds | Notes |
+|---|---|---|
+| `/data` | SQLite DB + blobs | named volume; the only mutable state |
+| `/models` | docling assets + embedder | downloaded on first run (~650 MB); must be writable |
+| `/documents` | ingest source | mount read-only |
+| `/config` | optional `.env` | Docker env vars take precedence |
+
+- **Models** are not baked in; the entrypoint runs `download-models` when the
+  volume is empty. Set `LS_SKIP_MODEL_DOWNLOAD=1` for a pre-provisioned volume,
+  a remote-VLM (`LS_EXTRACT_PIPELINE=vlm`) or `LS_EMBED_PROVIDER=llamacpp` setup.
+- **Non-root**: the entrypoint runs as root only to prepare volumes, then drops
+  to `PUID:PGID` (default `1000:1000`). Match a bind-mounted host directory with
+  `docker build --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .`
+- **GPU**: `--gpus all` requires nvidia-container-toolkit. Without it, drop the
+  flag and the ONNX runtime falls back to CPU (logged).
+- **Single writer**: SQLite is single-writer. Run the ingest container to
+  completion before/around serving; do not run two ingests at once.
+- Health: the image healthcheck polls `GET /health` on `${LS_ADDR}`.
+
 ## Service
 
 Install `deploy/local-search.service`, set `LS_DB_PATH` to a path under
