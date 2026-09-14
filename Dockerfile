@@ -31,6 +31,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+# Vendored docling-onnx (see `[patch.crates-io]` in Cargo.toml); the build fails
+# with "failed to read /build/vendor/docling-onnx/Cargo.toml" without it.
+COPY vendor ./vendor
 COPY src ./src
 COPY examples ./examples
 COPY tests ./tests
