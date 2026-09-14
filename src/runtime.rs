@@ -1,4 +1,4 @@
-//! ONNX execution-provider selection and reporting.
+//! ONNX execution-provider selection, reporting, and docling runtime defaults.
 //!
 //! docling's default when a GPU provider is compiled in is `auto` — but ORT's
 //! `auto` only falls back to CPU when the provider fails to *register*. If the
@@ -6,6 +6,12 @@
 //! (the common `libcudnn.so` case), the kernel errors out and there is no
 //! fallback. So before docling caches its choice we probe for the CUDA runtime
 //! ourselves and, when it is missing, pin the provider to CPU and say so.
+//!
+//! We also apply two docling defaults the operator did not set:
+//! - `DOCLING_RS_OCR_ORIENTATION=off` (orientation detection re-runs the
+//!   recognizer on rotated hypotheses and is a large share of OCR time),
+//! - on CUDA, `DOCLING_RS_PDF_WORKERS=1` (parallel page workers each build
+//!   their own CUDA sessions and exhaust GPU memory).
 
 /// Resolve and report the execution provider, disabling CUDA up front when its
 /// runtime libraries are not loadable.
@@ -20,6 +26,7 @@ pub fn log_execution_provider() {
         let forced_to_cpu = cuda_forced_cpu();
 
         let choice = docling_onnx::choice();
+        apply_runtime_defaults(choice);
         if forced_to_cpu {
             tracing::info!(resolved = ?choice, "ONNX execution provider (CPU fallback)");
         } else {
@@ -44,6 +51,48 @@ pub fn log_execution_provider() {
 
         #[cfg(not(feature = "cuda"))]
         tracing::info!("built without the 'cuda' feature; ONNX runs on CPU");
+    }
+}
+
+/// Apply docling defaults the operator did not set. Runs at startup, before
+/// docling reads (and caches) them.
+#[cfg(any(feature = "docling-extract", feature = "onnx-embed"))]
+fn apply_runtime_defaults(choice: docling_onnx::Ep) {
+    // Orientation detection re-runs the OCR recognizer over rotated hypotheses —
+    // a large share of OCR time — for pages that are rarely rotated. Off by
+    // default; set `DOCLING_RS_OCR_ORIENTATION=auto` to re-enable.
+    set_default("DOCLING_RS_OCR_ORIENTATION", "off");
+
+    // The default parallel page workers each build their own CUDA sessions and
+    // exhaust GPU memory (cuBLAS allocation failure / OOM). A single serial
+    // worker is the reliable default on CUDA; override with
+    // `DOCLING_RS_PDF_WORKERS` if the GPU has headroom.
+    if !matches!(choice, docling_onnx::Ep::Cpu) {
+        set_default("DOCLING_RS_PDF_WORKERS", "1");
+    }
+}
+
+/// Set a docling variable only when the operator has not already set it.
+#[cfg(any(feature = "docling-extract", feature = "onnx-embed"))]
+fn set_default(name: &str, value: &str) {
+    if std::env::var_os(name).is_none() {
+        // SAFETY: startup-time, single-threaded; set before docling reads it.
+        unsafe { std::env::set_var(name, value) };
+        tracing::info!(var = name, value, "applying docling default");
+    }
+}
+
+/// Whether the resolved execution provider is a GPU. Used to pick GPU-safe
+/// defaults (code/formula enrichment off, since CodeFormulaV2's fp32 models do
+/// not fit alongside the rest of the pipeline on a modest card).
+pub fn gpu_selected() -> bool {
+    #[cfg(any(feature = "docling-extract", feature = "onnx-embed"))]
+    {
+        !matches!(docling_onnx::choice(), docling_onnx::Ep::Cpu)
+    }
+    #[cfg(not(any(feature = "docling-extract", feature = "onnx-embed")))]
+    {
+        false
     }
 }
 

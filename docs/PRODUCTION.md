@@ -149,6 +149,24 @@ The log line `CUDA execution provider registered; GPU inference enabled`
 confirms GPU use. If `libcudnn` is missing, the provider is pinned to CPU and
 the fallback is logged. Force either side with `DOCLING_RS_EP=cuda|cpu`.
 
+The binary applies three defaults at startup unless you set them:
+`DOCLING_RS_OCR_ORIENTATION=off` (the orientation pass is a large share of OCR
+time), `DOCLING_RS_PDF_WORKERS=1` when the provider resolves to CUDA (parallel
+page workers exhaust GPU memory and fail with `cuBLAS` allocation errors), and
+`LS_EXTRACT_CODE_FORMULA=false` on CUDA (CodeFormulaV2's fp32 models do not fit
+alongside the rest on a modest card — it stays on for CPU). Override any of them
+to change the behaviour; raise `PDF_WORKERS` only if the GPU has headroom.
+
+On top of that, a **vendored `docling-onnx` patch** (see `vendor/docling-onnx`,
+wired via `[patch.crates-io]`) registers CUDA with memory-friendly defaults:
+HEURISTIC cuDNN conv search with a 32 MB workspace cap and
+`SameAsRequested` arena growth, instead of ORT's EXHAUSTIVE search with an
+unbounded workspace and power-of-two arenas. That is what keeps a 15-page,
+OCR-heavy PDF stable on an 11 GB card (peak ~8.1 GB instead of ~10.7 GB and
+intermittent OOM). Override with `DOCLING_RS_CUDA_CONV_ALGO`,
+`DOCLING_RS_CUDA_CONV_MAX_WORKSPACE`, `DOCLING_RS_CUDA_ARENA_EXTEND`, and
+`DOCLING_RS_CUDA_MEM_LIMIT_MB`.
+
 ## Upgrades and the database
 
 There is **no need to rebuild the database from scratch** for a new pipeline:

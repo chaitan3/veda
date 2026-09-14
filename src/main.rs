@@ -87,6 +87,18 @@ async fn main() -> anyhow::Result<()> {
     cfg.apply_docling_env();
     // Report the ONNX execution provider (CUDA vs CPU fallback).
     local_search::runtime::log_execution_provider();
+    // On a GPU, CodeFormulaV2's fp32 models do not fit alongside layout / OCR /
+    // TableFormer on a modest card (docling prefers fp32 on CUDA), so default
+    // code/formula enrichment off unless the operator asked for it.
+    if std::env::var_os("LS_EXTRACT_CODE_FORMULA").is_none()
+        && local_search::runtime::gpu_selected()
+    {
+        cfg.code_formula = false;
+        tracing::info!(
+            "GPU execution selected; defaulting code/formula enrichment off \
+             (set LS_EXTRACT_CODE_FORMULA=true to override)"
+        );
+    }
 
     match cli.command {
         Command::InitDb => {

@@ -141,7 +141,7 @@ See `.env.example` for the full list. Key RAG-layer settings:
 | `LS_SOURCE_PATH` | `docs` | folder(s) the ingest CLI walks; path-separated |
 | `LS_MODELS_DIR` | `.models` | model tree; fans out to docling's `DOCLING_*` vars |
 | `LS_EXTRACT_PIPELINE` | `onnx` | `onnx` (local) or `vlm` (remote, llama.cpp) |
-| `LS_EXTRACT_CODE_FORMULA` | `true` | CodeFormulaV2 code/formula enrichment (skipped if models absent) |
+| `LS_EXTRACT_CODE_FORMULA` | `true` on CPU / `false` on CUDA | CodeFormulaV2 code/formula enrichment (skipped if models absent) |
 | `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `llamacpp` \| `hash` |
 | `LS_IMAGE_EMBED_PROVIDER` | `siglip` | `siglip` \| `off` \| `hash` — image channel (SigLIP2 shared space) |
 | `LS_EMBED_DIM` | `384` | must match the embedder; sizes the `vec0` index |
@@ -245,9 +245,18 @@ re-runs only the stages whose configuration or models changed.
   query-by-image. Image chunks carry a `media_url` served by
   `GET /api/media/{chunk_id}` (from the source file; nothing is stored). PDF
   figure extraction is not implemented yet.
-- **Code/formula enrichment** (CodeFormulaV2): **on by default**
-  (`LS_EXTRACT_CODE_FORMULA=true`). Requires the models fetched by
-  `download-models`; if they're missing the pass is skipped with a warning.
+- **Code/formula enrichment** (CodeFormulaV2): on by default on **CPU**, off
+  when the provider resolves to **CUDA** (`LS_EXTRACT_CODE_FORMULA`). Requires
+  the models fetched by `download-models`; if they're missing the pass is
+  skipped with a warning. Set `LS_EXTRACT_CODE_FORMULA=true` to force it on.
+- **Runtime defaults** (all overridable): `DOCLING_RS_OCR_ORIENTATION=off`
+  (the orientation pass re-runs the recognizer over rotated hypotheses and is a
+  large share of OCR time), and on CUDA `DOCLING_RS_PDF_WORKERS=1` (parallel
+  page workers each build their own CUDA sessions and exhaust GPU memory). Set
+  either explicitly to opt back in. A vendored `docling-onnx` patch additionally
+  applies memory-friendly CUDA defaults (HEURISTIC conv search, capped
+  workspace, `SameAsRequested` arenas) — see `vendor/docling-onnx` and
+  `docs/PRODUCTION.md`.
 - `LS_EMBED_PROVIDER=hash` is deterministic but **not semantic** — for smoke
   tests only.
 - BM25 scores are zero on very small corpora (FTS5's IDF collapses); ranking
