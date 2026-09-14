@@ -67,6 +67,12 @@ tower = { version = "0.5", features = ["util"] }
 
 # Vendored docling-onnx with a CUDA memory patch (see vendor/docling-onnx):
 # memory-friendly cuDNN conv search and arena growth, overridable via
-# DOCLING_RS_CUDA_* env vars. Remove this to track upstream.
+# DOCLING_RS_CUDA_* env vars, plus shared run options with CUDA
+# memory-arena shrinkage (DOCLING_RS_CUDA_ARENA_SHRINK) so session-reuse
+# across an ingest batch stops ratcheting reserved VRAM. Remove this to
+# track upstream.
 [patch.crates-io]
 docling-onnx = { path = "vendor/docling-onnx" }
+# Same patch series, run-options side: every ONNX inference call in
+# docling-pdf runs through docling-onnx::shrink_run_options().
+docling-pdf = { path = "vendor/docling-pdf" }

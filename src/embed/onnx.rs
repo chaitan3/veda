@@ -117,16 +117,22 @@ impl OnnxEmbedder {
         let outputs = if self.needs_token_type_ids {
             let type_tensor = Tensor::from_array(([batch, seq], types))
                 .map_err(|e| Error::embedding(e.to_string()))?;
-            session.run(ort::inputs![
-                "input_ids" => id_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => type_tensor,
-            ])
+            session.run_with_options(
+                ort::inputs![
+                    "input_ids" => id_tensor,
+                    "attention_mask" => mask_tensor,
+                    "token_type_ids" => type_tensor,
+                ],
+                docling_onnx::shrink_run_options(),
+            )
         } else {
-            session.run(ort::inputs![
-                "input_ids" => id_tensor,
-                "attention_mask" => mask_tensor,
-            ])
+            session.run_with_options(
+                ort::inputs![
+                    "input_ids" => id_tensor,
+                    "attention_mask" => mask_tensor,
+                ],
+                docling_onnx::shrink_run_options(),
+            )
         }
         .map_err(|e| Error::embedding(format!("onnx run: {e}")))?;
 

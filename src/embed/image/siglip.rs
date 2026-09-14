@@ -191,10 +191,10 @@ impl SigLipEmbedder {
             .lock()
             .map_err(|_| Error::embedding("SigLIP vision mutex poisoned"))?;
         let outputs = session
-            .run(vec![(
-                self.vision_input.as_str(),
-                SessionInputValue::from(input),
-            )])
+            .run_with_options(
+                vec![(self.vision_input.as_str(), SessionInputValue::from(input))],
+                docling_onnx::shrink_run_options(),
+            )
             .map_err(|e| Error::embedding(format!("SigLIP vision run: {e}")))?;
         let pooled = extract_pooled(&outputs[self.vision_output.as_str()], batch, None)?;
         Ok(pooled)
@@ -247,7 +247,7 @@ impl SigLipEmbedder {
             .lock()
             .map_err(|_| Error::embedding("SigLIP text mutex poisoned"))?;
         let outputs = session
-            .run(input_values)
+            .run_with_options(input_values, docling_onnx::shrink_run_options())
             .map_err(|e| Error::embedding(format!("SigLIP text run: {e}")))?;
         let pooled = extract_pooled(&outputs[self.text_output.as_str()], batch, Some(&mask))?;
         Ok(pooled)

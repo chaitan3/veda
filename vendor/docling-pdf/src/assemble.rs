@@ -1,0 +1,3691 @@
+//! Layout-driven assembly: map detected [`Region`]s + text cells to a
+//! [`DoclingDocument`], mirroring docling's page-assembly + reading-order.
+//!
+//! Overlapping detections are resolved greedily by score, each text cell is
+//! assigned to its best-containing region, regions are ordered in reading order
+//! (two-column aware), and each becomes a typed node by its layout label.
+
+use docling_core::{Node, PictureClass, PictureImage, Table};
+#[cfg(feature = "ml")]
+use image::RgbImage;
+
+use crate::layout::Region;
+use crate::pdfium_backend::{PdfPage, TextCell};
+
+fn area(l: f32, t: f32, r: f32, b: f32) -> f32 {
+    ((r - l).max(0.0)) * ((b - t).max(0.0))
+}
+
+/// Intersection area of two boxes.
+fn inter(a: &Region, l: f32, t: f32, r: f32, b: f32) -> f32 {
+    let il = a.l.max(l);
+    let it = a.t.max(t);
+    let ir = a.r.min(r);
+    let ib = a.b.min(b);
+    area(il, it, ir, ib)
+}
+
+/// Wrapper (structured-region) labels, ported from docling
+/// `LayoutPostprocessor.WRAPPER_TYPES`: a region that *contains* other regions
+/// and renders as a structured block (a table / table-of-contents index), not as
+/// its own flat text.
+fn is_wrapper(label: &str) -> bool {
+    matches!(
+        label,
+        "table" | "document_index" | "form" | "key_value_region"
+    )
+}
+
+/// Labels docling's table-structure (TableFormer) model runs on and that render
+/// as a Markdown table: a plain `table` and a `document_index` (a table of
+/// contents), which docling assembles as a `TableItem` too.
+pub fn is_table_like(label: &str) -> bool {
+    matches!(label, "table" | "document_index")
+}
+
+/// Greedily keep regions by descending score, dropping a region that is mostly
+/// covered by an already-kept one (RT-DETR emits overlapping duplicates).
+fn greedy(mut regions: Vec<Region>) -> Vec<Region> {
+    regions.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut kept: Vec<Region> = Vec::new();
+    for r in regions {
+        let ra = area(r.l, r.t, r.r, r.b).max(1.0);
+        let covered = kept.iter().any(|k| {
+            let i = inter(&r, k.l, k.t, k.r, k.b);
+            let ka = area(k.l, k.t, k.r, k.b).max(1.0);
+            // drop if most of r is inside k, or they strongly mutually overlap
+            i / ra > 0.7 || i / (ra + ka - i) > 0.5
+        });
+        if !covered {
+            kept.push(r);
+        }
+    }
+    kept
+}
+
+/// Resolve overlapping RT-DETR detections, ported from the bucket structure of
+/// docling's `LayoutPostprocessor`: regular, picture and wrapper clusters live in
+/// **separate** spatial indexes and are de-overlapped independently, so a
+/// high-score picture never suppresses a lower-score table or table-of-contents
+/// index (the redp5110 TOC that was otherwise replaced by a picture box). A
+/// cross-type pass first drops a picture that nearly coincides with a table
+/// (`_handle_cross_type_overlaps`), keeping the structured table.
+/// docling's `_remove_overlapping_clusters("picture")`: same-label picture
+/// detections whose boxes heavily overlap (IoU > 0.8, or either box > 80 %
+/// contained in the other) form one group, and a single survivor is kept per
+/// group. Survivor selection ports `_should_prefer_cluster` /
+/// `_select_best_cluster_from_group` with the picture params
+/// (`area_threshold` 2.0, `conf_threshold` 0.3): a candidate is rejected only
+/// when a rival is both comparable in size (candidate ≤ 2× its area) and
+/// clearly more confident (> 0.3); among the survivors the *larger* box wins
+/// unless it is > 0.3 less confident. Net effect on the corpus: a figure the
+/// detector proposes both whole and as its sub-panels (2206's four-thumbnail
+/// Figure 1) collapses to the whole-figure box, exactly like docling.
+pub(crate) fn dedup_pictures(regions: &mut Vec<Region>) {
+    let idx: Vec<usize> = (0..regions.len())
+        .filter(|&i| regions[i].label == "picture")
+        .collect();
+    if idx.len() < 2 {
+        return;
+    }
+    // Union-find over the picture subset.
+    let mut parent: Vec<usize> = (0..idx.len()).collect();
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut cur = i;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    let boxed = |r: &Region| (r.l, r.t, r.r, r.b);
+    for a in 0..idx.len() {
+        for b in (a + 1)..idx.len() {
+            let (ra, rb) = (&regions[idx[a]], &regions[idx[b]]);
+            let (al, at, ar, ab_) = boxed(ra);
+            let (bl, bt, br, bb) = boxed(rb);
+            let ix = (ar.min(br) - al.max(bl)).max(0.0);
+            let iy = (ab_.min(bb) - at.max(bt)).max(0.0);
+            let inter = ix * iy;
+            let aa = area(al, at, ar, ab_).max(f32::EPSILON);
+            let ba = area(bl, bt, br, bb).max(f32::EPSILON);
+            let iou = inter / (aa + ba - inter).max(f32::EPSILON);
+            if iou > 0.8 || inter / aa > 0.8 || inter / ba > 0.8 {
+                let (pa, pb) = (find(&mut parent, a), find(&mut parent, b));
+                if pa != pb {
+                    parent[pa] = pb;
+                }
+            }
+        }
+    }
+    // Per group, run docling's pairwise preference + larger-wins selection.
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..idx.len() {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(i);
+    }
+    let mut drop = vec![false; regions.len()];
+    for group in groups.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        const AREA_THRESHOLD: f32 = 2.0;
+        const CONF_THRESHOLD: f32 = 0.3;
+        let area_of = |i: usize| {
+            let r = &regions[idx[i]];
+            area(r.l, r.t, r.r, r.b).max(f32::EPSILON)
+        };
+        let mut best: Option<usize> = None;
+        for &cand in group {
+            let passes = group.iter().all(|&other| {
+                if other == cand {
+                    return true;
+                }
+                let area_ratio = area_of(cand) / area_of(other);
+                let conf_diff = regions[idx[other]].score - regions[idx[cand]].score;
+                !(area_ratio <= AREA_THRESHOLD && conf_diff > CONF_THRESHOLD)
+            });
+            if passes {
+                best = Some(match best {
+                    None => cand,
+                    Some(cur) => {
+                        if area_of(cand) > area_of(cur)
+                            && regions[idx[cur]].score - regions[idx[cand]].score <= CONF_THRESHOLD
+                        {
+                            cand
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+        }
+        // Every candidate rejected can't happen with docling's rule (rejection
+        // needs a strictly better rival); guard with highest score anyway.
+        let keep = best.unwrap_or_else(|| {
+            *group
+                .iter()
+                .max_by(|&&a, &&b| regions[idx[a]].score.total_cmp(&regions[idx[b]].score))
+                .expect("non-empty group")
+        });
+        for &i in group {
+            if i != keep {
+                drop[idx[i]] = true;
+            }
+        }
+    }
+    let mut keep_iter = drop.into_iter();
+    regions.retain(|_| !keep_iter.next().expect("aligned"));
+}
+
+/// `intersection_over_union` of two regions.
+fn iou(a: &Region, b: &Region) -> f32 {
+    let i = inter(a, b.l, b.t, b.r, b.b);
+    let u = area(a.l, a.t, a.r, a.b) + area(b.l, b.t, b.r, b.b) - i;
+    if u > 0.0 {
+        i / u
+    } else {
+        0.0
+    }
+}
+
+/// docling's `_resolve_coincident_pairs` (#4059, 2.122): for every (loser,
+/// winner) pair at a near-identical box (IoU > 0.8) whose confidences are
+/// within 0.1 (`loser.score - winner.score < 0.1`), the loser label is dropped
+/// so the label with the richer downstream semantic survives. Nothing else —
+/// containment, area — is considered; a clearly more confident loser stays.
+fn coincident_losers(regions: &[Region], losers: &[usize], winners: &[usize]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for &li in losers {
+        for &wi in winners {
+            if iou(&regions[li], &regions[wi]) > 0.8 && regions[li].score - regions[wi].score < 0.1
+            {
+                out.push(li);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// docling's `_handle_cross_type_overlaps` (2.122/2.123 shape): the layout
+/// model can emit one grounded region under several labels, and the picture /
+/// table / container buckets are de-overlapped independently, so such a region
+/// survives twice. Elect a winner for the near-identical pairs:
+///
+/// | pair                                  | loser     | winner              |
+/// |---------------------------------------|-----------|---------------------|
+/// | TABLE vs DOCUMENT_INDEX               | table     | document_index      |
+/// | PICTURE vs TABLE / DOCUMENT_INDEX     | picture   | the table-like      |
+/// | FORM / KEY_VALUE_REGION vs *surviving* TABLE / DOCUMENT_INDEX / PICTURE | container | structured element |
+///
+/// IoU (not containment) so a genuine small figure inside a large table region
+/// is not removed; the confidence tolerance keeps a clearly more confident
+/// loser (an earlier port dropped every coincident picture regardless).
+fn handle_cross_type_overlaps(regions: Vec<Region>) -> Vec<Region> {
+    let by = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        (0..regions.len())
+            .filter(|&i| pred(regions[i].label))
+            .collect()
+    };
+    let tables = by(&|l| l == "table");
+    let doc_indices = by(&|l| l == "document_index");
+    let pictures = by(&|l| l == "picture");
+    let containers = by(&|l| matches!(l, "form" | "key_value_region"));
+    let mut drop = vec![false; regions.len()];
+    for i in coincident_losers(&regions, &tables, &doc_indices) {
+        drop[i] = true;
+    }
+    let table_like: Vec<usize> = tables.iter().chain(&doc_indices).copied().collect();
+    for i in coincident_losers(&regions, &pictures, &table_like) {
+        drop[i] = true;
+    }
+    let structured: Vec<usize> = table_like
+        .iter()
+        .chain(&pictures)
+        .copied()
+        .filter(|&i| !drop[i])
+        .collect();
+    for i in coincident_losers(&regions, &containers, &structured) {
+        drop[i] = true;
+    }
+    let mut drop = drop.into_iter();
+    let mut regions = regions;
+    regions.retain(|_| !drop.next().expect("aligned"));
+    regions
+}
+
+pub fn resolve(regions: Vec<Region>) -> Vec<Region> {
+    let regions = handle_cross_type_overlaps(regions);
+    // De-overlap each bucket on its own.
+    let pictures = greedy(
+        regions
+            .iter()
+            .filter(|r| r.label == "picture")
+            .cloned()
+            .collect(),
+    );
+    // Tables and containers are separate buckets since docling 2.123
+    // (`TABLE_TYPES` vs `CONTAINER_TYPES`, docling#4064): a form drawn around a
+    // table no longer competes with it for survival — the table nests inside
+    // the container instead (`order_with_containers`).
+    let tables = greedy(
+        regions
+            .iter()
+            .filter(|r| is_table_like(r.label))
+            .cloned()
+            .collect(),
+    );
+    let containers = greedy(
+        regions
+            .iter()
+            .filter(|r| matches!(r.label, "form" | "key_value_region"))
+            .cloned()
+            .collect(),
+    );
+    let mut kept = greedy(
+        regions
+            .iter()
+            .filter(|r| r.label != "picture" && !is_wrapper(r.label))
+            .cloned()
+            .collect(),
+    );
+    dedup_nested_code(&mut kept);
+    kept.extend(pictures);
+    kept.extend(tables);
+    kept.extend(containers);
+    kept
+}
+
+/// Drop a regular region that is >80% contained in a surviving special region we
+/// render **as a single unit** — a table/table-of-contents index — ported from
+/// docling's "Remove regular clusters that are included in wrappers" step: the
+/// special absorbs it as a child (a table cell), so it must not also be emitted
+/// as its own paragraph/list-item. This stops the survey list-items from
+/// appearing both inside the detected table and again as bullets
+/// (`table_mislabeled_as_picture`).
+///
+/// `picture` regions stay in the swallow set even after #165: docling keeps a
+/// picture's contained clusters as the `PictureItem`'s *children* in the
+/// document JSON (`ReadingOrderModel._add_child_elements`), but its
+/// `MarkdownPictureSerializer` prints only the caption and the image — the
+/// children never reach the Markdown (verified against the corpus groundtruth:
+/// `amt_handbook`'s in-figure callout labels are absent). Dropping the
+/// fully-contained regulars here reproduces exactly that. What #165 *does*
+/// change is upstream, in [`add_orphan_regions`]: pictures no longer claim
+/// cells, so a line only partially under a figure box (straddling its border,
+/// ≤80 % contained) now forms an orphan region that survives this drop — those
+/// words were silently erased before, and docling emits them.
+///
+/// `form` / `key_value_region` wrappers are deliberately **excluded**: this
+/// pipeline does not render them as a structured block (they are skipped), so
+/// their textual content comes precisely from the contained regular regions —
+/// dropping those would erase the page (e.g. `right_to_left_03`'s form-heavy
+/// pages). Runs *after* [`drop_false_pictures`] so a phantom picture can't
+/// swallow real text on its way out.
+pub fn drop_contained_regulars(regions: &mut Vec<Region>) {
+    let specials: Vec<(f32, f32, f32, f32)> = regions
+        .iter()
+        .filter(|r| r.label == "picture" || is_table_like(r.label))
+        .map(|r| (r.l, r.t, r.r, r.b))
+        .collect();
+    if specials.is_empty() {
+        return;
+    }
+    regions.retain(|r| {
+        if r.label == "picture" || is_wrapper(r.label) {
+            return true;
+        }
+        let ra = area(r.l, r.t, r.r, r.b).max(1.0);
+        !specials
+            .iter()
+            .any(|&(l, t, rr, b)| inter(r, l, t, rr, b) / ra > 0.8)
+    });
+}
+
+/// True for a bare, single-token source-code language label (`XML`, `C#`, `JSON`,
+/// `bash`, …) — the little header the docs render above a code block. Matched
+/// case-insensitively; anything with whitespace or longer than a token is out.
+fn is_code_language(t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || t.chars().any(char::is_whitespace) || t.chars().count() > 12 {
+        return false;
+    }
+    const LANGS: &[&str] = &[
+        "xml",
+        "html",
+        "xhtml",
+        "json",
+        "jsonc",
+        "yaml",
+        "yml",
+        "toml",
+        "ini",
+        "c#",
+        "csharp",
+        "f#",
+        "fsharp",
+        "vb",
+        "c",
+        "c++",
+        "cpp",
+        "java",
+        "kotlin",
+        "scala",
+        "go",
+        "golang",
+        "rust",
+        "swift",
+        "javascript",
+        "js",
+        "typescript",
+        "ts",
+        "jsx",
+        "tsx",
+        "python",
+        "py",
+        "ruby",
+        "rb",
+        "php",
+        "perl",
+        "lua",
+        "r",
+        "dart",
+        "bash",
+        "sh",
+        "shell",
+        "powershell",
+        "zsh",
+        "batch",
+        "cmd",
+        "sql",
+        "tsql",
+        "plsql",
+        "graphql",
+        "dockerfile",
+        "makefile",
+        "css",
+        "scss",
+        "sass",
+        "less",
+        "markdown",
+        "md",
+        "tex",
+        "latex",
+        "diff",
+        "proto",
+        "razor",
+        "cshtml",
+        "xaml",
+        "aspx",
+        "http",
+    ];
+    let lower = t.to_ascii_lowercase();
+    LANGS.contains(&lower.as_str())
+}
+
+/// Mark the region indices that are a code block's **language label** — a bare
+/// `XML`/`C#`/… token sitting directly above a `code` region — so they are consumed
+/// rather than emitted as their own stray paragraph/heading. The label may also be
+/// captured inside a wider code box (rendered as the fence's first line); dropping
+/// the standalone copy just removes the duplicate.
+fn code_language_labels(regions: &[Region], cells: &[TextCell]) -> Vec<bool> {
+    let mut drop = vec![false; regions.len()];
+    for (i, r) in regions.iter().enumerate() {
+        if matches!(r.label, "code" | "picture" | "table") {
+            continue;
+        }
+        if !is_code_language(&region_text(r, cells)) {
+            continue;
+        }
+        // The label sits just above the code (a blank line's gap) or is swallowed
+        // into the top of a wider code box; either way it is that block's label.
+        // The window is generous because the label's own font is small, so a
+        // one-line gap is several times its height.
+        let line_h = (r.b - r.t).abs().max(1.0);
+        let window = (line_h * 4.0).max(28.0);
+        let labels_code = regions.iter().enumerate().any(|(j, c)| {
+            if j == i || c.label != "code" {
+                return false;
+            }
+            let gap = c.t - r.b; // >0 when the code is below the label
+            let h_overlap = (r.r.min(c.r) - r.l.max(c.l)).max(0.0);
+            gap > -line_h * 3.0 && gap < window && h_overlap > 0.0
+        });
+        if labels_code {
+            drop[i] = true;
+        }
+    }
+    drop
+}
+
+/// Collapse `code` regions where one is nested inside another, keeping the larger.
+///
+/// RT-DETR sometimes emits a tight code box *and* a wider near-duplicate that also
+/// captures the block's language label (`XML`, `C#`, …). When the tight box scores
+/// higher it is kept first, and the wider container — not "mostly inside" the tight
+/// box — survives [`resolve`]'s greedy pass, so the block is emitted twice. Keeping
+/// the **larger** box (rather than dropping it) collapses the pair without leaking
+/// the container's extra cells back out as orphan text, since the larger box still
+/// covers every cell. Restricted to `code` so genuinely distinct nested regions of
+/// other kinds are untouched.
+fn dedup_nested_code(kept: &mut Vec<Region>) {
+    let mut drop = vec![false; kept.len()];
+    for i in 0..kept.len() {
+        if kept[i].label != "code" {
+            continue;
+        }
+        let ai = area(kept[i].l, kept[i].t, kept[i].r, kept[i].b).max(1.0);
+        for j in 0..kept.len() {
+            if i == j || drop[j] || kept[j].label != "code" {
+                continue;
+            }
+            let aj = area(kept[j].l, kept[j].t, kept[j].r, kept[j].b).max(1.0);
+            // Drop i when it is mostly inside a strictly larger code box j.
+            let overlap = inter(&kept[i], kept[j].l, kept[j].t, kept[j].r, kept[j].b);
+            if aj > ai && overlap / ai > 0.7 {
+                drop[i] = true;
+                break;
+            }
+        }
+    }
+    let mut keep = drop.iter();
+    kept.retain(|_| !*keep.next().unwrap());
+}
+
+/// Fraction of the page's non-empty text cells that some detected region
+/// claims (>0.2 intersection-over-self, docling's assignment rule). 1.0 for a
+/// page without text cells.
+///
+/// The int8-layout guard keys off this: a dense digital page whose detections
+/// cover almost none of its text is the signature of quantized confidences
+/// flipping under the 0.5 label thresholds on this CPU's kernels — not of a
+/// genuinely empty layout — and is worth re-running on the fp32 graph.
+pub fn layout_cell_coverage(regions: &[Region], cells: &[TextCell]) -> f32 {
+    let mut total = 0usize;
+    let mut covered = 0usize;
+    for c in cells {
+        if c.text.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+        if regions
+            .iter()
+            .any(|r| inter(r, c.l, c.t, c.r, c.b) / ca > 0.2)
+        {
+            covered += 1;
+        }
+    }
+    if total == 0 {
+        1.0
+    } else {
+        covered as f32 / total as f32
+    }
+}
+
+/// Append `text` regions for cells the layout left uncovered ("orphan cells"),
+/// the way docling's `LayoutPostprocessor` does (`create_orphan_clusters`): any
+/// non-empty cell that no kept region covers (>50% of the cell's area) becomes a
+/// text region of its own, so text the detector missed (a stray `.`, a small
+/// label) is still emitted instead of silently dropped. Adjacent orphan cells on a
+/// line are merged so a missed paragraph doesn't shatter into one block per line.
+pub fn add_orphan_regions(regions: &mut Vec<Region>, cells: &[TextCell]) {
+    // docling assigns each cell to its single best-overlapping cluster at
+    // intersection-over-self > 0.2 and serializes exactly the assigned cells —
+    // and since [`region_texts_exclusive`] now emits under that very rule, the
+    // claim test here matches it: any cell over 0.2 will actually render in
+    // its best region, everything else becomes an orphan. Completeness by
+    // construction, with no (0.2, 0.5] hole (the old > 0.5 serializer needed
+    // the claim test raised to > 0.5 to keep right_to_left_03's `20300` from
+    // vanishing; the exclusive port closes that structurally).
+    //
+    // Only *regular* clusters claim cells: docling's `_find_unassigned_cells`
+    // walks `regular_clusters` alone, so a cell under a `picture` or a wrapper
+    // (`table`/`document_index`/`form`/`key_value_region`) that no regular
+    // cluster covers still becomes an orphan text cluster (#165). The orphans
+    // that end up *fully* inside the special are re-dropped by
+    // [`drop_contained_regulars`] (docling's Markdown drops them the same way
+    // — a picture's children never reach its `MarkdownPictureSerializer`
+    // output, a table's text renders through the reconstructed grid). The
+    // observable fix is the border-straddlers: a line only partially under a
+    // figure box used to lose its cells to the picture's 0.2 claim and vanish
+    // — now it forms an orphan region and is emitted, as docling does.
+    let assigned = |c: &TextCell| {
+        let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+        regions
+            .iter()
+            .filter(|r| r.label != "picture" && !is_wrapper(r.label))
+            .any(|r| inter(r, c.l, c.t, c.r, c.b) / ca > 0.2)
+    };
+    // Collect orphan cells (non-empty, unassigned), in page order.
+    let mut orphans: Vec<&TextCell> = cells
+        .iter()
+        .filter(|c| !c.text.trim().is_empty() && !assigned(c))
+        .collect();
+    if orphans.is_empty() {
+        return;
+    }
+    orphans.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.l.total_cmp(&b.l)));
+    // Merge cells that sit on the same line and nearly touch into one region, so a
+    // dropped multi-word line stays one block (docling's refinement merges these).
+    let mut merged: Vec<Region> = Vec::new();
+    for c in orphans {
+        let h = (c.b - c.t).abs().max(1.0);
+        if let Some(last) = merged.last_mut() {
+            let same_line = (last.t - c.t).abs() < h * 0.5;
+            let touching = c.l <= last.r + h && c.l >= last.l - h;
+            if same_line && touching {
+                last.l = last.l.min(c.l);
+                last.r = last.r.max(c.r);
+                last.t = last.t.min(c.t);
+                last.b = last.b.max(c.b);
+                continue;
+            }
+        }
+        merged.push(Region {
+            label: "text",
+            score: 0.0,
+            l: c.l,
+            t: c.t,
+            r: c.r,
+            b: c.b,
+        });
+    }
+    regions.extend(merged);
+}
+
+/// Demote a `picture` region that is really a **text panel** — a paragraph block
+/// the layout model boxed as a figure because it is typeset on a colored
+/// background (terms-and-conditions callouts, quote boxes) — into ordinary
+/// `text` regions, one per paragraph, so its words are read instead of shipped
+/// as pixels. docling loses this text the same way (cells assigned to a picture
+/// cluster are never serialized); this is a deliberate improvement, not parity.
+///
+/// The gate is conservative so a genuine figure keeps its crop: the region must
+/// contain at least three text lines whose median width spans most of the panel
+/// (axis labels and chat bubbles are narrow and varied) and whose cells cover a
+/// substantial fraction of its area (a photo or chart with sparse labels does
+/// not). Paragraph boundaries are re-derived from the line pitch: a vertical gap
+/// clearly larger than the panel's own leading starts a new `text` region, so
+/// the panel doesn't collapse into one giant paragraph.
+///
+/// Works on any cell source — the digital text layer or OCR lines recognized
+/// from the picture crop — so the native and browser paths, with or without
+/// force-OCR, demote identically.
+pub fn recover_text_panels(regions: &mut Vec<Region>, cells: &[TextCell]) {
+    // A *captioned* picture is a genuine figure whatever it contains — the
+    // corpus is full of document screenshots ("Figure 3: …" above a page
+    // image) that are exactly as dense and wide as a text panel. Only an
+    // uncaptioned picture is a demotion candidate.
+    let captioned: Vec<bool> = regions
+        .iter()
+        .map(|r| {
+            r.label == "picture"
+                && regions.iter().any(|c| {
+                    c.label == "caption" && c.r.min(r.r) - c.l.max(r.l) > 0.0 && {
+                        let gap = if c.t >= r.b {
+                            c.t - r.b
+                        } else if r.t >= c.b {
+                            r.t - c.b
+                        } else {
+                            f32::MAX // vertically overlapping: not a caption
+                        };
+                        gap <= 25.0
+                    }
+                })
+        })
+        .collect();
+    let mut out: Vec<Region> = Vec::with_capacity(regions.len());
+    // Synthesized paragraphs and the demoted panels' boxes are kept separate
+    // from `out` until the end: the dedup filter below must not confuse a
+    // paragraph we just built with a pre-existing region inside the panel.
+    let mut demoted_paras: Vec<Region> = Vec::new();
+    let mut demoted_boxes: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for (i, r) in regions.drain(..).enumerate() {
+        if r.label != "picture" || captioned[i] {
+            out.push(r);
+            continue;
+        }
+        let inside: Vec<&TextCell> = cells
+            .iter()
+            .filter(|c| {
+                !c.text.trim().is_empty() && {
+                    let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+                    inter(&r, c.l, c.t, c.r, c.b) / ca > 0.5
+                }
+            })
+            .collect();
+        // Group the contained cells into lines by vertical overlap (the same
+        // rule region_text orders by), tracking each line's union box.
+        let mut lines: Vec<(f32, f32, f32, f32)> = Vec::new(); // (t, b, l, r)
+        for c in &inside {
+            let (ct, cb) = (c.t.min(c.b), c.t.max(c.b));
+            match lines.iter_mut().find(|(lt, lb, _, _)| {
+                let ov = cb.min(*lb) - ct.max(*lt);
+                ov > 0.5 * (cb - ct).min(*lb - *lt).max(1.0)
+            }) {
+                Some((lt, lb, ll, lr)) => {
+                    *lt = lt.min(ct);
+                    *lb = lb.max(cb);
+                    *ll = ll.min(c.l);
+                    *lr = lr.max(c.r);
+                }
+                None => lines.push((ct, cb, c.l, c.r)),
+            }
+        }
+        if lines.len() < 3 {
+            out.push(r);
+            continue;
+        }
+        let panel_w = (r.r - r.l).max(1.0);
+        let coverage = inside.iter().map(|c| area(c.l, c.t, c.r, c.b)).sum::<f32>()
+            / area(r.l, r.t, r.r, r.b).max(1.0);
+        let mut widths: Vec<f32> = lines.iter().map(|(_, _, l, rr)| rr - l).collect();
+        widths.sort_by(f32::total_cmp);
+        // A figure's text is ragged: a title line, small axis/tick labels, and
+        // OCR boxes over the plot area come out at wildly different heights,
+        // whereas a real text panel is set in one face with constant leading.
+        // Require near-uniform line heights (median absolute deviation ≤ 35%
+        // of the median) so an uncaptioned chart keeps its crop even when its
+        // labels are dense enough to pass the coverage gate (#173) — garbled
+        // OCR of its bars is not content.
+        let mut heights: Vec<f32> = lines.iter().map(|(t, b, _, _)| b - t).collect();
+        heights.sort_by(f32::total_cmp);
+        let h_med = heights[heights.len() / 2].max(1.0);
+        let mut devs: Vec<f32> = heights.iter().map(|h| (h - h_med).abs()).collect();
+        devs.sort_by(f32::total_cmp);
+        let uniform = devs[devs.len() / 2] <= 0.35 * h_med;
+        let text_panel = coverage >= 0.2 && widths[widths.len() / 2] >= 0.45 * panel_w && uniform;
+        if !text_panel {
+            out.push(r);
+            continue;
+        }
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut heights: Vec<f32> = lines.iter().map(|(t, b, _, _)| b - t).collect();
+        heights.sort_by(f32::total_cmp);
+        let h = heights[heights.len() / 2].max(1.0);
+        let mut gaps: Vec<f32> = lines
+            .windows(2)
+            .map(|w| (w[1].0 - w[0].1).max(0.0))
+            .collect();
+        gaps.sort_by(f32::total_cmp);
+        let leading = if gaps.is_empty() {
+            0.0
+        } else {
+            gaps[gaps.len() / 2]
+        };
+        let brk = (1.8 * leading).max(0.75 * h);
+        let mut para: Option<(f32, f32, f32, f32)> = None; // (l, t, r, b) union
+        for (t, b, l, rr) in &lines {
+            match &mut para {
+                Some((pl, _, pr, pb)) if *t - *pb <= brk => {
+                    *pl = pl.min(*l);
+                    *pr = pr.max(*rr);
+                    *pb = pb.max(*b);
+                }
+                _ => {
+                    if let Some((pl, pt, pr, pb)) = para.take() {
+                        demoted_paras.push(Region {
+                            label: "text",
+                            score: r.score,
+                            l: pl,
+                            t: pt,
+                            r: pr,
+                            b: pb,
+                        });
+                    }
+                    para = Some((*l, *t, *rr, *b));
+                }
+            }
+        }
+        if let Some((pl, pt, pr, pb)) = para {
+            demoted_paras.push(Region {
+                label: "text",
+                score: r.score,
+                l: pl,
+                t: pt,
+                r: pr,
+                b: pb,
+            });
+        }
+        demoted_boxes.push((r.l, r.t, r.r, r.b));
+    }
+    // The paragraphs are rebuilt from *all* of the panel's cells, so any
+    // surviving text region inside a demoted panel (an orphan cluster or a
+    // layout-detected fragment — pictures no longer swallow them, #165) would
+    // say the same words twice. Consume those; wrappers and pictures stay.
+    if !demoted_boxes.is_empty() {
+        out.retain(|r| {
+            r.label == "picture" || is_wrapper(r.label) || {
+                let ra = area(r.l, r.t, r.r, r.b).max(1.0);
+                !demoted_boxes
+                    .iter()
+                    .any(|&(l, t, rr, b)| inter(r, l, t, rr, b) / ra > 0.5)
+            }
+        });
+    }
+    out.extend(demoted_paras);
+    *regions = out;
+}
+
+/// Drop a `picture` detection that is a small, empty, low-confidence margin box on
+/// a **text page** — a false positive the RT-DETR layout sometimes emits (e.g.
+/// `right_to_left_02`'s phantom right-column picture, score 0.40); docling does not
+/// emit it. The gate is deliberately narrow so a genuine figure is never dropped:
+/// (1) only on pages with a digital text layer — image/scanned/figure pages have
+/// no `cells` yet at this point (OCR runs later), so their pictures, which *are*
+/// the content, are kept; (2) only a box covering < 25 % of the page (a margin
+/// artifact, not a dominant figure); (3) only when it contains no text and scores
+/// below 0.5 (real empty figures in the corpus all score ≥ 0.86).
+pub fn drop_false_pictures(
+    regions: &mut Vec<Region>,
+    cells: &[TextCell],
+    page_w: f32,
+    page_h: f32,
+) {
+    if cells.iter().all(|c| c.text.trim().is_empty()) {
+        return; // no digital text layer (image/scanned page) — keep all pictures
+    }
+    // A text-document page carries several text-bearing non-picture regions (so a
+    // spurious margin picture is clearly extra). A slide / figure page has at most
+    // one — there the picture is the content, so never drop it.
+    let content_regions = regions
+        .iter()
+        .filter(|r| r.label != "picture" && !region_text(r, cells).trim().is_empty())
+        .count();
+    if content_regions < 2 {
+        return;
+    }
+    let page_area = (page_w * page_h).max(1.0);
+    regions.retain(|r| {
+        if r.label != "picture" || r.score >= 0.5 {
+            return true;
+        }
+        if area(r.l, r.t, r.r, r.b) / page_area >= 0.25 {
+            return true; // a dominant figure, not a margin artifact
+        }
+        // Keep it if any text cell falls mostly inside (a real captioned/labelled
+        // figure); drop only the genuinely empty low-confidence boxes.
+        cells.iter().any(|c| {
+            let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+            !c.text.trim().is_empty() && inter(r, c.l, c.t, c.r, c.b) / ca > 0.5
+        })
+    });
+}
+
+/// A small digit-only region in the top/bottom margin: a page number. docling
+/// emits `right_to_left_02`'s bottom `11` as the page's *first* text item (its
+/// reading-order model floats the page number to the front), whereas our
+/// position-based ordering would place a bottom region last.
+fn is_page_number(region: &Region, cells: &[TextCell], page_h: f32) -> bool {
+    let t = region_text(region, cells);
+    let t = t.trim();
+    !t.is_empty()
+        && t.chars().all(|c| c.is_ascii_digit())
+        && (region.b - region.t).abs() < 30.0
+        && (region.t < page_h * 0.12 || region.b > page_h * 0.88)
+}
+
+/// docling's `form` / `key_value_region` *containers* (2.123, docling#4064):
+/// every region sitting > 0.8 inside one — text, list items, and since #4064
+/// tables and pictures too — is that container's child. Children are
+/// reading-ordered among themselves and emitted as one block where the
+/// container falls in the page's top-level order (a `form_area` /
+/// `key_value_area` group upstream), instead of interleaving with the text
+/// around the form. A child inside several containers belongs to the smallest
+/// (then most confident, then first); a container with children shrinks to
+/// their union for the top-level ordering, like upstream's bbox adjustment.
+///
+/// The containers themselves are still not emitted (`is_skipped`), so the
+/// Markdown is exactly upstream's — a group prints only its children.
+fn order_with_containers<T: Clone>(
+    items: &mut Vec<T>,
+    page_w: f32,
+    page_h: f32,
+    reg: impl Fn(&T) -> &Region,
+) {
+    let is_container = |r: &Region| matches!(r.label, "form" | "key_value_region");
+    let containers: Vec<usize> = (0..items.len())
+        .filter(|&i| is_container(reg(&items[i])))
+        .collect();
+    if containers.is_empty() {
+        order_regions(items, page_w, page_h, reg);
+        return;
+    }
+    // Parent container per item (containers never nest in each other here —
+    // upstream assigns regulars and tables/pictures only).
+    let mut parent: Vec<Option<usize>> = vec![None; items.len()];
+    for i in 0..items.len() {
+        let r = reg(&items[i]);
+        if is_container(r) {
+            continue;
+        }
+        let ra = area(r.l, r.t, r.r, r.b).max(1.0);
+        let mut best: Option<(usize, f32, f32)> = None; // (idx, area, -score)
+        for &c in &containers {
+            let cr = reg(&items[c]);
+            if inter(r, cr.l, cr.t, cr.r, cr.b) / ra > 0.8 {
+                let key = (area(cr.l, cr.t, cr.r, cr.b), -cr.score);
+                if best.is_none_or(|(_, a, s)| key.0 < a || (key.0 == a && key.1 < s)) {
+                    best = Some((c, key.0, key.1));
+                }
+            }
+        }
+        parent[i] = best.map(|(c, _, _)| c);
+    }
+    // Top-level pass: non-children plus the containers, the latter shrunk to
+    // their children's union.
+    let mut top: Vec<(usize, Region)> = Vec::new();
+    for i in 0..items.len() {
+        if parent[i].is_some() {
+            continue;
+        }
+        let mut r = reg(&items[i]).clone();
+        if is_container(&r) {
+            let kids: Vec<&Region> = (0..items.len())
+                .filter(|&k| parent[k] == Some(i))
+                .map(|k| reg(&items[k]))
+                .collect();
+            if !kids.is_empty() {
+                r.l = kids.iter().map(|k| k.l).fold(f32::INFINITY, f32::min);
+                r.t = kids.iter().map(|k| k.t).fold(f32::INFINITY, f32::min);
+                r.r = kids.iter().map(|k| k.r).fold(f32::NEG_INFINITY, f32::max);
+                r.b = kids.iter().map(|k| k.b).fold(f32::NEG_INFINITY, f32::max);
+            }
+        }
+        top.push((i, r));
+    }
+    order_regions(&mut top, page_w, page_h, |it| &it.1);
+    let mut out: Vec<T> = Vec::with_capacity(items.len());
+    for (i, _) in top {
+        if is_container(reg(&items[i])) {
+            let mut kids: Vec<T> = (0..items.len())
+                .filter(|&k| parent[k] == Some(i))
+                .map(|k| items[k].clone())
+                .collect();
+            order_regions(&mut kids, page_w, page_h, &reg);
+            out.push(items[i].clone());
+            out.extend(kids);
+        } else {
+            out.push(items[i].clone());
+        }
+    }
+    *items = out;
+}
+
+/// Furniture / not-yet-emitted labels.
+fn is_skipped(label: &str) -> bool {
+    matches!(
+        label,
+        "page_header" | "page_footer" | "form" | "key_value_region"
+    )
+}
+
+/// Reading-order sort of a page's regions, via the ported rule-based
+/// [`reading_order`](crate::reading_order) predictor (docling's
+/// `ReadingOrderPredictor`): an up/down geometry graph, horizontal dilation and a
+/// depth-first traversal, with `page_header`/`page_footer` ordered as their own
+/// groups (first/last) as docling does.
+fn order_regions<T: Clone>(
+    items: &mut Vec<T>,
+    page_w: f32,
+    page_h: f32,
+    reg: impl Fn(&T) -> &Region,
+) {
+    let boxes: Vec<(f32, f32, f32, f32)> = items
+        .iter()
+        .map(|it| {
+            let r = reg(it);
+            (r.l, r.t, r.r, r.b)
+        })
+        .collect();
+    let is_header: Vec<bool> = items
+        .iter()
+        .map(|it| reg(it).label == "page_header")
+        .collect();
+    let is_footer: Vec<bool> = items
+        .iter()
+        .map(|it| reg(it).label == "page_footer")
+        .collect();
+    let order = crate::reading_order::order_page(&boxes, &is_header, &is_footer, page_w, page_h);
+    *items = order.iter().map(|&i| items[i].clone()).collect();
+}
+
+/// Clean a region's assembled text: undo soft-hyphen line wraps, map curly
+/// quotes and the ellipsis to ASCII (matching docling), and collapse runs of
+/// whitespace. pdfium emits the line-wrap hyphen as U+0002 in this corpus
+/// (U+00AD elsewhere), so `word\u{2} continuation` is one hyphenated word —
+/// drop the hyphen + the joining space and merge (`com\u{2} pact` → `compact`,
+/// `end-to\u{2} end` → `end-toend`), exactly as docling does.
+///
+/// Token spacing is otherwise left as the geometric join produced it. We do not
+/// tighten punctuation spacing: docling preserves the PDF's own spaces (it keeps
+/// `{ ahn }`, `Name 1 .`, `[ 9 ]`), and a geometric gap heuristic diverges from
+/// it more than a plain single-space join does.
+/// An ordered-list enumeration marker at the start of a list item: leading ASCII
+/// digits followed by `.`, e.g. `1. Undo/Redo` → `(1, "Undo/Redo")`. Returns
+/// `None` when the text doesn't start with `digits.`.
+fn parse_ordered_marker(s: &str) -> Option<(u64, String)> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = s[digits.len()..].strip_prefix('.')?;
+    let number = digits.parse().ok()?;
+    Some((number, rest.trim_start().to_string()))
+}
+
+/// Escape markdown special characters the way docling-core's markdown serializer
+/// does (`markdown.py` post_process): `_` → `\_`, then HTML-escape `&`, `<`, `>`
+/// (quote=False, so quotes are left). Applied to prose (headings, list items,
+/// paragraphs); code blocks, the formula placeholder, and table cells are left raw.
+fn md_escape(text: &str) -> String {
+    text.replace('_', "\\_")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn clean_text(text: &str) -> String {
+    // Typographic-quote normalization follows docling-parse's sanitizer table
+    // (`pdf_sanitators/constants.h`): every curly quote — single *and double* —
+    // becomes the ASCII apostrophe `'`, and `‚` a comma. A `"` in docling's
+    // output only ever comes from a literal `quotedbl` glyph, never from `“ ”`
+    // (2206's `'text in the wild"` pairs a curly open with a literal-quote
+    // close). This replaces an earlier Hangul-only special case that patched
+    // one symptom of mapping `“ ”` to `"`.
+    let replaced = text
+        .replace("\u{2} ", "")
+        .replace("\u{ad} ", "")
+        .replace(['\u{2}', '\u{ad}'], "") // any stray wrap hyphens not at a join
+        .replace(
+            [
+                '\u{2018}', '\u{2019}', '\u{201b}', '\u{201c}', '\u{201d}', '\u{201e}', '\u{201f}',
+            ],
+            "'",
+        ) // ‘ ’ ‛ “ ” „ ‟ → '
+        .replace('\u{201a}', ",") // ‚ → ,
+        .replace(
+            [
+                '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
+            ],
+            "-",
+        ) // hyphen/dash family → -
+        .replace('\u{2044}', "/") // ⁄ fraction slash → /
+        .replace('\u{2022}', "\u{b7}") // • → · (docling never emits •; inline CCS-concept separators)
+        .replace('\u{2026}', "..."); // … → ...
+    let out = if crate::pdfium_backend::use_dp_lines() {
+        // The docling-parse sanitizer already placed the correct spacing (e.g.
+        // justified double spaces); preserve internal runs of spaces, only
+        // normalizing line breaks/tabs and trimming the ends.
+        replaced.replace(['\n', '\r', '\t'], " ").trim().to_string()
+    } else {
+        // Legacy: collapse all whitespace runs to single spaces.
+        replaced.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    fix_arabic_lam_alef(&out)
+}
+
+/// pdfium decomposes the Arabic lam-alef ligature (لا / لإ / لأ / لآ) into its
+/// glyph constituents in *visual* order — `alef-variant, lam` — but docling keeps
+/// logical order, `lam, alef-variant`. Swap a mid-word `alef-variant + lam` back
+/// to `lam + alef-variant`. "Mid-word" (the previous char is an Arabic letter)
+/// distinguishes the ligature from the definite article `ال` (word-initial
+/// `alef + lam`), which must stay. No-op for non-Arabic text.
+fn fix_arabic_lam_alef(s: &str) -> String {
+    let is_arabic_letter = |c: char| ('\u{0620}'..='\u{064A}').contains(&c);
+    let chars: Vec<char> = s.chars().collect();
+    if !chars.iter().any(|&c| is_arabic_letter(c)) {
+        return s.to_string(); // no-op for non-Arabic text
+    }
+    // Pass 1: swap mid-word `alef-variant + lam` → `lam + alef-variant`. Only the
+    // hamza/madda alef variants (إ أ آ) are safe: the definite article is always
+    // plain `ا + ل`, so plain `alef + lam` is ambiguous (a legitimate `فعالة` vs a
+    // reversed `لا` ligature look identical) — leaving plain alef alone avoids
+    // corrupting legitimate words.
+    let mut a: Vec<char> = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if matches!(c, '\u{0622}' | '\u{0623}' | '\u{0625}')
+            && chars.get(i + 1) == Some(&'\u{0644}')
+            && i > 0
+            && is_arabic_letter(chars[i - 1])
+            // A preceding lam means this alef-variant is *already* the logical
+            // `lam + alef` ligature; the following lam is the next syllable's
+            // letter, not a reversed ligature — swapping it corrupts `لآل` → `للآ`
+            // (e.g. التعلم الآلي → الآلي, not اللآي).
+            && chars[i - 1] != '\u{0644}'
+        {
+            a.push('\u{0644}');
+            a.push(c);
+            i += 2;
+            continue;
+        }
+        a.push(c);
+        i += 1;
+    }
+    // Pass 2: insert a space at Arabic↔Latin boundaries (bidi script switch) that
+    // pdfium runs together — docling separates the embedded Latin run (`وPython`
+    // → `و Python`).
+    let mut out: Vec<char> = Vec::with_capacity(a.len());
+    for (j, &c) in a.iter().enumerate() {
+        if j > 0 {
+            let p = a[j - 1];
+            if (is_arabic_letter(p) && c.is_ascii_alphabetic())
+                || (p.is_ascii_alphabetic() && is_arabic_letter(c))
+            {
+                out.push(' ');
+            }
+        }
+        out.push(c);
+    }
+    out.into_iter().collect()
+}
+
+/// docling's `PageAssembleModel._match_hyperlink`: the URI whose link
+/// annotations cover at least half of the region's box, or `None`. Coverage is
+/// intersection-over-region-area, **accumulated per URI** — a URL that wraps
+/// across lines carries several annotation rects that sum toward the same
+/// target. Ties resolve to the first-seen URI (Python's `max` over dict
+/// insertion order); the winner still needs `>= 0.5`
+/// (`_HYPERLINK_COVERAGE_THRESHOLD`).
+pub(crate) fn region_hyperlink(
+    region: &Region,
+    links: &[crate::pdfium_backend::LinkAnnot],
+) -> Option<String> {
+    if links.is_empty() {
+        return None;
+    }
+    let area = (region.r - region.l).max(0.0) * (region.b - region.t).max(0.0);
+    if area <= 0.0 {
+        return None;
+    }
+    let mut coverage: Vec<(&str, f32)> = Vec::new();
+    for link in links {
+        let ix = (region.r.min(link.r) - region.l.max(link.l)).max(0.0);
+        let iy = (region.b.min(link.b) - region.t.max(link.t)).max(0.0);
+        let c = ix * iy / area;
+        match coverage.iter_mut().find(|(uri, _)| *uri == link.uri) {
+            Some((_, acc)) => *acc += c,
+            None => coverage.push((&link.uri, c)),
+        }
+    }
+    let mut best: Option<(&str, f32)> = None;
+    for (uri, c) in coverage {
+        // Strictly greater keeps the first-seen URI on ties, like Python's max.
+        if best.is_none_or(|(_, bc)| c > bc) {
+            best = Some((uri, c));
+        }
+    }
+    let (uri, c) = best?;
+    (c >= 0.5).then(|| normalize_uri(uri))
+}
+
+/// The pydantic-`AnyUrl` normalization docling's hyperlink value passes
+/// through on its way to the serializer: a URL with an authority but no path
+/// gains a trailing `/` (`https://arxiv.org` → `https://arxiv.org/`). Other
+/// AnyUrl canonicalizations (scheme/host lowercasing, percent-encoding) don't
+/// occur in PDF link annotations in practice, so they are not reproduced.
+fn normalize_uri(uri: &str) -> String {
+    if let Some((_, rest)) = uri.split_once("://") {
+        if !rest.is_empty() && !rest.contains(['/', '?', '#']) {
+            return format!("{uri}/");
+        }
+    }
+    uri.to_string()
+}
+
+/// Resolve each page hyperlink to the visible text it covers, as `(anchor, uri)`
+/// in reading order. The anchor is the cells whose centre falls in the link rect,
+/// joined left-to-right and cleaned the same way prose is (so it matches the
+/// serialized text), deduped against the immediately-preceding link so pdfium's
+/// occasional duplicate annotation doesn't double-list. Empty anchors are dropped.
+pub(crate) fn resolve_link_anchors(page: &PdfPage) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    // Use per-word cells, not the line-merged `cells`: a link rect covers a few
+    // words on a line, and a whole merged line cell would over-capture (its centre
+    // lands in one link's rect, grabbing the entire line as that link's anchor).
+    let words = if page.word_cells.is_empty() {
+        &page.cells
+    } else {
+        &page.word_cells
+    };
+    for link in &page.links {
+        // A cell participates when its centre row is inside the rect and it
+        // overlaps the rect horizontally. A cell can be *wider* than the rect:
+        // PDFs often draw a whole header line as one text run ("LinkedIn |
+        // GitHub | Credly"), which docling-parse's word grouping keeps as one
+        // cell even though each label carries its own link annotation —
+        // centre-in-rect alone would hand the entire line to every link.
+        // [`cell_text_in_rect`] clips such a cell to the tokens under the rect.
+        let mut inside: Vec<(&TextCell, String)> = words
+            .iter()
+            .filter(|c| {
+                let cy = (c.t + c.b) / 2.0;
+                cy >= link.t && cy <= link.b && c.r.min(link.r) > c.l.max(link.l)
+            })
+            .filter_map(|c| {
+                let text = cell_text_in_rect(c, link.l, link.r);
+                (!text.is_empty()).then_some((c, text))
+            })
+            .collect();
+        // Reading order: top band then left-to-right (link anchors are LTR).
+        let band = inside
+            .iter()
+            .map(|(c, _)| (c.b - c.t).abs())
+            .fold(0.0f32, f32::max)
+            .max(1.0);
+        inside.sort_by_key(|(c, _)| ((c.t / band).round() as i64, (c.l * 10.0) as i64));
+        let anchor = clean_text(
+            &inside
+                .iter()
+                .map(|(_, t)| t.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        if anchor.is_empty() {
+            continue;
+        }
+        if out
+            .last()
+            .is_some_and(|(a, u)| a == &anchor && u == &link.uri)
+        {
+            continue;
+        }
+        out.push((anchor, link.uri.clone()));
+    }
+    out
+}
+
+/// The part of a cell's text that lies under a link rect's x-range. A cell
+/// fully inside the rect (by centre) returns its whole text. A wider cell is
+/// split into whitespace tokens whose x-spans are estimated proportionally to
+/// their character positions (kerning makes this approximate, so selection
+/// snaps to whole tokens, never characters); tokens whose estimated centre
+/// falls inside the rect are kept. Returns "" when nothing falls inside.
+fn cell_text_in_rect(c: &TextCell, l: f32, r: f32) -> String {
+    let cx = (c.l + c.r) / 2.0;
+    if cx >= l && cx <= r && c.l >= l - (c.r - c.l) * 0.25 && c.r <= r + (c.r - c.l) * 0.25 {
+        return c.text.trim().to_string();
+    }
+    let chars: Vec<char> = c.text.chars().collect();
+    let n = chars.len();
+    if n == 0 || c.r <= c.l {
+        return String::new();
+    }
+    let per = (c.r - c.l) / n as f32;
+    let mut out: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut start = 0usize;
+    // A trailing sentinel space flushes the last token.
+    for (i, &ch) in chars.iter().enumerate().chain(std::iter::once((n, &' '))) {
+        if ch.is_whitespace() {
+            if !token.is_empty() {
+                let mid = c.l + (start as f32 + (i - start) as f32 / 2.0) * per;
+                if mid >= l && mid <= r {
+                    out.push(std::mem::take(&mut token));
+                } else {
+                    token.clear();
+                }
+            }
+        } else {
+            if token.is_empty() {
+                start = i;
+            }
+            token.push(ch);
+        }
+    }
+    out.join(" ")
+}
+
+/// Cells assigned to a region (best container), in reading order, joined.
+fn region_text(region: &Region, cells: &[TextCell]) -> String {
+    let inside: Vec<&TextCell> = cells
+        .iter()
+        .filter(|c| {
+            let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+            inter(region, c.l, c.t, c.r, c.b) / ca > 0.5
+        })
+        .collect();
+    cells_text(inside)
+}
+
+/// docling's exclusive cell assignment (`_assign_cells_to_clusters`): every
+/// non-empty cell goes to the single best-overlapping *regular* region at
+/// intersection-over-self > 0.2, and each region serializes exactly its
+/// assigned cells. A cell under two overlapping boxes is emitted once (by the
+/// better-covering one), and a cell only partially under its region — e.g.
+/// normal_4pages' big section numeral, ~30 % inside the heading box — still
+/// joins it (`## 들어가며 1`) instead of leaking as an orphan. Pictures and
+/// wrappers never claim (docling walks regular clusters only); ties go to the
+/// first region, like docling's strict `>` best-overlap scan.
+pub fn region_texts_exclusive(regions: &[Region], cells: &[TextCell]) -> Vec<String> {
+    let claimer: Vec<bool> = regions
+        .iter()
+        .map(|r| r.label != "picture" && !is_wrapper(r.label))
+        .collect();
+    let mut owned: Vec<Vec<&TextCell>> = vec![Vec::new(); regions.len()];
+    for c in cells {
+        if c.text.trim().is_empty() {
+            continue;
+        }
+        let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+        let mut best: Option<(usize, f32)> = None;
+        for (i, r) in regions.iter().enumerate() {
+            if !claimer[i] {
+                continue;
+            }
+            let ov = inter(r, c.l, c.t, c.r, c.b) / ca;
+            if ov > 0.2 && best.is_none_or(|(_, b)| ov > b) {
+                best = Some((i, ov));
+            }
+        }
+        if let Some((i, _)) = best {
+            owned[i].push(c);
+        }
+    }
+    // Non-claimers (tables/wrappers/pictures) keep the inclusive > 0.5 text:
+    // docling fills a special cluster's cells from its contained children, and
+    // downstream table assembly gates on that text being non-empty.
+    regions
+        .iter()
+        .zip(owned)
+        .map(|(r, cs)| {
+            if r.label != "picture" && !is_wrapper(r.label) {
+                cells_text(cs)
+            } else {
+                region_text(r, cells)
+            }
+        })
+        .collect()
+}
+
+/// Join a prefiltered cell list into the region's text (docling's
+/// `sanitize_text` on the docling-parse path, gap-aware band join on legacy).
+fn cells_text(mut inside: Vec<&TextCell>) -> String {
+    // Quantize the top coordinate into ~line bands so cells on the same line
+    // sort in reading order; this is a strict total order (a raw fuzzy comparator
+    // is not transitive and makes Rust's sort panic). For a right-to-left
+    // (Arabic-majority) region, cells on a line read right→left, so sort the band
+    // by descending left edge.
+    let band = inside
+        .iter()
+        .map(|c| (c.b - c.t).abs())
+        .fold(0.0f32, f32::max)
+        .max(1.0);
+    let arabic = inside
+        .iter()
+        .flat_map(|c| c.text.chars())
+        .filter(|&c| ('\u{0600}'..='\u{06FF}').contains(&c))
+        .count();
+    let latin = inside
+        .iter()
+        .flat_map(|c| c.text.chars())
+        .filter(|c| c.is_ascii_alphabetic())
+        .count();
+    let rtl = arabic > latin;
+    let dp = crate::pdfium_backend::use_dp_lines();
+    if dp {
+        // docling orders a cluster's cells by their docling-parse cell index
+        // alone (`LayoutPostprocessor._sort_cells`: `sorted(cells, key=c.index)`)
+        // — the sanitizer's output order, which our `cells` slice already is.
+        // No geometric re-sort: normal_4pages' big section numerals paint
+        // *after* their heading text, and docling's `## 들어가며 1` (numeral
+        // last) only falls out of pure index order — a band sort dragged the
+        // numeral to the front. The overlap-grouped line restore this replaced
+        // measured strictly worse on the corpus (it fixed nothing the index
+        // order broke, and broke the numerals).
+    } else {
+        inside.sort_by_key(|c| {
+            let x = (c.l * 10.0) as i64;
+            ((c.t / band).round() as i64, if rtl { -x } else { x })
+        });
+    }
+    let joined = if dp {
+        // docling's `PageAssembleModel.sanitize_text`, ported verbatim over the
+        // parse-index-ordered lines: append a separating space to a line —
+        // unless it ends with `-`. A dash-ending line whose last word and the
+        // next line's first word are both alphanumeric is a wrapped word: the
+        // dash is dropped and the lines fuse (`platforms-` + `reflects` →
+        // `platformsreflects`, `pp. 545-` + `561` → `545561`). Any other
+        // dash-ending line — e.g. the *bare* `-` cell a superscript ORCID or an
+        // inline `–` bullet splits off (its word list is empty, so the fuse
+        // test fails) — keeps its dash and still takes no trailing space:
+        // `[0000` `-` `0002` joins as docling's `[0000 -0002`, and the OTSL
+        // list's `-` + `"C" cell -` + `a new table cell` collapses to
+        // `-"C" cell a new table cell`. Our cells still carry the raw dash
+        // family (docling-parse normalizes to `-` before this; clean_text does
+        // it after), so the endswith test matches them all.
+        let texts: Vec<&str> = inside
+            .iter()
+            .map(|c| c.text.trim())
+            // Skip whitespace-only cells (a justified line's trailing space
+            // glyph): an empty line would double the separator.
+            .filter(|t| !t.is_empty())
+            .collect();
+        let last_word_alnum = |s: &str| {
+            s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .rfind(|w| !w.is_empty())
+                .is_some_and(|w| w.chars().all(char::is_alphanumeric))
+        };
+        let first_word_alnum = |s: &str| {
+            s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .find(|w| !w.is_empty())
+                .is_some_and(|w| w.chars().all(char::is_alphanumeric))
+        };
+        let mut out = String::new();
+        for (i, t) in texts.iter().enumerate() {
+            if i > 0 {
+                let prev = texts[i - 1];
+                let dashish = matches!(
+                    prev.chars().last(),
+                    Some(
+                        '-' | '\u{2010}'
+                            | '\u{2011}'
+                            | '\u{2012}'
+                            | '\u{2013}'
+                            | '\u{2014}'
+                            | '\u{2015}'
+                            | '\u{2212}'
+                    )
+                );
+                // docling#4052 (2.122): a dash only splits a word when it is
+                // *attached* to one — the character before it is alphanumeric.
+                // A dash that follows whitespace (a separator dash, a bullet
+                // marker, a wrapped `-prefixed` token, the bare `-` cell an
+                // ORCID splits off) is a literal character: it is kept and the
+                // lines join with the ordinary space.
+                let attached = prev.chars().rev().nth(1).is_some_and(char::is_alphanumeric);
+                if dashish && attached {
+                    if last_word_alnum(prev) && first_word_alnum(t) {
+                        out.pop(); // wrapped word: fuse without the dash
+                    }
+                    // an attached dash never takes a separating space
+                } else {
+                    out.push(' ');
+                }
+            }
+            out.push_str(t);
+        }
+        out
+    } else {
+        // Legacy reconstruction: join same-band cells with a space only across a
+        // real gap, because it can split a word into abutting segments
+        // (`الت`|`ي` → `التي`).
+        let mut out = String::new();
+        let mut prev: Option<&&TextCell> = None;
+        for c in &inside {
+            let t = c.text.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(p) = prev {
+                let same_band = ((p.t / band).round() as i64) == ((c.t / band).round() as i64);
+                let h = (c.b - c.t).abs().max((p.b - p.t).abs()).max(1.0);
+                let gap = if rtl { p.l - c.r } else { c.l - p.r };
+                if !same_band || gap > h * 0.25 {
+                    out.push(' ');
+                }
+            }
+            out.push_str(t);
+            prev = Some(c);
+        }
+        out
+    };
+    clean_text(&joined)
+}
+
+/// Tighten the spaces pdfium leaves around tight punctuation in a code line
+/// (`console .log` → `console.log`, `add (3 , 5)` → `add(3, 5)`), matching
+/// docling-parse's source spacing.
+fn tighten_code_punct(s: &str) -> String {
+    s.replace(" .", ".")
+        .replace(" ,", ",")
+        .replace(" ;", ";")
+        .replace(" )", ")")
+        .replace(" (", "(")
+}
+
+/// Assemble a **code** region's text with its line structure preserved.
+///
+/// Unlike [`region_text`] — which joins every cell with a single space, the right
+/// thing for prose reflow — a code block's line breaks and indentation are
+/// significant. The `code_cells` are already one physical source line each
+/// (grouped space-glyph-only, so monospace runs keep their spacing), so this:
+///
+/// 1. groups the cells into vertical line bands and orders them top→bottom,
+///    left→right;
+/// 2. joins the lines with `\n` (rather than spaces), keeping the carriage
+///    returns; and
+/// 3. reconstructs each line's leading indentation from its left offset, in units
+///    of the block's estimated monospace character width, so nesting survives.
+///
+/// Typography is normalized per line via [`clean_text`] (smart quotes, dashes,
+/// ellipsis), which never merges lines. Returns an empty string if the region has
+/// no code cells (the caller falls back to the prose text).
+fn code_region_text(region: &Region, cells: &[TextCell]) -> String {
+    let mut inside: Vec<&TextCell> = cells
+        .iter()
+        .filter(|c| {
+            let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+            inter(region, c.l, c.t, c.r, c.b) / ca > 0.5
+        })
+        .filter(|c| !c.text.trim().is_empty())
+        .collect();
+    if inside.is_empty() {
+        return String::new();
+    }
+
+    // Quantize the top edge into ~line bands (like `region_text`), then order the
+    // cells by band (top→bottom) and, within a band, by left edge.
+    let band = inside
+        .iter()
+        .map(|c| (c.b - c.t).abs())
+        .fold(0.0f32, f32::max)
+        .max(1.0);
+    let line_of = |c: &TextCell| (c.t / band).round() as i64;
+    inside.sort_by_key(|c| (line_of(c), (c.l * 10.0) as i64));
+
+    // Estimate one monospace character's width (total ink width / total glyphs) to
+    // convert a line's left offset into a count of leading spaces. Measured over
+    // all lines so a single short line can't skew it.
+    let (mut total_w, mut total_chars) = (0.0f32, 0usize);
+    for c in &inside {
+        let n = c.text.trim().chars().count();
+        if n > 0 {
+            total_w += (c.r - c.l).max(0.0);
+            total_chars += n;
+        }
+    }
+    let char_w = if total_chars > 0 {
+        (total_w / total_chars as f32).max(1.0)
+    } else {
+        1.0
+    };
+    // The block's own left margin is the zero-indent baseline.
+    let base_l = inside.iter().map(|c| c.l).fold(f32::INFINITY, f32::min);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur: Option<i64> = None;
+    for c in &inside {
+        // Tighten pdfium's spaced punctuation per line (on the trimmed content, so
+        // the reconstructed leading indentation is never nibbled).
+        let text = tighten_code_punct(&clean_text(c.text.trim()));
+        if Some(line_of(c)) == cur {
+            // A second cell sharing this band (rare — e.g. split columns): keep it
+            // on the same source line, separated by a space.
+            if let Some(last) = lines.last_mut() {
+                last.push(' ');
+                last.push_str(&text);
+            }
+            continue;
+        }
+        let indent = ((c.l - base_l) / char_w).round().max(0.0) as usize;
+        lines.push(format!("{}{}", " ".repeat(indent), text));
+        cur = Some(line_of(c));
+    }
+    lines.join("\n")
+}
+
+/// Reconstruct a table's grid geometrically from the text cells inside its
+/// region: cluster cells into rows (by vertical centre) and columns (by clustered
+/// left edges), then place each cell. A model-free stand-in for TableFormer that
+/// recovers grid-aligned tables from the precise PDF text layer (it does not
+/// resolve row/column spans).
+pub fn reconstruct_table(region: &Region, cells: &[TextCell]) -> Vec<Vec<String>> {
+    let mut inside: Vec<&TextCell> = cells
+        .iter()
+        .filter(|c| {
+            let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+            inter(region, c.l, c.t, c.r, c.b) / ca > 0.5
+        })
+        .collect();
+    if inside.is_empty() {
+        return Vec::new();
+    }
+    inside.sort_by(|a, b| a.t.total_cmp(&b.t));
+
+    // Rows: consecutive cells whose vertical centre is within ~0.7 line height.
+    let mut rows: Vec<(f32, Vec<&TextCell>)> = Vec::new();
+    for c in &inside {
+        let cyc = (c.t + c.b) / 2.0;
+        let lh = (c.b - c.t).abs().max(1.0);
+        if let Some((ryc, row)) = rows.last_mut() {
+            if (cyc - *ryc).abs() < lh * 0.7 {
+                row.push(c);
+                continue;
+            }
+        }
+        rows.push((cyc, vec![c]));
+    }
+
+    // Columns: cluster left edges (merge those within a tolerance).
+    let tol = {
+        let mut hs: Vec<f32> = inside.iter().map(|c| (c.b - c.t).abs()).collect();
+        hs.sort_by(f32::total_cmp);
+        hs[hs.len() / 2].max(4.0) * 1.5
+    };
+    let mut lefts: Vec<f32> = inside.iter().map(|c| c.l).collect();
+    lefts.sort_by(f32::total_cmp);
+    let mut col_starts: Vec<f32> = Vec::new();
+    for l in lefts {
+        if col_starts.last().is_none_or(|&last| l - last > tol) {
+            col_starts.push(l);
+        }
+    }
+    let ncols = col_starts.len().max(1);
+    let col_of = |l: f32| -> usize {
+        col_starts
+            .iter()
+            .rposition(|&s| l + tol * 0.5 >= s)
+            .unwrap_or(0)
+            .min(ncols - 1)
+    };
+
+    let mut grid = Vec::with_capacity(rows.len());
+    for (_, mut row) in rows {
+        row.sort_by(|a, b| a.l.total_cmp(&b.l));
+        let mut cols = vec![String::new(); ncols];
+        for c in row {
+            let ci = col_of(c.l);
+            // Strip the wrap-hyphen control char so it never lands in a cell.
+            let t = c.text.trim().replace(['\u{2}', '\u{ad}'], "");
+            if cols[ci].is_empty() {
+                cols[ci] = t;
+            } else {
+                cols[ci].push(' ');
+                cols[ci].push_str(&t);
+            }
+        }
+        grid.push(cols);
+    }
+    grid
+}
+
+/// Does the geometric reconstruction of a table look trustworthy enough to use
+/// as-is, instead of paying for TableFormer?
+///
+/// [`reconstruct_table`] derives columns by clustering cell **left edges**. On a
+/// clean grid that is exact, but when a column's entries are not left-aligned
+/// (or the OCR boxes wobble) the clustering splits one real column into several,
+/// and the result is a wide, mostly-empty grid — the "spurious empty columns"
+/// failure TableFormer exists to fix.
+///
+/// Two symptoms separate the two cases, and both are properties of the grid
+/// alone (no model needed):
+/// * **density** — a real table is mostly full; a split-up one is mostly holes;
+/// * **thin columns** — a column carrying at most one entry across several rows
+///   is almost always a split artefact rather than a real column.
+///
+/// Deliberately conservative: it answers `true` only for grids that are plainly
+/// well-formed, so the expensive path stays the default whenever there is doubt.
+/// A caller that skips TableFormer on `true` trades no quality for the time.
+pub fn geometric_table_is_reliable(rows: &[Vec<String>]) -> bool {
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    // Fewer than two columns is not a grid this heuristic can vouch for: it is
+    // exactly the shape a collapsed table takes, and TableFormer may recover
+    // real structure from it.
+    if rows.len() < 2 || ncols < 2 {
+        return false;
+    }
+    let filled = |c: &String| !c.trim().is_empty();
+    let total = rows.len() * ncols;
+    let full = rows.iter().flatten().filter(|c| filled(c)).count();
+    if (full as f32) < MIN_TABLE_FILL * total as f32 {
+        return false;
+    }
+    // A column used by at most one row, when there are rows enough to tell.
+    if rows.len() >= 3 {
+        for ci in 0..ncols {
+            let used = rows
+                .iter()
+                .filter(|r| r.get(ci).is_some_and(filled))
+                .count();
+            if used <= 1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Share of a geometric grid's cells that must carry text for it to be trusted
+/// without TableFormer. Chosen well above the density a left-edge split
+/// produces (those land nearer a third) and below what a genuine table with a
+/// few blank cells reaches.
+const MIN_TABLE_FILL: f32 = 0.6;
+
+/// The union bbox of the text cells assigned to a region (same >50%-overlap
+/// rule as [`region_text`]), or `None` when no cell lands in it. docling's
+/// LayoutPostprocessor shrinks a regular cluster's bbox to its cells, and the
+/// enrichment crops are taken from that cell-tight box — cropping the raw
+/// detector box instead hands the VLM surrounding chrome (e.g. the `Listing N:`
+/// caption under a code block) that changes its output.
+pub fn region_cell_bbox(region: &Region, cells: &[TextCell]) -> Option<[f32; 4]> {
+    let mut bbox: Option<[f32; 4]> = None;
+    for c in cells {
+        let ca = area(c.l, c.t, c.r, c.b).max(1.0);
+        if inter(region, c.l, c.t, c.r, c.b) / ca <= 0.5 {
+            continue;
+        }
+        bbox = Some(match bbox {
+            None => [c.l, c.t, c.r, c.b],
+            Some([l, t, r, b]) => [l.min(c.l), t.min(c.t), r.max(c.r), b.max(c.b)],
+        });
+    }
+    bbox
+}
+
+/// One region's enrichment-model result, produced by the pipeline's opt-in
+/// passes (issue #76) and applied during assembly.
+#[derive(Debug, Clone)]
+pub enum Enrichment {
+    /// DocumentPictureClassifier predictions, descending confidence.
+    PictureClasses(Vec<PictureClass>),
+    /// CodeFormulaV2 output for a `code` region: the rewritten source text and
+    /// the `<_language_>` prefix (when the model emitted one).
+    Code {
+        language: Option<String>,
+        text: String,
+    },
+    /// CodeFormulaV2 output for a `formula` region: the decoded LaTeX.
+    Formula { latex: String },
+}
+
+/// Crop a region (page points, already expanded by the caller if needed) from
+/// the rendered page image and resize it to `target_scale` pixels per point —
+/// the enrichment-model equivalent of docling's
+/// `page.get_image(scale=…, cropbox=…)`, sourced from the existing
+/// [`crate::pdfium_backend::RENDER_SCALE`] render instead of a fresh pdfium
+/// pass (the page bitmap is already the exact docling render at scale 2).
+#[cfg(feature = "ml")]
+pub fn crop_region_scaled(page: &PdfPage, bbox: [f32; 4], target_scale: f32) -> Option<RgbImage> {
+    let s = page.scale;
+    let [l, t, r, b] = bbox;
+    let (iw, ih) = (page.image.width(), page.image.height());
+    let x = (l * s).max(0.0) as u32;
+    let y = (t * s).max(0.0) as u32;
+    if x >= iw || y >= ih {
+        return None;
+    }
+    let w = (((r - l.max(0.0)) * s) as u32).min(iw - x);
+    let h = (((b - t.max(0.0)) * s) as u32).min(ih - y);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let crop = image::imageops::crop_imm(&page.image, x, y, w, h).to_image();
+    // docling renders the crop at `target_scale` directly; from the scale-2
+    // page render that is a resize to the same pixel geometry
+    // (`round(width_points * scale)`, PIL's BICUBIC ≙ CatmullRom).
+    let tw = ((w as f32 / s) * target_scale).round().max(1.0) as u32;
+    let th = ((h as f32 / s) * target_scale).round().max(1.0) as u32;
+    if (tw, th) == (w, h) {
+        return Some(crop);
+    }
+    Some(image::imageops::resize(
+        &crop,
+        tw,
+        th,
+        image::imageops::FilterType::CatmullRom,
+    ))
+}
+
+/// Crop a layout region from the rendered page image and encode it as PNG (the
+/// figure bytes docling stores on a `PictureItem`). Region coordinates are page
+/// points; the image is rendered at `page.scale`.
+#[cfg(feature = "ocr-prep")]
+fn crop_region(page: &PdfPage, region: &Region) -> Option<PictureImage> {
+    let s = page.scale;
+    let (iw, ih) = (page.image.width(), page.image.height());
+    let x = (region.l * s).max(0.0) as u32;
+    let y = (region.t * s).max(0.0) as u32;
+    if x >= iw || y >= ih {
+        return None;
+    }
+    let w = (((region.r - region.l) * s) as u32).min(iw - x);
+    let h = (((region.b - region.t) * s) as u32).min(ih - y);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let sub = image::imageops::crop_imm(&page.image, x, y, w, h).to_image();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    sub.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(PictureImage {
+        mimetype: "image/png".into(),
+        width: w,
+        height: h,
+        data: buf.into_inner(),
+    })
+}
+
+/// For each `picture` region, find the `caption` region closest below it (and
+/// horizontally overlapping); docling pairs them and emits the caption first.
+/// Each caption is claimed by at most one picture.
+fn pair_captions(regions: &[Region]) -> Vec<Option<usize>> {
+    let mut pairs = vec![None; regions.len()];
+    let mut taken = vec![false; regions.len()];
+    for (pi, p) in regions.iter().enumerate() {
+        if p.label != "picture" {
+            continue;
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, c) in regions.iter().enumerate() {
+            if c.label != "caption" || taken[ci] {
+                continue;
+            }
+            let line_h = (c.b - c.t).abs().max(1.0);
+            let gap = c.t - p.b; // caption sits below the picture
+            let h_overlap = (p.r.min(c.r) - p.l.max(c.l)).max(0.0);
+            if gap > -line_h && gap < line_h * 3.0 && h_overlap > 0.0 {
+                let dist = gap.abs();
+                if best.is_none_or(|(_, bd)| dist < bd) {
+                    best = Some((ci, dist));
+                }
+            }
+        }
+        if let Some((ci, _)) = best {
+            pairs[pi] = Some(ci);
+            taken[ci] = true;
+        }
+    }
+    pairs
+}
+
+/// Pair each `code` region with the `caption` region just **above** it (a
+/// `Listing N:` label). docling renders the code block first, then its caption,
+/// so the caption is consumed from its own (earlier) reading-order slot and
+/// re-emitted after the code.
+fn pair_code_captions(regions: &[Region]) -> Vec<Option<usize>> {
+    let mut pairs = vec![None; regions.len()];
+    let mut taken = vec![false; regions.len()];
+    for (pi, p) in regions.iter().enumerate() {
+        if p.label != "code" {
+            continue;
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, c) in regions.iter().enumerate() {
+            if c.label != "caption" || taken[ci] {
+                continue;
+            }
+            let line_h = (c.b - c.t).abs().max(1.0);
+            let gap = p.t - c.b; // caption sits above the code
+            let h_overlap = (p.r.min(c.r) - p.l.max(c.l)).max(0.0);
+            if gap > -line_h && gap < line_h * 3.0 && h_overlap > 0.0 {
+                let dist = gap.abs();
+                if best.is_none_or(|(_, bd)| dist < bd) {
+                    best = Some((ci, dist));
+                }
+            }
+        }
+        if let Some((ci, _)) = best {
+            pairs[pi] = Some(ci);
+            taken[ci] = true;
+        }
+    }
+    pairs
+}
+
+/// Pair each `table`/`document_index` region with its `caption` (#265) the way
+/// docling's `ReadingOrderPredictor._find_to_captions` does: by **reading-order
+/// adjacency**, not geometry. A caption claims the media element
+/// (table/picture/code) immediately next to it in the ordered region sequence,
+/// and only when exactly one side holds one — a caption sandwiched between two
+/// media elements stays unattached, and a text paragraph between caption and
+/// table breaks the bond. This is what lets a flush-left "Table 3: …" label
+/// bind a centered grid it doesn't horizontally overlap, while a caption in
+/// the neighbouring column of a two-column page — geometrically close — never
+/// pairs across the gutter. Runs after the picture and code pairings (the
+/// picture/code arms of the same upstream matcher), so a caption they claimed
+/// stays claimed. docling attaches these as `TableItem.captions` refs; the
+/// paired caption is consumed from its own reading-order slot and rides on the
+/// table node instead.
+fn pair_table_captions(regions: &[Region], taken: &mut [bool]) -> Vec<Option<usize>> {
+    let is_media = |label: &str| is_table_like(label) || matches!(label, "picture" | "code");
+    let mut pairs: Vec<Option<usize>> = vec![None; regions.len()];
+    for ci in 0..regions.len() {
+        if regions[ci].label != "caption" || taken[ci] {
+            continue;
+        }
+        // Furniture (headers/footers, form chrome) is not part of docling's
+        // body-element sequence, so it neither bonds nor blocks.
+        let prev = regions[..ci].iter().rposition(|r| !is_skipped(r.label));
+        let next = regions[ci + 1..]
+            .iter()
+            .position(|r| !is_skipped(r.label))
+            .map(|off| ci + 1 + off);
+        let prev_media = prev.is_some_and(|j| is_media(regions[j].label));
+        let next_media = next.is_some_and(|j| is_media(regions[j].label));
+        let target = match (prev_media, next_media) {
+            (true, false) => prev,
+            (false, true) => next,
+            // Ambiguous (media on both sides) or no media at all: leave the
+            // caption in its own reading-order slot, as docling does.
+            _ => None,
+        };
+        if let Some(ti) = target {
+            // A first claim wins (a table with captions above *and* below
+            // keeps the earlier one — docling's nearest-first tiebreak).
+            if is_table_like(regions[ti].label) && pairs[ti].is_none() {
+                pairs[ti] = Some(ci);
+                taken[ci] = true;
+            }
+        }
+    }
+    pairs
+}
+
+/// Assemble one page from its (already overlap-resolved) layout regions and
+/// text cells.
+/// Normalize a layout region (page points, top-left origin) to DocLang's 0–511
+/// location grid: `clamp(round(512 · coord / page_dim), 0, 511)`, per axis,
+/// order `[x0, y0, x1, y1]`. Mirrors docling_core's
+/// `_doclang_utils._create_location_tokens_for_bbox` (resolution 512) so the
+/// emitted `<location>` tokens line up with the Python groundtruth. Our heron
+/// cluster boxes match docling's to within ~1 grid unit; the residual (mainly
+/// the aspect-ratio-stretch vs letterbox preprocessing difference) is absorbed
+/// by the conformance harness's geometry tolerance.
+fn norm_loc(region: &Region, page_w: f32, page_h: f32) -> [u16; 4] {
+    let q = |v: f32, dim: f32| -> u16 {
+        if dim <= 0.0 {
+            return 0;
+        }
+        let g = (512.0 * (v as f64) / (dim as f64)).round() as i64;
+        g.clamp(0, 511) as u16
+    };
+    [
+        q(region.l, page_w),
+        q(region.t, page_h),
+        q(region.r, page_w),
+        q(region.b, page_h),
+    ]
+}
+
+/// Wrap a node in its layout provenance so the DocLang serializer emits the four
+/// `<location>` tokens as the element's head (Markdown/JSON render `inner`
+/// unchanged).
+fn located(loc: [u16; 4], inner: Node) -> Node {
+    Node::Located {
+        location: loc,
+        inner: Box::new(inner),
+    }
+}
+
+/// Stamp the real 1-based page number onto a page's leading marker (see
+/// [`assemble_page`], which emits it with `page_no: 0` because only the
+/// document-level collector knows the true index — `--pages` windows shift it).
+pub fn stamp_page_no(nodes: &mut [Node], page_no: usize) {
+    if let Some(Node::PageInfo { page_no: p, .. }) = nodes.first_mut() {
+        *p = page_no;
+    }
+}
+
+/// A dense table grid plus its first-class cells (#240): `rows` is the text
+/// grid every serializer renders (spans replicate their anchor's text);
+/// `cells` are the docling-parity per-cell records (text, page-point bbox,
+/// span rectangle, OTSL header roles). Produced by the TableFormer paths
+/// (`tf_core`); lives in this always-compiled module so the pure-text (wasm
+/// `pdf-text`) build sees the type.
+#[derive(Clone, Debug)]
+pub struct TableGrid {
+    pub rows: Vec<Vec<String>>,
+    pub cells: Vec<docling_core::TableCell>,
+}
+
+/// docling's `_RICH_CELL_PICTURE_COVERAGE_THRESHOLD`.
+const RICH_CELL_PICTURE_COVERAGE: f32 = 0.8;
+
+/// docling `ReadingOrderModel._match_table_pictures` (#3906, 2.118.1): every
+/// picture ≥ 80 % inside a TableFormer-structured table on the page is matched
+/// to the cell covering it, and returned per table as `cell index → pictures`.
+/// A picture that pairs with a caption stays a standalone figure (upstream
+/// would nest it and lose the caption; keeping the caption is the better
+/// failure). Tables without first-class cells (geometric fallback) have no cell
+/// boxes to match against and nest nothing.
+fn match_table_pictures(
+    regions: &[Region],
+    table_rows: &[Option<TableGrid>],
+    caption_for: &[Option<usize>],
+) -> std::collections::HashMap<usize, Vec<(usize, Vec<usize>)>> {
+    let mut out: std::collections::HashMap<usize, Vec<(usize, Vec<usize>)>> =
+        std::collections::HashMap::new();
+    for (p, pic) in regions.iter().enumerate() {
+        if pic.label != "picture" || caption_for.get(p).is_some_and(Option::is_some) {
+            continue;
+        }
+        let pa = area(pic.l, pic.t, pic.r, pic.b).max(1.0);
+        let mut best: Option<(f32, usize, usize)> = None; // (coverage, table, cell)
+        for (t, tbl) in regions.iter().enumerate() {
+            if !is_table_like(tbl.label) {
+                continue;
+            }
+            let Some(grid) = table_rows.get(t).and_then(Option::as_ref) else {
+                continue;
+            };
+            if inter(pic, tbl.l, tbl.t, tbl.r, tbl.b) / pa < RICH_CELL_PICTURE_COVERAGE {
+                continue;
+            }
+            if let Some((cov, cell)) = match_picture_to_cell(pic, &grid.cells) {
+                if best.is_none_or(|(b, _, _)| cov > b) {
+                    best = Some((cov, t, cell));
+                }
+            }
+        }
+        if let Some((_, t, cell)) = best {
+            let entry = out.entry(t).or_default();
+            match entry.iter_mut().find(|(c, _)| *c == cell) {
+                Some((_, pics)) => pics.push(p),
+                None => entry.push((cell, vec![p])),
+            }
+        }
+    }
+    out
+}
+
+/// docling `_match_picture_to_table_cell`: among the cells covering ≥ 80 % of
+/// the picture, prefer the one at the picture's inferred grid position (the
+/// row / column whose median cell center is nearest the picture's center —
+/// cell boxes can overlap across logical rows and columns), else the best
+/// coverage. Returns `(coverage, cell index)`.
+fn match_picture_to_cell(pic: &Region, cells: &[docling_core::TableCell]) -> Option<(f32, usize)> {
+    let pa = area(pic.l, pic.t, pic.r, pic.b).max(1.0);
+    let cover = |b: &[f32; 4]| inter(pic, b[0], b[1], b[2], b[3]) / pa;
+    let eligible: Vec<(f32, usize)> = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let b = c.bbox.as_ref()?;
+            let cov = cover(b);
+            (cov >= RICH_CELL_PICTURE_COVERAGE).then_some((cov, i))
+        })
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    let mut row_centers: std::collections::BTreeMap<usize, Vec<f32>> = Default::default();
+    let mut col_centers: std::collections::BTreeMap<usize, Vec<f32>> = Default::default();
+    for c in cells {
+        let Some(b) = c.bbox.as_ref() else { continue };
+        for r in c.start_row..c.start_row + c.row_span {
+            row_centers.entry(r).or_default().push((b[1] + b[3]) / 2.0);
+        }
+        for k in c.start_col..c.start_col + c.col_span {
+            col_centers.entry(k).or_default().push((b[0] + b[2]) / 2.0);
+        }
+    }
+    let median = |v: &mut Vec<f32>| -> f32 {
+        v.sort_by(f32::total_cmp);
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        }
+    };
+    let (px, py) = ((pic.l + pic.r) / 2.0, (pic.t + pic.b) / 2.0);
+    let nearest = |centers: &mut std::collections::BTreeMap<usize, Vec<f32>>, target: f32| {
+        centers
+            .iter_mut()
+            .map(|(&i, v)| (i, (median(v) - target).abs()))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+    };
+    let row = nearest(&mut row_centers, py);
+    let col = nearest(&mut col_centers, px);
+    let logical: Vec<(f32, usize)> = eligible
+        .iter()
+        .copied()
+        .filter(|&(_, i)| {
+            let c = &cells[i];
+            row.is_some_and(|r| c.start_row <= r && r < c.start_row + c.row_span)
+                && col.is_some_and(|k| c.start_col <= k && k < c.start_col + c.col_span)
+        })
+        .collect();
+    let pool = if logical.is_empty() {
+        &eligible
+    } else {
+        &logical
+    };
+    // Python's `max` over `(coverage, cell_index, cell)` tuples: highest
+    // coverage, ties to the higher index.
+    pool.iter()
+        .copied()
+        .max_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+}
+
+/// The DocLang structure overlay derived from first-class cells: span
+/// continuations (`lcel`/`ucel`/`xcel`) and per-cell header roles, so the
+/// PDF path's DCLX carries real spans instead of a flat grid.
+fn structure_from_cells(
+    cells: &[docling_core::TableCell],
+    nrows: usize,
+    ncols: usize,
+) -> docling_core::TableStructure {
+    let grid = || vec![vec![false; ncols]; nrows];
+    let mut col_cont = grid();
+    let mut row_cont = grid();
+    let mut row_header = grid();
+    let mut col_header = grid();
+    for c in cells {
+        for r in c.start_row..(c.start_row + c.row_span).min(nrows) {
+            for k in c.start_col..(c.start_col + c.col_span).min(ncols) {
+                col_cont[r][k] = k > c.start_col;
+                row_cont[r][k] = r > c.start_row;
+                row_header[r][k] = c.row_header;
+                col_header[r][k] = c.column_header;
+            }
+        }
+    }
+    docling_core::TableStructure {
+        header_row: Vec::new(),
+        col_continuation: col_cont,
+        row_continuation: row_cont,
+        row_header,
+        col_header,
+    }
+}
+
+pub fn assemble_page(
+    page: &PdfPage,
+    regions: Vec<Region>,
+    table_rows: &[Option<TableGrid>],
+    enrichments: &[Option<Enrichment>],
+) -> (Vec<Node>, Vec<(String, String)>) {
+    let mut nodes: Vec<Node> = Vec::new();
+    // Every page opens with an invisible page marker carrying its size in
+    // points — what the JSON export needs to build docling's `pages` map and
+    // denormalize the 0–511 `<location>` grid into point bboxes (#171). The
+    // page *number* is stamped by the document-level collector (which knows
+    // the real 1-based index, `--pages` windows included); every serializer
+    // except JSON skips the marker, so Markdown/DocLang stay byte-identical.
+    nodes.push(Node::PageInfo {
+        page_no: 0,
+        width: page.width,
+        height: page.height,
+    });
+    // Recover this page's hyperlinks (anchor-precise pairs for strict
+    // Markdown; whole-item docling-parity links are baked below and their
+    // pairs dropped from this list so strict output doesn't double-wrap).
+    let mut links = resolve_link_anchors(page);
+    // Pair each region with its precomputed TableFormer grid and enrichment
+    // (indexed by original order) and order by reading order together, so they
+    // stay aligned.
+    type RegionItem = (Region, Option<TableGrid>, Option<Enrichment>);
+    let mut items: Vec<RegionItem> = regions
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            (
+                r,
+                table_rows.get(i).cloned().flatten(),
+                enrichments.get(i).cloned().flatten(),
+            )
+        })
+        .collect();
+    order_with_containers(&mut items, page.width, page.height, |it| &it.0);
+    // Float a margin page number to the front of reading order (docling parity:
+    // right_to_left_02's bottom `11` is its first item). Stable, so everything
+    // else keeps its order; no-op on pages without such a region.
+    let page_h = page.height;
+    items.sort_by_key(|(r, _, _)| !is_page_number(r, &page.cells, page_h));
+    let table_rows: Vec<Option<TableGrid>> = items.iter().map(|(_, t, _)| t.clone()).collect();
+    let enrichments: Vec<Option<Enrichment>> = items.iter().map(|(_, _, e)| e.clone()).collect();
+    let regions: Vec<Region> = items.into_iter().map(|(r, _, _)| r).collect();
+    // docling emits a figure's caption *before* the image marker. Pair each
+    // picture with the caption region nearest below it and consume that caption,
+    // so it isn't also emitted in its own (lower) reading-order position.
+    let caption_for = pair_captions(&regions);
+    let code_caption_for = pair_code_captions(&regions);
+    let mut consumed = vec![false; regions.len()];
+    for ci in caption_for.iter().flatten() {
+        consumed[*ci] = true;
+    }
+    for ci in code_caption_for.iter().flatten() {
+        consumed[*ci] = true;
+    }
+    // Table captions (#265) claim from what the picture/code pairings left.
+    let mut caption_taken = consumed.clone();
+    let table_caption_for = pair_table_captions(&regions, &mut caption_taken);
+    for ci in table_caption_for.iter().flatten() {
+        consumed[*ci] = true;
+    }
+    // Pictures inside a table become rich-cell content (docling#3906, 2.118.1):
+    // the picture is nested in the cell it covers and not emitted standalone.
+    let rich_cell_pictures = match_table_pictures(&regions, &table_rows, &caption_for);
+    for (_, pics) in rich_cell_pictures.values().flatten() {
+        for &p in pics {
+            consumed[p] = true;
+        }
+    }
+    // A code block's language label (`XML`, `C#`, …) is chrome, not content — the
+    // detector emits it as its own region above the code; consume it.
+    for (i, is_label) in code_language_labels(&regions, &page.cells)
+        .into_iter()
+        .enumerate()
+    {
+        if is_label {
+            consumed[i] = true;
+        }
+    }
+
+    // docling `ReadingOrderPredictor.predict_merges`: join a text fragment with a
+    // following text fragment strictly to its right (an author column that wraps
+    // into the next, a paragraph continuing in the next column) into one block —
+    // the intra-page half of docling's reading-order merges (cross-page/vertical
+    // continuations stay with [`merge_continuations`]). Already-consumed regions
+    // (paired captions, code labels) are excluded.
+    // Exclusive docling cell assignment: computed once for the ordered region
+    // list and reused for every serialization below, so a cell can never render
+    // in two regions.
+    let region_texts: Vec<String> = region_texts_exclusive(&regions, &page.cells);
+    let is_text: Vec<bool> = regions
+        .iter()
+        .enumerate()
+        .map(|(i, r)| r.label == "text" && !consumed[i])
+        .collect();
+    let is_skip: Vec<bool> = regions
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            consumed[i]
+                || matches!(
+                    r.label,
+                    "page_header" | "page_footer" | "table" | "picture" | "caption" | "footnote"
+                )
+        })
+        .collect();
+    let boxes: Vec<(f32, f32, f32, f32)> = regions.iter().map(|r| (r.l, r.t, r.r, r.b)).collect();
+    if docling_core::env::flag("DOCLING_RS_DEBUG_MERGES") {
+        for (i, r) in regions.iter().enumerate() {
+            eprintln!(
+                "MRG {i:2} {} text={} skip={} [{:.0},{:.0},{:.0},{:.0}] {:?}",
+                r.label,
+                is_text[i],
+                is_skip[i],
+                r.l,
+                r.t,
+                r.r,
+                r.b,
+                region_texts[i].chars().take(40).collect::<String>()
+            );
+        }
+    }
+    let mut merge_suffix: Vec<String> = vec![String::new(); regions.len()];
+    for (head, children) in
+        crate::reading_order::predict_merges(&boxes, &region_texts, &is_text, &is_skip)
+            .into_iter()
+            .enumerate()
+    {
+        for c in children {
+            let t = region_texts[c].trim();
+            if !t.is_empty() {
+                merge_suffix[head].push(' ');
+                merge_suffix[head].push_str(t);
+            }
+            consumed[c] = true;
+        }
+    }
+
+    for (i, region) in regions.iter().enumerate() {
+        if consumed[i] {
+            continue;
+        }
+        // Page headers/footers: docling emits them as furniture blocks
+        // (`<page_header>`/`<page_footer>` with a layer + location + text) at
+        // their reading-order position, not as body — emit them, don't skip.
+        if matches!(region.label, "page_header" | "page_footer") {
+            let text = region_texts[i].clone();
+            if !text.is_empty() {
+                nodes.push(Node::PageFurniture {
+                    footer: region.label == "page_footer",
+                    location: norm_loc(region, page.width, page_h),
+                    text: md_escape(&text),
+                });
+            }
+            continue;
+        }
+        if is_skipped(region.label) {
+            continue;
+        }
+        // Layout provenance for this region, normalized to docling's 0–511 grid.
+        let loc = norm_loc(region, page.width, page_h);
+        if region.label == "picture" {
+            // The figure pixels are cropped from the page render for image export.
+            // Captions are prose: markdown-escaped like a paragraph (the JSON
+            // export unescapes back to the raw text, matching docling).
+            let caption = caption_for[i]
+                .map(|ci| md_escape(&region_texts[ci]))
+                .filter(|t| !t.is_empty());
+            let classification = match &enrichments[i] {
+                Some(Enrichment::PictureClasses(classes)) => Some(classes.clone()),
+                _ => None,
+            };
+            // Without the page render (text-layer-only build) a picture keeps
+            // its caption/classification but carries no cropped pixels.
+            #[cfg(feature = "ocr-prep")]
+            let image = crate::timing::timed("crop_region", || crop_region(page, region));
+            #[cfg(not(feature = "ocr-prep"))]
+            let image: Option<PictureImage> = None;
+            nodes.push(located(
+                loc,
+                Node::Picture {
+                    caption,
+                    caption_href: None,
+                    image,
+                    classification,
+                },
+            ));
+            continue;
+        }
+        let mut text = region_texts[i].clone();
+        text.push_str(&merge_suffix[i]);
+        if text.is_empty() {
+            continue;
+        }
+        match region.label {
+            // docling assembles checkboxes as TEXT_ELEM items (the region's
+            // cells are the option label, e.g. right_to_left_03's بلی/خير)
+            // and its Markdown serializer renders them as task-list lines
+            // (`- [x] …`) — mirrored by [`Node::CheckboxItem`].
+            "checkbox_selected" | "checkbox_unselected" => nodes.push(Node::CheckboxItem {
+                checked: region.label == "checkbox_selected",
+                text: md_escape(&text),
+            }),
+            // docling renders both the document title and section headers as
+            // `##` (it never emits a top-level `#` for PDFs), so match that.
+            "title" | "section_header" => nodes.push(located(
+                loc,
+                Node::Heading {
+                    level: 2,
+                    text: md_escape(&text),
+                },
+            )),
+            // docling drops the rendered bullet glyph; the Markdown serializer
+            // adds its own `- ` marker. An item whose text opens with an `N.`
+            // enumeration marker is an ordered item (rendered `N. text`).
+            // A leading dash stays: it is an ordinary text glyph that
+            // docling-parse keeps, and docling's items carry it into the
+            // Markdown (2305's OTSL list renders `- -"C" cell …`) — only the
+            // symbol-font bullets docling-parse filters out are stripped.
+            "list_item" => {
+                let stripped = text
+                    .trim_start_matches(['•', '◦', '▪', '·', '*'])
+                    .trim_start()
+                    .to_string();
+                if let Some((number, rest)) = parse_ordered_marker(&stripped) {
+                    nodes.push(Node::ListItem {
+                        ordered: true,
+                        number,
+                        first_in_list: false,
+                        text: md_escape(&rest),
+                        level: 0,
+                        marker: None,
+                        location: Some(loc),
+                        dclx: None,
+                        href: None,
+                        layer: None,
+                    });
+                } else {
+                    nodes.push(Node::ListItem {
+                        ordered: false,
+                        number: 0,
+                        first_in_list: false,
+                        text: md_escape(&stripped),
+                        level: 0,
+                        // docling keeps the bullet as the DocLang list marker
+                        // (`<ldiv><marker>·</marker></ldiv>`); Markdown ignores it.
+                        marker: Some("·".into()),
+                        location: Some(loc),
+                        dclx: None,
+                        href: None,
+                        layer: None,
+                    });
+                }
+            }
+            // TableFormer structure (cells + spans, text matched from word cells)
+            // when available; otherwise geometric grid reconstruction; finally a
+            // single cell.
+            "table" | "document_index" => {
+                // TableFormer grids carry first-class cells (#240: text +
+                // page-point bbox + span rectangle + OTSL header roles) into
+                // the public model, and the DocLang structure overlay derives
+                // from them so DCLX emits real span/header tokens. The
+                // geometric fallback has no per-cell records.
+                let (mut rows, cells, structure) = match table_rows[i].clone() {
+                    Some(grid) => {
+                        let nrows = grid.rows.len();
+                        let ncols = grid.rows.first().map_or(0, Vec::len);
+                        let structure = structure_from_cells(&grid.cells, nrows, ncols);
+                        (grid.rows, Some(grid.cells), Some(structure))
+                    }
+                    None => {
+                        let rows = reconstruct_table(region, &page.cells);
+                        let rows = if rows.iter().any(|r| r.len() > 1) {
+                            rows
+                        } else {
+                            vec![vec![text.clone()]]
+                        };
+                        (rows, None, None)
+                    }
+                };
+                // The paired caption (#265) rides on the table — docling's
+                // TableItem.captions ref; Markdown prints it above the grid,
+                // the JSON export emits the $ref, DocLang the <caption>.
+                let caption = table_caption_for[i]
+                    .map(|ci| md_escape(&region_texts[ci]))
+                    .filter(|t| !t.is_empty());
+                // Rich cells (docling#3906): the covering cell's blocks are its
+                // text followed by the nested picture(s). docling's Markdown
+                // renders a `RichTableCell` through the serializer — the
+                // group's children joined by blank lines, newlines flattened
+                // to spaces — so the flat `rows` text becomes
+                // `text  <!-- image -->`; the first-class `cells` (the JSON
+                // `table_cells` / `grid`) keep the plain text, as upstream.
+                let mut cell_blocks: Option<Vec<Vec<Vec<Node>>>> = None;
+                if let (Some(by_cell), Some(fc)) = (rich_cell_pictures.get(&i), cells.as_ref()) {
+                    let nrows = rows.len();
+                    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+                    let mut blocks = vec![vec![Vec::<Node>::new(); ncols]; nrows];
+                    for (cell_idx, pics) in by_cell {
+                        let cell = &fc[*cell_idx];
+                        let (r, c) = (cell.start_row, cell.start_col);
+                        if r >= nrows || c >= ncols {
+                            continue;
+                        }
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut cell_nodes: Vec<Node> = Vec::new();
+                        if !cell.text.trim().is_empty() {
+                            parts.push(cell.text.clone());
+                            cell_nodes.push(Node::Paragraph {
+                                text: cell.text.clone(),
+                            });
+                        }
+                        for &p in pics {
+                            parts.push("<!-- image -->".to_string());
+                            let classification = match &enrichments[p] {
+                                Some(Enrichment::PictureClasses(classes)) => Some(classes.clone()),
+                                _ => None,
+                            };
+                            #[cfg(feature = "ocr-prep")]
+                            let image = crop_region(page, &regions[p]);
+                            #[cfg(not(feature = "ocr-prep"))]
+                            let image: Option<PictureImage> = None;
+                            cell_nodes.push(located(
+                                norm_loc(&regions[p], page.width, page_h),
+                                Node::Picture {
+                                    caption: None,
+                                    caption_href: None,
+                                    image,
+                                    classification,
+                                },
+                            ));
+                        }
+                        let rendered = parts.join("  ");
+                        for row in rows.iter_mut().skip(r).take(cell.row_span) {
+                            for slot in row.iter_mut().skip(c).take(cell.col_span) {
+                                *slot = rendered.clone();
+                            }
+                        }
+                        blocks[r][c] = cell_nodes;
+                    }
+                    cell_blocks = Some(blocks);
+                }
+                nodes.push(located(
+                    loc,
+                    Node::Table(Table {
+                        rows,
+                        location: None,
+                        structure,
+                        cell_blocks,
+                        cells,
+                        caption,
+                    }),
+                ));
+            }
+            // With formula enrichment the CodeFormula model decodes the region
+            // to LaTeX; otherwise docling emits a placeholder comment rather
+            // than the (garbled) raw glyph text.
+            "formula" => match &enrichments[i] {
+                Some(Enrichment::Formula { latex }) => nodes.push(Node::Formula {
+                    latex: latex.clone(),
+                    orig: text.clone(),
+                    location: Some(loc),
+                }),
+                _ => nodes.push(Node::Paragraph {
+                    text: "<!-- formula-not-decoded -->".into(),
+                }),
+            },
+            // Code blocks: use the space-glyph-only grouping (monospace keeps its
+            // source spacing) and emit a fenced block, preserving the line breaks
+            // and indentation of the source (unlike prose, which reflows). pdfium
+            // still inserts spaces around tight punctuation (`console .log`,
+            // `add (3 , 5)`); tighten them to match docling-parse's source spacing.
+            "code" => {
+                // `code_region_text` preserves line breaks/indentation and tightens
+                // each line itself; the fallback prose `text` is tightened here.
+                let code = code_region_text(region, &page.code_cells);
+                let code = if code.is_empty() {
+                    tighten_code_punct(&text)
+                } else {
+                    code
+                };
+                // With code enrichment the CodeFormula model rewrites the block
+                // (and names its language); `orig` keeps the raw extraction in
+                // docling's shape — its parser has no line-preserving code
+                // path, so its `orig` is the same code with the lines joined
+                // by single spaces (indentation collapsed).
+                // docling's parser has no line-preserving code path — its code
+                // items carry the lines joined by single spaces. That flat
+                // form is what every byte-conformance surface serializes
+                // (legacy Markdown, JSON, DocLang); the line-preserving
+                // extraction rides in `pretty` for strict Markdown only.
+                let flat = code
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let node = match &enrichments[i] {
+                    Some(Enrichment::Code {
+                        language,
+                        text: enriched,
+                    }) => Node::Code {
+                        language: language.clone(),
+                        text: enriched.clone(),
+                        orig: Some(flat),
+                        pretty: None,
+                    },
+                    _ => Node::Code {
+                        language: None,
+                        text: flat,
+                        orig: None,
+                        pretty: Some(code),
+                    },
+                };
+                nodes.push(located(loc, node));
+                // docling emits the `Listing N:` caption after the code block.
+                if let Some(ci) = code_caption_for[i] {
+                    let cap = md_escape(&region_texts[ci]);
+                    if !cap.is_empty() {
+                        nodes.push(Node::Paragraph { text: cap });
+                    }
+                }
+            }
+            // text, caption, footnote → paragraph
+            _ => {
+                // docling parity (`PageAssembleModel._match_hyperlink`): when
+                // link annotations cover ≥ half of the region's box, the
+                // hyperlink attaches to the item and the legacy Markdown
+                // serializer wraps its full text — 2206.01062's footnote URLs
+                // render as `[1 https://…](https://…)`. Sparse in-paragraph
+                // citation links stay below the 0.5 coverage threshold and
+                // remain plain text, exactly like docling.
+                //
+                // Scope: **footnote regions only.** Upstream's page_assemble
+                // matches every TEXT_ELEM label, but published docling
+                // observably carries the hyperlink into the document only for
+                // footnote items — in both committed groundtruth generations
+                // (docling-JSON and Markdown, independent runs) the fully
+                // covered plain-text DOI line of 2206.01062 page 1 has
+                // `hyperlink: None` while the equally covered footnotes carry
+                // theirs. The corpus is the conformance reference, so match
+                // the observed behavior; widen the label set if a future
+                // groundtruth refresh starts linking plain text too.
+                let escaped = md_escape(&text);
+                let hyperlink = (region.label == "footnote")
+                    .then(|| region_hyperlink(region, &page.links))
+                    .flatten();
+                let text = match hyperlink {
+                    Some(uri) => {
+                        // The strict-mode anchor pairs this item covers are
+                        // superseded by the baked whole-item link.
+                        links.retain(|(anchor, href)| {
+                            !(href == &uri && region_texts[i].contains(anchor.as_str()))
+                        });
+                        format!("[{escaped}]({uri})")
+                    }
+                    None => escaped,
+                };
+                nodes.push(located(loc, Node::Paragraph { text }))
+            }
+        }
+    }
+    // A `/Rotate`-normalized scanned page (see `pdfium_backend`) was assembled
+    // in upright space; rotate the finished geometry back so locations and the
+    // page size are display-space, like docling and every viewer report them.
+    if page.rotation != 0 {
+        rotate_nodes_to_display(&mut nodes, page.rotation);
+    }
+    (nodes, links)
+}
+
+/// Rotate one 0–511 location bbox 90° clockwise on the grid (top-left origin):
+/// `(x, y) → (511 - y, x)`.
+fn rot_loc_cw(l: [u16; 4]) -> [u16; 4] {
+    [511 - l[3], l[0], 511 - l[1], l[2]]
+}
+
+/// Map upright-space geometry back to display space for a page whose `/Rotate`
+/// was normalized away before inference: every `<location>` rotates `rot`°
+/// clockwise on the 0–511 grid (the grid is per-axis normalized, so no page
+/// dims are needed), and the `PageInfo` size returns to the display box. Node
+/// text and order are untouched — reading order was decided upright, which is
+/// the whole point.
+fn rotate_nodes_to_display(nodes: &mut [Node], rot: u16) {
+    let quarter_turns = (rot / 90) as usize;
+    let rot_loc = |l: &mut [u16; 4]| {
+        for _ in 0..quarter_turns {
+            *l = rot_loc_cw(*l);
+        }
+    };
+    fn walk(node: &mut Node, rot_loc: &impl Fn(&mut [u16; 4]), swap_dims: bool) {
+        match node {
+            Node::PageInfo { width, height, .. } => {
+                if swap_dims {
+                    std::mem::swap(width, height);
+                }
+            }
+            Node::Located { location, inner } => {
+                rot_loc(location);
+                walk(inner, rot_loc, swap_dims);
+            }
+            Node::Furniture { inner, .. } => walk(inner, rot_loc, swap_dims),
+            Node::Group { children, .. } => {
+                for c in children {
+                    walk(c, rot_loc, swap_dims);
+                }
+            }
+            Node::ListItem { location, .. }
+            | Node::Formula { location, .. }
+            | Node::Chart { location, .. } => {
+                if let Some(l) = location {
+                    rot_loc(l);
+                }
+            }
+            Node::PageFurniture { location, .. } => rot_loc(location),
+            Node::Table(t) => {
+                if let Some(l) = &mut t.location {
+                    rot_loc(l);
+                }
+            }
+            _ => {}
+        }
+    }
+    let swap_dims = quarter_turns % 2 == 1;
+    for node in nodes {
+        walk(node, &rot_loc, swap_dims);
+    }
+}
+
+/// Merge paragraph fragments split across a column or page break. docling joins a
+/// paragraph whose previous fragment ends mid-sentence (a letter, not sentence
+/// punctuation) with a lowercase continuation: `…definition of` + `lists in…` →
+/// `…definition of lists in…`. The fragments are consecutive paragraphs, or
+/// separated only by figure(s) the text wraps around: a column whose body flows
+/// past a figure resumes below it (`…The wing type that is` ⟶[figure]⟶ `the most
+/// common…`), and docling emits the whole paragraph before the figure. A heading,
+/// table, or list between them ends the paragraph (no merge).
+/// A paragraph that is really a figure/table caption (`Fig. 1. …`, `Table 2 …`).
+/// Used to skip an unpaired caption when stitching a paragraph that wraps around
+/// a figure.
+fn looks_like_caption(text: &str) -> bool {
+    let head: String = text.trim_start().chars().take(14).collect();
+    (head.starts_with("Fig") || head.starts_with("Table"))
+        && head.contains(|c: char| c.is_ascii_digit())
+}
+
+/// A paragraph fragment is "open" — i.e. it might continue into the next
+/// paragraph — when it ends mid-word (a letter) or with a wrap hyphen/dash.
+/// docling joins `vocab-` + `ulary` → `vocab- ulary`.
+fn paragraph_is_open(text: &str) -> bool {
+    // docling's merge head test (`.+([a-z,\-\u00AD])\s*`): at least two chars,
+    // ending in an ASCII lowercase letter, a comma, a hyphen, or a soft
+    // hyphen. The comma matters: 2206's "…In phase four," resumes across the
+    // page break. Uppercase/non-Latin endings do not merge, exactly as
+    // upstream (the dash family is already `-` here — clean_text normalized).
+    let t = text.trim_end();
+    t.chars().count() >= 2
+        && t.chars()
+            .next_back()
+            .is_some_and(|c| matches!(c, 'a'..='z' | ',' | '-' | '\u{ad}'))
+}
+
+/// The paragraph text inside a node, looking through a [`Node::Located`]
+/// provenance wrapper (PDF body paragraphs are wrapped since they carry a
+/// `<location>`). Returns `None` for non-paragraph nodes.
+fn as_paragraph(n: &Node) -> Option<&str> {
+    match n {
+        Node::Paragraph { text } => Some(text),
+        Node::Located { inner, .. } => match inner.as_ref() {
+            Node::Paragraph { text } => Some(text),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a node is a picture, looking through a [`Node::Located`] wrapper.
+fn is_picture_node(n: &Node) -> bool {
+    match n {
+        Node::Picture { .. } => true,
+        Node::Located { inner, .. } => matches!(inner.as_ref(), Node::Picture { .. }),
+        _ => false,
+    }
+}
+
+/// A node a forward paragraph merge looks straight past: a figure or *table*
+/// the text wraps around, or a page header/footer that falls between the two
+/// fragments of a paragraph continuing across a page break (docling's merge
+/// skip-labels: page_header, page_footer, table, picture, caption, footnote —
+/// 2206's "…In phase four," resumes after a full caption+table+figure block).
+fn is_merge_trailer(n: &Node) -> bool {
+    is_picture_node(n)
+        || matches!(
+            n,
+            Node::PageFurniture { .. } | Node::PageInfo { .. } | Node::Table(_)
+        )
+        || matches!(n, Node::Located { inner, .. } if matches!(inner.as_ref(), Node::Table(_)))
+        || as_paragraph(n).is_some_and(looks_like_caption)
+}
+
+/// Rebuild node `i` as a paragraph with `text`, preserving its `<location>`
+/// wrapper (and thus provenance) if it had one.
+fn reparagraph(node: &Node, text: String) -> Node {
+    match node {
+        Node::Located { location, .. } => located(*location, Node::Paragraph { text }),
+        _ => Node::Paragraph { text },
+    }
+}
+
+pub(crate) fn merge_continuations(nodes: &mut Vec<Node>) {
+    let mut i = 0;
+    while i + 1 < nodes.len() {
+        let Some(a) = as_paragraph(&nodes[i]) else {
+            i += 1;
+            continue;
+        };
+        // A figure/table caption is a self-contained unit; body text resuming
+        // after a figure is the continuation case, not the caption itself. Never
+        // stitch *from* a caption — otherwise a caption that ends in a lone glyph
+        // (`Fig. 5. … PubTabNet. μ`) would swallow a following stray figure label
+        // (a standalone `μ`) into `… μ μ`.
+        if looks_like_caption(a) {
+            i += 1;
+            continue;
+        }
+        if !paragraph_is_open(a) {
+            i += 1;
+            continue;
+        }
+        // The continuation is the next paragraph, looking past any figures the
+        // text wraps around — and a figure/table caption that was emitted as its
+        // own paragraph (an above-the-figure caption that didn't pair), since the
+        // body text resumes after the whole figure+caption block.
+        let mut j = i + 1;
+        while nodes.get(j).is_some_and(is_merge_trailer) {
+            j += 1;
+        }
+        // docling's continuation regex allows either case, but its merge runs
+        // over the pre-assembly element stream; at node level an uppercase
+        // start is overwhelmingly a new sentence/heading fragment (allowing it
+        // swallowed 2305's formula blocks and redp's chapter openers), so the
+        // continuation stays lowercase-start here.
+        let cont = nodes.get(j).and_then(as_paragraph).is_some_and(|b| {
+            b.trim_start()
+                .chars()
+                .next()
+                .is_some_and(char::is_lowercase)
+        });
+        if cont {
+            let a = as_paragraph(&nodes[i]).unwrap().trim_end().to_string();
+            let b = as_paragraph(&nodes[j]).unwrap().trim_start().to_string();
+            // A soft hyphen -- or a hard hyphen followed by a lowercase
+            // continuation (guaranteed lowercase by the `cont` gate above) --
+            // is a word split across the break: strip it and join without a
+            // space, docling#3888 ("vocab-" + "ulary" -> "vocabulary");
+            // docling's older serializer kept the artifact ("vocab- ulary").
+            // Everything else joins with the space, as before.
+            let merged = match a.strip_suffix('\u{ad}').or_else(|| a.strip_suffix('-')) {
+                Some(stem) => format!("{stem}{b}"),
+                None => format!("{a} {b}"),
+            };
+            // Keep node i's provenance wrapper; docling's merged paragraph keeps
+            // the first fragment's geometry as its primary location.
+            nodes[i] = reparagraph(&nodes[i], merged);
+            nodes.remove(j);
+            // Re-check i: the merged paragraph may continue further.
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// How many leading nodes of `nodes` are safe to flush now — i.e. cannot be
+/// rewritten by a future [`merge_continuations`] once more pages are appended.
+///
+/// A forward merge can only start from an "open" paragraph (ends mid-word) and
+/// only reaches across trailing pictures and figure/table captions. So we scan
+/// from the end past those skippable trailers: if the first non-skippable node is
+/// an open paragraph, it (and the trailers after it) must be held; anything else —
+/// a closed paragraph, a heading, a table, a list — blocks any forward merge, so
+/// the whole buffer is safe to flush.
+fn hold_start(nodes: &[Node]) -> usize {
+    for k in (0..nodes.len()).rev() {
+        // Skippable trailers (figures, page furniture, captions): a forward merge
+        // looks straight past them.
+        if is_merge_trailer(&nodes[k]) {
+            continue;
+        }
+        match as_paragraph(&nodes[k]) {
+            // An open body paragraph might still pull a continuation off the next
+            // page — hold from here to the end.
+            Some(text) if paragraph_is_open(text) => return k,
+            // A closed paragraph, heading, table, list, etc. ends the paragraph:
+            // nothing after it can merge backwards across it. Flush everything.
+            _ => return nodes.len(),
+        }
+    }
+    // Only skippable trailers (or empty) and no open paragraph to anchor a merge.
+    nodes.len()
+}
+
+/// Streaming counterpart of [`merge_continuations`]: feed per-page node batches in
+/// document order and get back the prefix that is final (its cross-page merges are
+/// resolved and no future page can change it), holding back only the small tail
+/// that might still merge into the next page. Concatenating every flushed batch
+/// (then [`finish`](Self::finish)) yields exactly the same nodes as running
+/// [`merge_continuations`] once over the whole document.
+pub(crate) struct StreamAssembler {
+    pending: Vec<Node>,
+}
+
+impl StreamAssembler {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Append one page's nodes, resolve merges within the buffer, and return the
+    /// now-final prefix to emit (possibly empty).
+    pub(crate) fn push(&mut self, mut nodes: Vec<Node>) -> Vec<Node> {
+        self.pending.append(&mut nodes);
+        merge_continuations(&mut self.pending);
+        let cut = hold_start(&self.pending);
+        let tail = self.pending.split_off(cut);
+        std::mem::replace(&mut self.pending, tail)
+    }
+
+    /// Flush whatever is left after the last page (the held tail is final once no
+    /// more pages can follow).
+    pub(crate) fn finish(self) -> Vec<Node> {
+        self.pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cells_text, clean_text};
+    use super::{code_region_text, merge_continuations, resolve_link_anchors, StreamAssembler};
+    use crate::layout::Region;
+    use crate::pdfium_backend::{LinkAnnot, PdfPage, TextCell};
+    use docling_core::Node;
+
+    /// The int8-layout guard's coverage metric: cells under detections count,
+    /// cells outside don't, whitespace cells are ignored, and a cell-less page
+    /// reads as fully covered (nothing to rescue).
+    #[test]
+    fn layout_cell_coverage_counts_claimed_text_cells() {
+        let cell = |text: &str, l: f32, t: f32| TextCell {
+            text: text.into(),
+            l,
+            t,
+            r: l + 40.0,
+            b: t + 10.0,
+        };
+        let region = Region {
+            label: "text",
+            score: 0.9,
+            l: 0.0,
+            t: 0.0,
+            r: 100.0,
+            b: 50.0,
+        };
+        let cells = vec![
+            cell("inside", 10.0, 10.0),
+            cell("also inside", 10.0, 30.0),
+            cell("outside", 10.0, 200.0),
+            cell("   ", 10.0, 210.0), // whitespace: not counted at all
+        ];
+        let cov = super::layout_cell_coverage(std::slice::from_ref(&region), &cells);
+        assert!((cov - 2.0 / 3.0).abs() < 1e-6, "got {cov}");
+        assert_eq!(super::layout_cell_coverage(&[], &[]), 1.0);
+        assert_eq!(super::layout_cell_coverage(&[], &cells), 0.0);
+    }
+
+    /// #165: a picture no longer claims cells at 0.2 intersection-over-self.
+    /// A line straddling the figure border (≤80 % contained) becomes an orphan
+    /// region and survives the contained-regulars drop — before the fix its
+    /// cells were silently erased. A line fully inside the picture is still
+    /// re-dropped, matching docling's Markdown (a picture's children never
+    /// reach its serializer's output).
+    #[test]
+    fn border_straddling_lines_survive_picture_interior_is_still_dropped() {
+        let pic = Region {
+            label: "picture",
+            score: 0.9,
+            l: 0.0,
+            t: 0.0,
+            r: 100.0,
+            b: 100.0,
+        };
+        // ~35 % of this cell overlaps the picture (l=90..120 of 0..100): above
+        // the old 0.2 claim (was swallowed), below full containment (survives).
+        let straddler = TextCell {
+            text: "axis label".into(),
+            l: 90.0,
+            t: 40.0,
+            r: 120.0,
+            b: 48.0,
+        };
+        let interior = TextCell {
+            text: "in-figure callout".into(),
+            l: 10.0,
+            t: 10.0,
+            r: 60.0,
+            b: 18.0,
+        };
+        let mut regions = vec![pic];
+        super::add_orphan_regions(&mut regions, &[straddler, interior]);
+        assert_eq!(
+            regions.iter().filter(|r| r.label == "text").count(),
+            2,
+            "both unclaimed lines become orphans"
+        );
+        super::drop_contained_regulars(&mut regions);
+        let texts: Vec<(f32, f32)> = regions
+            .iter()
+            .filter(|r| r.label == "text")
+            .map(|r| (r.l, r.r))
+            .collect();
+        assert_eq!(
+            texts,
+            [(90.0, 120.0)],
+            "the straddler is emitted, the fully-contained callout is not"
+        );
+    }
+
+    /// docling#3906's concern, pinned on our side: a picture detected fully
+    /// inside a table region must survive the containment drop (upstream now
+    /// attaches it to the table's cell; we keep it as a body sibling — either
+    /// way it must not vanish). The text region inside the same table is the
+    /// control: regulars are the ones the drop swallows.
+    #[test]
+    fn picture_inside_a_table_region_survives_the_containment_drop() {
+        let mut regions = vec![
+            region("table", 0.9, 0.0, 0.0, 200.0, 200.0),
+            region("picture", 0.9, 20.0, 20.0, 120.0, 120.0),
+            region("text", 0.9, 20.0, 140.0, 180.0, 180.0),
+        ];
+        super::drop_contained_regulars(&mut regions);
+        let labels: Vec<&str> = regions.iter().map(|r| r.label).collect();
+        assert_eq!(
+            labels,
+            ["table", "picture"],
+            "the in-table picture stays; the in-table regular is the special's child"
+        );
+    }
+
+    /// Table–caption pairing (#265) is reading-order adjacency, docling's
+    /// `_find_to_captions`: a caption binds the table directly next to it in
+    /// the region sequence — above-caption and below-caption both work, and
+    /// geometry is irrelevant (a same-page caption in the other column of a
+    /// two-column layout is *not* adjacent, however close its box is). A
+    /// caption with media on both sides, or separated from the table by a
+    /// text paragraph, stays unattached.
+    #[test]
+    fn table_captions_pair_by_reading_order_adjacency() {
+        // caption → table (above-caption), then table → caption (below-caption),
+        // then a caption fenced off by a paragraph, then one between two tables.
+        let regions = vec![
+            region("text", 0.9, 0.0, 0.0, 100.0, 10.0), // 0 body text
+            region("caption", 0.9, 0.0, 12.0, 60.0, 20.0), // 1 above-caption
+            region("table", 0.9, 20.0, 22.0, 90.0, 60.0), // 2 ← pairs with 1
+            region("table", 0.9, 0.0, 70.0, 100.0, 110.0), // 3 ← pairs with 4
+            region("caption", 0.9, 0.0, 112.0, 60.0, 120.0), // 4 below-caption
+            region("text", 0.9, 0.0, 130.0, 100.0, 140.0), // 5 body text
+            region("caption", 0.9, 0.0, 142.0, 60.0, 150.0), // 6 fenced by 5/7
+            region("text", 0.9, 0.0, 152.0, 100.0, 162.0), // 7 body text
+            region("table", 0.9, 0.0, 170.0, 100.0, 200.0), // 8 unpaired
+            region("caption", 0.9, 0.0, 202.0, 60.0, 210.0), // 9 ambiguous
+            region("table", 0.9, 0.0, 212.0, 100.0, 240.0), // 10 unpaired
+        ];
+        let mut taken = vec![false; regions.len()];
+        let pairs = super::pair_table_captions(&regions, &mut taken);
+        assert_eq!(pairs[2], Some(1), "caption directly above its table pairs");
+        assert_eq!(pairs[3], Some(4), "caption directly below its table pairs");
+        assert_eq!(
+            pairs[8], None,
+            "a text paragraph between caption and table breaks the bond"
+        );
+        assert_eq!(
+            pairs[10], None,
+            "a caption between two tables is ambiguous and stays loose"
+        );
+        assert!(taken[1] && taken[4] && !taken[6] && !taken[9]);
+    }
+
+    /// A colored terms-and-conditions panel detected as `picture` demotes into
+    /// per-paragraph `text` regions (the blank line between C.7 and C.8 splits
+    /// them); a chart whose only text is a few narrow axis labels keeps its
+    /// crop untouched.
+    #[test]
+    fn text_panels_demote_to_paragraphs_but_charts_keep_their_crop() {
+        let cell = |text: &str, l: f32, t: f32, r: f32, b: f32| TextCell {
+            text: text.to_string(),
+            l,
+            t,
+            r,
+            b,
+        };
+        let panel = Region {
+            label: "picture",
+            score: 0.9,
+            l: 0.0,
+            t: 0.0,
+            r: 100.0,
+            b: 100.0,
+        };
+        // Three tight lines, a blank-line gap, two more: two paragraphs.
+        let cells = vec![
+            cell(
+                "C.7. Wenn Sie diesen Vertrag widerrufen,",
+                5.0,
+                10.0,
+                95.0,
+                18.0,
+            ),
+            cell(
+                "haben wir Ihnen alle Zahlungen, die wir",
+                5.0,
+                20.0,
+                95.0,
+                28.0,
+            ),
+            cell(
+                "von Ihnen erhalten haben, zurückzuzahlen.",
+                5.0,
+                30.0,
+                90.0,
+                38.0,
+            ),
+            cell(
+                "C.8. Wir können die Rückzahlung verweigern,",
+                5.0,
+                52.0,
+                95.0,
+                60.0,
+            ),
+            cell(
+                "bis wir die Waren wieder zurückerhalten haben.",
+                5.0,
+                62.0,
+                92.0,
+                70.0,
+            ),
+        ];
+        let mut regions = vec![panel.clone()];
+        super::recover_text_panels(&mut regions, &cells);
+        assert_eq!(
+            regions.iter().map(|r| r.label).collect::<Vec<_>>(),
+            ["text", "text"],
+            "dense panel must demote into one text region per paragraph"
+        );
+        assert!(regions[0].b < regions[1].t, "paragraphs split at the gap");
+        // Sparse narrow labels (a chart): picture survives.
+        let labels = vec![
+            cell("0", 5.0, 90.0, 8.0, 95.0),
+            cell("50", 5.0, 50.0, 10.0, 55.0),
+            cell("100", 5.0, 10.0, 12.0, 15.0),
+            cell("t, s", 45.0, 96.0, 55.0, 100.0),
+        ];
+        let mut regions = vec![panel];
+        super::recover_text_panels(&mut regions, &labels);
+        assert_eq!(
+            regions.iter().map(|r| r.label).collect::<Vec<_>>(),
+            ["picture"]
+        );
+    }
+
+    /// An uncaptioned chart on a scanned page whose title, axis labels, and
+    /// OCR boxes over the plot area are dense and wide enough to pass the
+    /// coverage/width gates still keeps its crop: its line heights are ragged
+    /// (title face vs tick labels vs bar-area OCR), failing the uniform-leading
+    /// gate — a real text panel is set with constant leading (#173).
+    #[test]
+    fn dense_titled_chart_keeps_its_crop() {
+        let cell = |text: &str, l: f32, t: f32, r: f32, b: f32| TextCell {
+            text: text.to_string(),
+            l,
+            t,
+            r,
+            b,
+        };
+        let chart = Region {
+            label: "picture",
+            score: 0.9,
+            l: 0.0,
+            t: 0.0,
+            r: 100.0,
+            b: 100.0,
+        };
+        // Five wide lines at wildly different heights: a 12-pt title, 20-pt OCR
+        // boxes over the bars, 4–5-pt tick/axis labels. Coverage and median
+        // width both clear the panel thresholds.
+        let cells = vec![
+            cell("Underground Water Storage", 10.0, 5.0, 90.0, 17.0),
+            cell("aquifer recharge zone", 15.0, 30.0, 75.0, 50.0),
+            cell("confined | unconfined | perched", 12.0, 55.0, 80.0, 59.0),
+            cell("saturated thickness", 8.0, 70.0, 60.0, 90.0),
+            cell("distance from well, km", 20.0, 92.0, 85.0, 97.0),
+        ];
+        let mut regions = vec![chart];
+        super::recover_text_panels(&mut regions, &cells);
+        assert_eq!(
+            regions.iter().map(|r| r.label).collect::<Vec<_>>(),
+            ["picture"],
+            "ragged line heights mark a figure, not a text panel"
+        );
+    }
+
+    /// docling serializes a cluster's cells in docling-parse index order
+    /// (`_sort_cells`) and joins them with `PageAssembleModel.sanitize_text`:
+    /// a space after every line except one ending in `-`, which either fuses a
+    /// wrapped word (alnum on both sides — dash dropped) or glues verbatim (a
+    /// bare `-` cell: `[0000` `-` `0002` → `[0000 -0002`, the 2305 ORCID line;
+    /// `-` + `"C" cell -` + `a new table cell` → `-"C" cell a new table cell`,
+    /// its OTSL list). Verified against the corpus: pure index order beats any
+    /// geometric re-sort (normal_4pages' heading numerals paint after their
+    /// text and belong last: `## 들어가며 1`).
+    #[test]
+    fn cells_join_in_index_order_with_sanitize_text_rules() {
+        let cell = |text: &str, l: f32, t: f32, r: f32, b: f32| TextCell {
+            text: text.to_string(),
+            l,
+            t,
+            r,
+            b,
+        };
+        let region = Region {
+            label: "text",
+            score: 1.0,
+            l: 0.0,
+            t: 95.0,
+            r: 200.0,
+            b: 130.0,
+        };
+        // ORCID superscript: a bare dash cell is a *detached* dash — kept, and
+        // since docling#4052 (2.122) it joins with the ordinary space on both
+        // sides (`[0000 -0002 -6960]` before that fix).
+        let orcid = vec![
+            cell("[0000", 10.0, 100.0, 30.0, 110.0),
+            cell("−", 30.0, 100.0, 34.0, 110.0),
+            cell("0002", 34.0, 100.0, 50.0, 110.0),
+            cell("−", 50.0, 100.0, 54.0, 110.0),
+            cell("6960]", 54.0, 100.0, 70.0, 110.0),
+        ];
+        assert_eq!(super::region_text(&region, &orcid), "[0000 - 0002 - 6960]");
+        // Wrapped word: dash dropped, lines fused (both boundary words alnum).
+        let wrapped = vec![
+            cell("platforms-", 10.0, 100.0, 60.0, 110.0),
+            cell("reflects the design", 10.0, 112.0, 90.0, 122.0),
+        ];
+        assert_eq!(
+            super::region_text(&region, &wrapped),
+            "platformsreflects the design"
+        );
+        // Dash-ending lines that are *detached* dashes (a bare bullet cell, a
+        // `cell -` separator): the dash stays and the lines join with a space
+        // — docling#4052; before it they glued (`-"C" cell a new table cell`,
+        // 2305's OTSL list bullets).
+        let otsl = vec![
+            cell("–", 10.0, 100.0, 14.0, 110.0),
+            cell("\"C\" cell -", 16.0, 100.0, 60.0, 110.0),
+            cell("a new table cell", 10.0, 112.0, 80.0, 122.0),
+        ];
+        assert_eq!(
+            super::region_text(&region, &otsl),
+            "- \"C\" cell - a new table cell"
+        );
+        // Index order is authoritative — no geometric re-sort.
+        let numeral = vec![
+            cell("들어가며", 30.0, 100.0, 80.0, 110.0),
+            cell("1", 10.0, 98.0, 25.0, 112.0), // big numeral painted last
+        ];
+        assert_eq!(super::region_text(&region, &numeral), "들어가며 1");
+    }
+
+    /// The geometric-reliability gate, on the two shapes it has to tell apart.
+    #[test]
+    fn geometric_reliability_rejects_split_column_grids() {
+        let g = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|r| r.iter().map(|c| c.to_string()).collect())
+                .collect()
+        };
+        // A genuine grid: dense, every column carrying entries. Nothing for
+        // TableFormer to improve, so geometry is used as-is.
+        assert!(super::geometric_table_is_reliable(&g(&[
+            &["Datum", "Leistung", "Anzahl", "Kosten"],
+            &["04.07", "Internet", "1", "40.30"],
+            &["04.07", "Telefon", "2", "8.06"],
+        ])));
+        // The left-edge split artefact (the shape a scanned invoice produced):
+        // one real label column plus values scattered across three sparse ones.
+        assert!(!super::geometric_table_is_reliable(&g(&[
+            &["www.magenta.at/faq", "", "", ""],
+            &["Serviceteam", "", "", ""],
+            &["Telefon", "0676/2000", "", ""],
+            &["Kundennummer", "", "", "1.21699482"],
+            &["Rechnungsnummer", "", "922769430725", ""],
+            &["Rechnungsdatum", "", "", "04.07.2025"],
+        ])));
+        // A column only one row ever uses is a split artefact even when the
+        // grid is otherwise dense.
+        assert!(!super::geometric_table_is_reliable(&g(&[
+            &["a", "b", ""],
+            &["c", "d", ""],
+            &["e", "f", "g"],
+        ])));
+        // Degenerate shapes are never vouched for — TableFormer may recover
+        // structure a collapsed reconstruction lost.
+        assert!(!super::geometric_table_is_reliable(&g(&[&[
+            "only one column"
+        ]])));
+        assert!(!super::geometric_table_is_reliable(&[]));
+    }
+
+    /// A `picture` region is cropped out of the rendered page, whatever built
+    /// that page. The browser pipeline (#157) has no pdfium but does hand over
+    /// the rasterized bitmap through `from_cells_with_image`, so it must get
+    /// the same figure bytes the native path does — that is what makes
+    /// `images = "embedded"` inline real pixels instead of a placeholder.
+    #[cfg(feature = "ocr-prep")]
+    #[test]
+    fn picture_regions_are_cropped_from_a_host_supplied_page_image() {
+        let mut img = image::RgbImage::new(200, 200);
+        // Paint the figure area so the crop is distinguishable from the page.
+        for y in 100..160 {
+            for x in 20..120 {
+                img.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        // scale 2.0: the region is in page points, the bitmap in pixels.
+        let page = PdfPage::from_cells_with_image(100.0, 100.0, 2.0, Vec::new(), img);
+        let region = Region {
+            label: "picture",
+            score: 0.9,
+            l: 10.0,
+            t: 50.0,
+            r: 60.0,
+            b: 80.0,
+        };
+        let (nodes, _) = super::assemble_page(&page, vec![region], &[None], &[None]);
+        // Layout-derived nodes carry provenance, so the picture arrives wrapped.
+        let image = nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Located { inner, .. } => match &**inner {
+                    Node::Picture { image, .. } => image.as_ref(),
+                    _ => None,
+                },
+                Node::Picture { image, .. } => image.as_ref(),
+                _ => None,
+            })
+            .expect("a picture node with cropped pixels");
+        assert_eq!(image.mimetype, "image/png");
+        assert_eq!((image.width, image.height), (100, 60), "region × scale");
+        assert!(!image.data.is_empty(), "PNG bytes were encoded");
+    }
+
+    #[test]
+    fn link_anchors_split_a_shared_word_cell_between_adjacent_links() {
+        // A common header layout: one text run holds several pipe-separated
+        // labels, each carrying its own link annotation. Every link must get
+        // its own label as the anchor (and the "|" separators must belong to
+        // none), not the whole run.
+        let annot = |l: f32, r: f32, uri: &str| LinkAnnot {
+            l,
+            t: 100.0,
+            r,
+            b: 114.0,
+            uri: uri.into(),
+        };
+        let page = PdfPage {
+            width: 600.0,
+            height: 800.0,
+            scale: 2.0,
+            cells: Vec::new(),
+            code_cells: Vec::new(),
+            // "LinkedIn | GitHub | Credly" = 26 chars over x 100..360.
+            word_cells: vec![cell(
+                "LinkedIn | GitHub | Credly",
+                100.0,
+                100.0,
+                360.0,
+                114.0,
+            )],
+            image: image::RgbImage::new(1, 1),
+            image_layout: None,
+            links: vec![
+                annot(100.0, 180.0, "https://l"),
+                annot(200.0, 260.0, "https://g"),
+                annot(290.0, 360.0, "https://c"),
+            ],
+            rotation: 0,
+        };
+        assert_eq!(
+            resolve_link_anchors(&page),
+            vec![
+                ("LinkedIn".to_string(), "https://l".to_string()),
+                ("GitHub".to_string(), "https://g".to_string()),
+                ("Credly".to_string(), "https://c".to_string()),
+            ]
+        );
+    }
+
+    /// A one-line code cell at `[l, r] × [t, b]` (top-left coords).
+    fn cell(text: &str, l: f32, t: f32, r: f32, b: f32) -> TextCell {
+        TextCell {
+            text: text.into(),
+            l,
+            t,
+            r,
+            b,
+        }
+    }
+
+    fn region(label: &'static str, score: f32, l: f32, t: f32, r: f32, b: f32) -> Region {
+        Region {
+            label,
+            score,
+            l,
+            t,
+            r,
+            b,
+        }
+    }
+
+    #[test]
+    fn resolve_collapses_nested_code_keeping_the_larger_box() {
+        // A tight high-score `code` box and a taller lower-score near-duplicate that
+        // contains it must collapse to one — the *larger* box, so every cell stays
+        // covered and nothing leaks out as orphan text.
+        let tight = region("code", 0.95, 78.0, 292.0, 300.0, 330.0);
+        let wide = region("code", 0.66, 63.0, 260.0, 320.0, 346.0);
+        let kept = super::resolve(vec![tight, wide]);
+        assert_eq!(kept.len(), 1, "nested code boxes must collapse to one");
+        assert!(
+            kept[0].l == 63.0 && kept[0].b == 346.0,
+            "the larger containing box is kept"
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_distinct_and_differently_typed_regions() {
+        // A text box fully inside a lower-score *table* must NOT be collapsed (the
+        // code dedup is code-only), and two separate code blocks stay separate.
+        let text = region("text", 0.95, 90.0, 210.0, 200.0, 230.0);
+        let table = region("table", 0.60, 80.0, 200.0, 400.0, 500.0);
+        assert_eq!(super::resolve(vec![text, table]).len(), 2);
+
+        let code_a = region("code", 0.9, 78.0, 100.0, 300.0, 140.0);
+        let code_b = region("code", 0.9, 78.0, 300.0, 300.0, 360.0); // far below, no overlap
+        assert_eq!(super::resolve(vec![code_a, code_b]).len(), 2);
+    }
+
+    #[test]
+    fn code_language_label_above_code_is_detected() {
+        // A bare "XML" token directly above a code box is a language label; a real
+        // heading above the same code is not; a language word with no code below is
+        // left alone.
+        let label = region("section_header", 0.9, 76.0, 540.0, 96.0, 549.0);
+        let code = region("code", 0.7, 77.0, 552.0, 290.0, 640.0);
+        let heading = region("section_header", 0.9, 76.0, 500.0, 260.0, 512.0);
+        let cells = vec![
+            cell("XML", 78.0, 541.0, 94.0, 548.0),       // inside `label`
+            cell("Overview", 78.0, 501.0, 250.0, 511.0), // inside `heading`
+        ];
+        let drop = super::code_language_labels(&[label, code, heading], &cells);
+        assert_eq!(drop, vec![true, false, false], "only the label is consumed");
+
+        // Same label with no code region present → not consumed.
+        let label2 = region("section_header", 0.9, 76.0, 540.0, 96.0, 549.0);
+        let only = vec![cell("XML", 78.0, 541.0, 94.0, 548.0)];
+        assert_eq!(super::code_language_labels(&[label2], &only), vec![false]);
+
+        // A label swallowed into the top of a wider code box (negative gap) is still
+        // recognized.
+        let inside_lbl = region("text", 0.9, 76.0, 540.0, 96.0, 549.0);
+        let wide_code = region("code", 0.7, 63.0, 531.0, 320.0, 654.0);
+        let cells2 = vec![cell("XML", 78.0, 541.0, 94.0, 548.0)];
+        assert_eq!(
+            super::code_language_labels(&[inside_lbl, wide_code], &cells2),
+            vec![true, false]
+        );
+
+        assert!(super::is_code_language("XML") && super::is_code_language("c#"));
+        assert!(!super::is_code_language("Configure") && !super::is_code_language("XML schema"));
+    }
+
+    #[test]
+    fn code_region_text_keeps_lines_and_indentation() {
+        // Three source lines; each glyph is 6 units wide (width / chars = 6), so the
+        // `int X;` line indented to x=22 is (22-10)/6 = 2 spaces in.
+        let region = Region {
+            label: "code",
+            score: 1.0,
+            l: 0.0,
+            t: -5.0,
+            r: 100.0,
+            b: 40.0,
+        };
+        let cells = vec![
+            cell("struct P {", 10.0, 0.0, 70.0, 10.0),
+            cell("int X;", 22.0, 12.0, 58.0, 22.0),
+            cell("}", 10.0, 24.0, 16.0, 34.0),
+        ];
+        assert_eq!(code_region_text(&region, &cells), "struct P {\n  int X;\n}");
+    }
+
+    #[test]
+    fn code_region_text_tightens_punctuation_without_eating_indentation() {
+        // A fluent `.Foo()` line at x=22 (2 chars in). Per-line tightening must not
+        // consume the leading indent space by matching " ." across it.
+        let region = Region {
+            label: "code",
+            score: 1.0,
+            l: 0.0,
+            t: -5.0,
+            r: 100.0,
+            b: 40.0,
+        };
+        let cells = vec![
+            cell("builder", 10.0, 0.0, 52.0, 10.0),
+            // pdfium spaced the call: ".Foo (x)" tightens to ".Foo(x)", still 2-indented.
+            cell(".Foo (x)", 22.0, 12.0, 70.0, 22.0),
+        ];
+        assert_eq!(code_region_text(&region, &cells), "builder\n  .Foo(x)");
+    }
+
+    #[test]
+    fn code_region_text_orders_out_of_order_cells_and_ignores_blank_lines() {
+        let region = Region {
+            label: "code",
+            score: 1.0,
+            l: 0.0,
+            t: -5.0,
+            r: 100.0,
+            b: 60.0,
+        };
+        // Fed bottom-up and with a whitespace-only cell; output is top-down, no blank.
+        let cells = vec![
+            cell("b();", 10.0, 24.0, 34.0, 34.0),
+            cell("   ", 10.0, 12.0, 20.0, 22.0),
+            cell("a();", 10.0, 0.0, 34.0, 10.0),
+        ];
+        assert_eq!(code_region_text(&region, &cells), "a();\nb();");
+        // No code cells → empty, so the caller falls back to the prose text.
+        assert_eq!(code_region_text(&region, &[]), "");
+    }
+
+    fn para(text: &str) -> Node {
+        Node::Paragraph { text: text.into() }
+    }
+
+    /// Run a node sequence through [`StreamAssembler`] with the given page splits
+    /// and assert the flushed result equals one-shot [`merge_continuations`].
+    fn assert_stream_eq(nodes: &[Node], splits: &[usize]) {
+        let mut want = nodes.to_vec();
+        merge_continuations(&mut want);
+
+        let mut asm = StreamAssembler::new();
+        let mut got = Vec::new();
+        let mut start = 0;
+        for &end in splits {
+            got.extend(asm.push(nodes[start..end].to_vec()));
+            start = end;
+        }
+        got.extend(asm.push(nodes[start..].to_vec()));
+        got.extend(asm.finish());
+        assert_eq!(got, want, "stream assembly diverged (splits={splits:?})");
+    }
+
+    #[test]
+    fn stream_assembler_matches_merge_continuations() {
+        // Open fragment + lowercase continuation split across a page boundary.
+        let cross = [para("the definition of"), para("lists in scope")];
+        assert_stream_eq(&cross, &[1]);
+        assert_stream_eq(&cross, &[]);
+
+        // Continuation that wraps around a figure (+ its caption) on the boundary.
+        let wrap = [
+            para("the wing type that is"),
+            Node::Picture {
+                caption: None,
+                caption_href: None,
+                image: None,
+                classification: None,
+            },
+            para("Fig. 1. a diagram"),
+            para("the most common kind"),
+        ];
+        for splits in [&[][..], &[1][..], &[2][..], &[3][..], &[1, 3][..]] {
+            assert_stream_eq(&wrap, splits);
+        }
+
+        // A heading between fragments blocks the merge (must still flush correctly).
+        let blocked = [
+            para("ends mid word and"),
+            Node::Heading {
+                level: 2,
+                text: "New Section".into(),
+            },
+            para("more body here"),
+        ];
+        for splits in [&[][..], &[1][..], &[2][..]] {
+            assert_stream_eq(&blocked, splits);
+        }
+
+        // A chain across three pages: each page is one open lowercase fragment.
+        let chain = [
+            para("alpha beta"),
+            para("gamma delta"),
+            para("epsilon zeta"),
+        ];
+        assert_stream_eq(&chain, &[1, 2]);
+    }
+
+    #[test]
+    fn clean_text_dehyphenates_and_normalizes_typography() {
+        // U+0002 line-wrap hyphen + the join space → merged word (like docling).
+        assert_eq!(clean_text("com\u{2} pact"), "compact");
+        assert_eq!(clean_text("end-to\u{2} end deep"), "end-toend deep");
+        // A stray wrap hyphen (no following join) is dropped.
+        assert_eq!(clean_text("word\u{2}"), "word");
+        // Typographic punctuation → ASCII: every curly quote becomes `'`
+        // (docling-parse's sanitizer table), a literal `"` stays.
+        assert_eq!(
+            clean_text("Graph\u{2019}s \u{201c}x\u{201d} \"y\""),
+            "Graph's 'x' \"y\""
+        );
+        assert_eq!(clean_text("a\u{2026}"), "a...");
+        // The dp default (the docling-parse sanitizer) preserves internal spacing
+        // it placed deliberately; line breaks/tabs normalize to a space, ends trim.
+        assert_eq!(clean_text("a   b\nc"), "a   b c");
+    }
+
+    /// docling#4064: a form's children are emitted together where the form
+    /// sits in the top-level order, not interleaved with surrounding text.
+    #[test]
+    fn form_children_stay_together_in_reading_order() {
+        let reg = |label: &'static str, l: f32, t: f32, r: f32, b: f32| Region {
+            label,
+            score: 0.9,
+            l,
+            t,
+            r,
+            b,
+        };
+        // Page: intro text, then a form spanning the left column with two
+        // fields and a table inside, while a right-column paragraph sits
+        // level with the form's first field (it would otherwise be read
+        // between the form's children).
+        let mut items = vec![
+            reg("text", 50.0, 50.0, 550.0, 70.0),    // 0 intro
+            reg("form", 50.0, 100.0, 300.0, 400.0),  // 1 container
+            reg("text", 60.0, 110.0, 290.0, 130.0),  // 2 field A (child)
+            reg("text", 320.0, 110.0, 550.0, 130.0), // 3 right column paragraph
+            reg("table", 60.0, 150.0, 290.0, 300.0), // 4 table (child)
+            reg("text", 60.0, 320.0, 290.0, 340.0),  // 5 field B (child)
+            reg("text", 50.0, 450.0, 550.0, 470.0),  // 6 outro
+        ];
+        super::order_with_containers(&mut items, 600.0, 800.0, |r| r);
+        let order: Vec<(&str, f32)> = items.iter().map(|r| (r.label, r.t)).collect();
+        // The form block (container, then its children top-down) is one unit.
+        let form_pos = order.iter().position(|(l, _)| *l == "form").unwrap();
+        assert_eq!(
+            &order[form_pos..form_pos + 4],
+            &[
+                ("form", 100.0),
+                ("text", 110.0),
+                ("table", 150.0),
+                ("text", 320.0)
+            ]
+        );
+        assert_eq!(order[0], ("text", 50.0));
+        assert_eq!(order[order.len() - 1], ("text", 450.0));
+        // Without a container the plain order interleaves by geometry.
+        let mut flat: Vec<Region> = items
+            .iter()
+            .filter(|r| r.label != "form")
+            .cloned()
+            .collect();
+        super::order_regions(&mut flat, 600.0, 800.0, |r| r);
+        assert_ne!(
+            flat.iter().map(|r| r.t).collect::<Vec<_>>(),
+            order
+                .iter()
+                .filter(|(l, _)| *l != "form")
+                .map(|(_, t)| *t)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// docling#3906: a picture inside a table lands in the covering cell,
+    /// chosen by the picture's inferred grid position when cell boxes overlap.
+    #[test]
+    fn picture_matches_the_cell_at_its_grid_position() {
+        let cell = |r: usize, c: usize, bbox: [f32; 4]| docling_core::TableCell {
+            text: format!("r{r}c{c}"),
+            bbox: Some(bbox),
+            start_row: r,
+            start_col: c,
+            row_span: 1,
+            col_span: 1,
+            column_header: false,
+            row_header: false,
+            row_section: false,
+        };
+        // 2×2 grid; the (1,0) cell box is generous and also covers the picture.
+        let cells = vec![
+            cell(0, 0, [0.0, 0.0, 100.0, 50.0]),
+            cell(0, 1, [100.0, 0.0, 200.0, 50.0]),
+            cell(1, 0, [0.0, 50.0, 100.0, 100.0]),
+            cell(1, 1, [100.0, 50.0, 200.0, 100.0]),
+        ];
+        let pic = Region {
+            label: "picture",
+            score: 0.9,
+            l: 110.0,
+            t: 60.0,
+            r: 190.0,
+            b: 95.0,
+        };
+        assert_eq!(super::match_picture_to_cell(&pic, &cells), Some((1.0, 3)));
+        // A picture only half inside any cell is not nested.
+        let straddling = Region {
+            label: "picture",
+            score: 0.9,
+            l: 60.0,
+            t: 60.0,
+            r: 160.0,
+            b: 95.0,
+        };
+        assert_eq!(super::match_picture_to_cell(&straddling, &cells), None);
+    }
+
+    /// docling#4052 (2.122): a line-final dash fuses the wrapped word only
+    /// when attached to it; a detached dash is a literal and the lines join
+    /// with a space.
+    #[test]
+    fn line_final_hyphen_fuses_only_when_attached_to_a_word() {
+        let line = |text: &str, t: f32| TextCell {
+            text: text.to_string(),
+            l: 0.0,
+            t,
+            r: 100.0,
+            b: t + 10.0,
+        };
+        // `algo-` / `rithms`: attached hyphen, alnum on both sides → fused.
+        assert_eq!(
+            cells_text(vec![&line("algo-", 0.0), &line("rithms", 12.0)]),
+            "algorithms"
+        );
+        // `pp. 545-` / `561`: attached, digits count as alnum → `545561` (upstream).
+        assert_eq!(
+            cells_text(vec![&line("pp. 545-", 0.0), &line("561", 12.0)]),
+            "pp. 545561"
+        );
+        // A dash after whitespace — a separator or a lone `-` cell — is kept and
+        // the lines take the ordinary joining space.
+        assert_eq!(
+            cells_text(vec![&line("range -", 0.0), &line("wide", 12.0)]),
+            "range - wide"
+        );
+        assert_eq!(
+            cells_text(vec![&line("-", 0.0), &line("item", 12.0)]),
+            "- item"
+        );
+        // Attached but the next line opens with no word (`x-` / `...`): dash
+        // kept and, as before, no separating space.
+        assert_eq!(
+            cells_text(vec![&line("x-", 0.0), &line("...", 12.0)]),
+            "x-..."
+        );
+    }
+
+    #[test]
+    fn lam_alef_only_swaps_a_genuinely_reversed_ligature() {
+        // A mid-word `alef-variant + lam` is pdfium's reversed lam-alef ligature and
+        // is swapped back to logical `lam + alef-variant` (`ب أ ل` → `ب ل أ`).
+        assert_eq!(
+            clean_text("\u{0628}\u{0623}\u{0644}"),
+            "\u{0628}\u{0644}\u{0623}"
+        );
+        // But when the alef-variant is *already* preceded by a lam it is the logical
+        // ligature `لآ`; the following lam is the next syllable's letter and must not
+        // move. `التعلم الآلي` must stay `الآلي`, not become `اللآي`.
+        assert_eq!(
+            clean_text("\u{0627}\u{0644}\u{0622}\u{0644}\u{064a}"),
+            "\u{0627}\u{0644}\u{0622}\u{0644}\u{064a}"
+        );
+    }
+}

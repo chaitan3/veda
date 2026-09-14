@@ -1,0 +1,98 @@
+[package]
+name = "docling-pdf"
+description = "PDF/image backend for docling.rs: pdfium text extraction + ONNX layout/table/OCR pipeline."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["ml"]
+# The full pipeline: pdfium page rendering + ONNX layout/OCR/TableFormer/
+# enrichment. Without it only the pure-Rust text-layer path remains
+# (`convert_text_layer` — lopdf content-stream parsing + the docling-parse
+# line sanitizer, the same extraction `--no-ocr` uses), which compiles for
+# wasm32-unknown-unknown.
+# The ONNX-free OCR pre/post half (`ocr_prep`) alone — what the wasm build
+# (#79 phase 2) pulls: pure Rust + the `image` crate, no ort/pdfium.
+ocr-prep = ["dep:image"]
+# HEIC/HEIF image input (#211): decode via the system libheif (native
+# dependency — libde265 for HEVC), off by default so plain and wasm builds
+# stay pure Rust. Without it a .heic input fails with a targeted
+# "rebuild with --features heif" message.
+heif = ["dep:libheif-rs"]
+ml = [
+    "ocr-prep",
+    "dep:pdfium-render",
+    "dep:ort",
+    "dep:image",
+    "dep:fast_image_resize",
+    "dep:tokenizers",
+    "dep:flate2",
+    "dep:tar",
+    "dep:regex",
+    "dep:docling-onnx",
+]
+# GPU execution providers (#74). Each feature makes `ort` link/download an
+# ONNX Runtime binary that contains that provider; which provider actually
+# runs is chosen at startup via DOCLING_RS_EP (default: cpu). CPU stays the
+# default build with zero GPU dependencies. directml is Windows-only and
+# coreml is macOS-only (the underlying ONNX Runtime binaries only exist
+# there); cuda/tensorrt are Linux + Windows.
+cuda = ["ml", "docling-onnx/cuda"]
+tensorrt = ["ml", "docling-onnx/tensorrt"]
+directml = ["ml", "docling-onnx/directml"]
+coreml = ["ml", "docling-onnx/coreml"]
+# CPU-class XNNPACK (#324) — see docling-onnx's note: self-built ONNX Runtime
+# only, never in a download-binaries CI matrix.
+xnnpack = ["ml", "docling-onnx/xnnpack"]
+
+[dependencies]
+# ~1.0: keeps libheif-sys on the 2.x line, which links libheif 1.16–1.17 —
+# what current LTS distros ship (Ubuntu 24.04 = 1.17). Newer libheif-rs
+# requires libheif >= 1.18 and can be selected once baselines move.
+libheif-rs = { version = "~1.0", default-features = false, optional = true }
+docling-core = { path = "../docling-core", version = "1.44.0" }
+# Shared ONNX execution-provider selection (DOCLING_RS_EP, #74/#288);
+# re-exported as `docling_pdf::ep`.
+docling-onnx = { path = "../docling-onnx", version = "1.44.0", optional = true }
+pdfium-render = { version = "0.8", optional = true }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls"], optional = true }
+image = { version = "0.25", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+regex = { version = "1.11", optional = true }
+lopdf = "0.44"
+# Not used directly — a minimum-version floor for lopdf's under-declared
+# requirement: lopdf 0.44 calls time's `BorrowedFormatItem::StringLiteral`
+# (added in time 0.3.48) while declaring only `time = "0.3"`. The MSRV-aware
+# resolver (.cargo/config.toml) caps versions at docling-core's 1.85 floor
+# and would otherwise select time 0.3.45, which doesn't compile lopdf. Drop
+# when lopdf raises its own minimum. (time 0.3.48+ wants rustc 1.88 — the
+# workspace MSRV; it never enters docling-core's 1.85-only tree.)
+time = { version = "0.3.48", default-features = false }
+fast_image_resize = { version = "5.1.4", optional = true }
+# CodeFormula enrichment decodes its VLM output with the HF tokenizer
+# (.models/code_formula/tokenizer.json) — same crate/features as docling-core's
+# chunking tokenizer.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+
+# lopdf 0.44 compiles its PDF-encryption support unconditionally, pulling in a
+# non-optional `getrandom`. On wasm32-unknown-unknown getrandom needs an
+# explicit backend, so enable lopdf's `wasm_js` feature there (JS crypto) —
+# the text-layer path never draws randomness, but the code must still compile.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+lopdf = { version = "0.44", features = ["wasm_js"] }
+
+# The text-layer diagnostic example reaches for lopdf directly to tell a load
+# failure apart from "loaded, but no text came out".
+[dev-dependencies]
+lopdf = "0.44"
+
+[lib]
+name = "docling_pdf"

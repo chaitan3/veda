@@ -167,6 +167,21 @@ intermittent OOM). Override with `DOCLING_RS_CUDA_CONV_ALGO`,
 `DOCLING_RS_CUDA_CONV_MAX_WORKSPACE`, `DOCLING_RS_CUDA_ARENA_EXTEND`, and
 `DOCLING_RS_CUDA_MEM_LIMIT_MB`.
 
+The same patch also fixes **VRAM creep across batch ingests**. ONNX Runtime's
+BFC arenas never return free chunks to the driver, and the pipeline reuses its
+sessions for every document in a run — so with pages of varying sizes the
+combined reservation ratchets upward until an ordinary mid-run allocation
+fails intermittently, even though each document's peak would fit. Every
+inference call therefore runs with shared `RunOptions` that enable
+`memory.enable_memory_arena_shrinkage=gpu:0` (each Run frees its session's
+unused arena chunks back to the driver). Measured on the 11 GB card: batch
+peak drops from ~9.3 GB to ~4.1 GB with no accumulation, at ~10-20% slower
+inference. It engages only after a one-time probe proves the CUDA EP really
+initialized (a CUDA build with missing drivers falls back to CPU per session,
+where the key would fail every Run); `DOCLING_RS_CUDA_ARENA_SHRINK=0` opts
+out entirely. Set `DOCLING_RS_DEBUG=1` to see the probe and the decision in
+the log.
+
 ## Upgrades and the database
 
 There is **no need to rebuild the database from scratch** for a new pipeline:

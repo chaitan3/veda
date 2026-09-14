@@ -987,8 +987,6 @@ dependencies = [
 [[package]]
 name = "docling-pdf"
 version = "1.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d72f5dce8bcd12ba521219ae92a695e0cbcfed8c677dc68ecd08becc92c24c94"
 dependencies = [
  "docling-core",
  "docling-onnx",

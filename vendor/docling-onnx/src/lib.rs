@@ -46,6 +46,13 @@
 //! is selected ([`prefers_fp32`]): the int8 exports are QDQ graphs calibrated
 //! for CPU kernels — on GPU they only add de-quantize traffic and were never
 //! conformance-validated there, while fp32 is (see docs/PDF_CONFORMANCE.md).
+//!
+//! Run-level memory: [`shrink_run_options`] is the shared `RunOptions` for
+//! every inference call. On a live CUDA provider it enables memory-arena
+//! shrinkage (`memory.enable_memory_arena_shrinkage=gpu:0`) so the reused
+//! sessions' BFC arenas stop ratcheting their reserved VRAM across a batch
+//! of differently sized documents; `DOCLING_RS_CUDA_ARENA_SHRINK=0` opts
+//! out. On CPU selections the options are plain — ORT's default behavior.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -398,6 +405,140 @@ pub fn apply(builder: SessionBuilder) -> Result<SessionBuilder, String> {
         .map_err(|e| format!("execution provider registration: {e}"))?;
     // After the GPU EPs, so they keep registration priority.
     memory_opts(builder)
+}
+
+/// The RunOptions config key that makes ONNX Runtime shrink the listed
+/// memory arenas after every Run.
+const SHRINK_KEY: &str = "memory.enable_memory_arena_shrinkage";
+
+/// The shared `RunOptions` every inference call in the workspace runs with.
+///
+/// ONNX Runtime's BFC device arenas never return free chunks to the driver.
+/// The pipeline reuses its sessions across every document of an ingest
+/// batch, and pages of different sizes allocate different-sized chunks: the
+/// combined reservation of the coexisting layout/OCR/TableFormer arenas
+/// ratchets upward with the variety of inputs seen so far, until an ordinary
+/// mid-run allocation fails on a machine whose VRAM the batch has gradually
+/// consumed — even though any single document's peak would fit. Setting
+/// [`SHRINK_KEY`] to `gpu:0` frees each session's unused arena chunks after
+/// every Run, so reserved memory tracks the current document instead of the
+/// batch's high-water mark.
+///
+/// The key hard-fails a Run (`INVALID_ARGUMENT`) when the session has no GPU
+/// arena, so it is only set after a one-time probe commits a trivial graph
+/// with CPU fallback disabled — session creation then succeeds only if the
+/// CUDA provider genuinely initialized. That distinguishes a live GPU from
+/// the silent per-session CPU fallback a CUDA build takes with missing
+/// drivers (`DOCLING_RS_EP=auto` cannot tell the two apart statically).
+/// Off on CPU selections and with `DOCLING_RS_CUDA_ARENA_SHRINK=0`; the
+/// returned options are then plain, matching ORT's default behavior.
+pub fn shrink_run_options() -> &'static ort::session::RunOptions {
+    static OPTS: OnceLock<ort::session::RunOptions> = OnceLock::new();
+    OPTS.get_or_init(|| {
+        let mut opts = ort::session::RunOptions::new().expect("run options");
+        if shrinkage_enabled() {
+            // A valid key on a valid RunOptions cannot fail; a failure here
+            // would only mean the default (retain-everything) behavior.
+            let _ = opts.set(SHRINK_KEY, "gpu:0");
+            docling_core::debug_log!("docling-onnx: run options carry {SHRINK_KEY}=gpu:0");
+        }
+        opts
+    })
+}
+
+/// Whether to attach the GPU arena-shrinkage entry to [`shrink_run_options`]:
+/// the selection must include a CUDA-class provider (`DOCLING_RS_EP`), and
+/// the provider must actually initialize — a CUDA build without usable
+/// drivers falls back to CPU per session, where the `gpu:0` entry would fail
+/// every Run. `DOCLING_RS_CUDA_ARENA_SHRINK=0` (or `false`/`off`) opts out.
+fn shrinkage_enabled() -> bool {
+    if docling_core::env::nonempty("DOCLING_RS_CUDA_ARENA_SHRINK")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let requested = match choice() {
+        Ep::Cuda | Ep::TensorRt => true,
+        // `auto` registers the CUDA provider when it was compiled in; the
+        // runtime fallback (missing drivers, no device) is what the probe
+        // below catches.
+        Ep::Auto => cfg!(feature = "cuda"),
+        _ => false,
+    };
+    requested && cuda_ep_live()
+}
+
+/// Does the CUDA provider genuinely initialize on this machine? A trivial
+/// Add graph is committed with the selected execution providers registered
+/// and CPU fallback disabled, then run once: session creation instantiates
+/// the CUDA EP (cuBLAS/cuDNN handles included), so success is exactly the
+/// condition under which `gpu:0` shrinkage is safe to request. Runs once per
+/// process, after the real models have loaded or fallen back.
+fn cuda_ep_live() -> bool {
+    static LIVE: OnceLock<bool> = OnceLock::new();
+    *LIVE.get_or_init(|| match cuda_probe() {
+        Ok(()) => {
+            docling_core::debug_log!("docling-onnx: CUDA probe OK; gpu:0 arena shrinkage on");
+            true
+        }
+        Err(e) => {
+            docling_core::debug_log!(
+                "docling-onnx: CUDA probe failed ({e}); gpu:0 arena shrinkage left off"
+            );
+            false
+        }
+    })
+}
+
+fn cuda_probe() -> ort::Result<()> {
+    use ort::editor::{Graph, Model, Node, Opset, ONNX_DOMAIN};
+    use ort::session::builder::SessionBuilder;
+    use ort::value::{Outlet, Shape, SymbolicDimensions, Tensor, TensorElementType, ValueType};
+
+    let tensor = ValueType::Tensor {
+        ty: TensorElementType::Float32,
+        shape: Shape::new([1]),
+        dimension_symbols: SymbolicDimensions::empty(1),
+    };
+    let mut graph = Graph::new()?;
+    graph.set_inputs([
+        Outlet::new("x", tensor.clone()),
+        Outlet::new("y", tensor.clone()),
+    ])?;
+    graph.set_outputs([Outlet::new("z", tensor)])?;
+    graph.add_node(Node::new(
+        "Add",
+        ONNX_DOMAIN,
+        "probe_add",
+        ["x", "y"],
+        ["z"],
+        [],
+    )?)?;
+    let mut model = Model::new([Opset::new(ONNX_DOMAIN, 21)?])?;
+    model.add_graph(graph)?;
+    let builder = SessionBuilder::new()?
+        // The whole point of the probe: a CUDA-less machine must fail here,
+        // not quietly serve the probe from the CPU EP.
+        .with_config_entry("session.disable_cpu_ep_fallback", "1")?;
+    let builder = apply(builder).map_err(ort::Error::new)?;
+    let mut session = model.into_session(&builder)?;
+    let x = Tensor::from_array((Shape::new([1]), vec![1.0f32]))?;
+    let y = Tensor::from_array((Shape::new([1]), vec![3.0f32]))?;
+    let mut out = session.run(ort::inputs!["x" => x, "y" => y])?;
+    let value = out
+        .remove("z")
+        .ok_or_else(|| ort::Error::new("probe output missing"))?;
+    let z = value.try_extract_tensor::<f32>()?;
+    if z.1 != [4.0] {
+        return Err(ort::Error::new(format!("probe produced {:?}", z.1)));
+    }
+    Ok(())
 }
 
 /// Session memory options (#263): with `DOCLING_RS_NO_ARENA` set, the CPU
