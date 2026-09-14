@@ -64,3 +64,9 @@ required-features = ["image-embed"]
 # Drive the axum router in-process (versions already in the dependency graph).
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+
+# Vendored docling-onnx with a CUDA memory patch (see vendor/docling-onnx):
+# memory-friendly cuDNN conv search and arena growth, overridable via
+# DOCLING_RS_CUDA_* env vars. Remove this to track upstream.
+[patch.crates-io]
+docling-onnx = { path = "vendor/docling-onnx" }

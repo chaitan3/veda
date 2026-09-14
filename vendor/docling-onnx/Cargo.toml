@@ -1,0 +1,39 @@
+# Vendored copy of `docling-onnx` 1.44.0 with a CUDA memory patch.
+#
+# Upstream registers `ort::ep::CUDA::default()`, leaving ONNX Runtime's
+# memory-hungry defaults in place: EXHAUSTIVE cuDNN conv-algorithm search with
+# an unbounded workspace, and `NextPowerOfTwo` arena growth. On a modest GPU
+# that fills the card and fails on Conv-heavy models (the OCR recognizer), with
+# the failure surfacing as `Failed to allocate memory` on a `Conv` node.
+#
+# This copy applies memory-friendly defaults, overridable via `DOCLING_RS_CUDA_*`
+# env vars (see `cuda_ep` in src/lib.rs). Wired in through `[patch.crates-io]`
+# in the root Cargo.toml; delete this directory and that patch to track upstream.
+[package]
+name = "docling-onnx"
+version = "1.44.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Shared ONNX Runtime execution-provider selection for docling.rs (DOCLING_RS_EP)."
+license = "MIT"
+homepage = "https://github.com/docling-project/docling.rs"
+repository = "https://github.com/docling-project/docling.rs"
+
+[features]
+coreml = ["ort/coreml", "ort/copy-dylibs"]
+cuda = ["ort/cuda", "ort/copy-dylibs"]
+directml = ["ort/directml", "ort/copy-dylibs"]
+tensorrt = ["ort/tensorrt", "ort/copy-dylibs"]
+xnnpack = ["ort/xnnpack"]
+
+[lib]
+name = "docling_onnx"
+path = "src/lib.rs"
+
+[dependencies.docling-core]
+version = "1.44.0"
+
+[dependencies.ort]
+version = "2.0.0-rc.13"
+features = ["std", "download-binaries", "tls-rustls"]
+default-features = false
