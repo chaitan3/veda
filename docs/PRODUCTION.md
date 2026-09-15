@@ -196,6 +196,28 @@ There is **no need to rebuild the database from scratch** for a new pipeline:
   changing the text embedder re-embeds text only.
 - `ingest --stages extract|text_embed|image_embed` targets specific stages;
   `ingest --force` forces just the targeted ones.
+
+**Chunk-size semantics differ per chunker** (`LS_CHUNK_SIZE` means different
+things to each):
+
+- `hybrid` (default; used for PDF/Office files, which keep the docling tree):
+  docling enforces the budget in **tokens**, counted with the chunk tokenizer
+  (`.models/chunk/tokenizer.json`). Two caveats: table chunks overshoot by
+  their heading-path length (docling's line-splitter budgets the full window,
+  a faithful port of docling's own behavior), and the budget is measured in
+  the *chunk tokenizer's* units, not the embedder's — with the default model
+  pair both are the same WordPiece vocab, but a custom
+  `DOCLING_CHUNK_TOKENIZER` changes the units.
+- `window` (used for `.md`/`.txt`/`.html` passthrough, and when the doc tree
+  is unavailable): `LS_CHUNK_SIZE` is **words**, with no token accounting. A
+  300-word chunk of table/OCR/number-heavy text tokenizes to 770+ BPE tokens
+  (measured up to ~4× on table-like rows).
+- `hierarchical`: structural only — **no size budget at all**; chunks can be
+  arbitrarily long.
+
+The embedder's `LS_EMBED_MAX_TOKENS` cap (above) is the backstop for all
+three; set `LS_CHUNK_SIZE` low enough that truncation rarely fires if you care
+about full chunk coverage.
 - A **matching stage fingerprint always skips**, even when the document has no
   text chunks (scanned or blank pages): extraction is deterministic, so
   re-running it would produce no chunks again. Re-extract triggers are a
