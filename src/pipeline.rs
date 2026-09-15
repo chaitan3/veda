@@ -2,7 +2,7 @@
 //! store) and querying (retrieve).
 
 use crate::chunk::Chunker;
-use crate::config::{ChunkerKind, Config, ExtractPipeline};
+use crate::config::{ChunkerKind, Config, EmbedProvider, ExtractPipeline};
 use crate::convert;
 use crate::embed::image::ImageEmbedder;
 use crate::embed::{self, Embedder};
@@ -122,6 +122,24 @@ pub struct Pipeline {
 impl Pipeline {
     /// Build every component from config.
     pub async fn from_config(cfg: &Config) -> Result<Self> {
+        // The `hybrid` budget (`LS_CHUNK_SIZE`) and the `window` word count are
+        // both honored by the chunkers — but the ONNX embedder has a hard
+        // position-embedding window (`LS_EMBED_MAX_TOKENS`, 512 for BGE-style
+        // encoders). A chunk budget larger than that window is silently
+        // truncated at embed time, so say so at startup instead.
+        if matches!(cfg.embed.provider, EmbedProvider::Onnx)
+            && matches!(cfg.chunker, ChunkerKind::Hybrid | ChunkerKind::Window)
+            && cfg.chunk_size + 2 > cfg.embed.max_tokens
+        {
+            tracing::warn!(
+                chunk_size = cfg.chunk_size,
+                max_tokens = cfg.embed.max_tokens,
+                "LS_CHUNK_SIZE exceeds the embedder's sequence window; \
+                 over-long chunks are truncated before embedding \
+                 (LS_CHUNK_SIZE <= {} avoids truncation)",
+                cfg.embed.max_tokens.saturating_sub(2)
+            );
+        }
         let embedder = embed::from_config(cfg)?;
         let image = embed::image::from_config(cfg)?;
         let store = store::from_config(cfg).await?;
