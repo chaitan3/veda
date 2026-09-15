@@ -216,6 +216,15 @@ There is **no need to rebuild the database from scratch** for a new pipeline:
   dropped on the next ingest; image vectors are kept). Transitions are
   automatic; a `png(image-only)` row in the ingest summary shows the split.
 
+- **Sequence-length cap.** The ONNX text embedder truncates every chunk to
+  `LS_EMBED_MAX_TOKENS` (default 512, the position-embedding table size of
+  BGE-style encoders). The tokenizer ships no truncation config, and chunk
+  sizes are counted in words — tables, OCR noise and code tokenize to far
+  more BPE tokens than words, so an over-long chunk used to crash inside the
+  graph (`/embeddings/Add_1 … right operand cannot broadcast`). Truncation is
+  logged as a warning; lower `LS_CHUNK_SIZE` if it fires often, since
+  truncated chunk tails are not embedded.
+
 Changing an embedding **dimension** is structural: the affected `vec0` table is
 dropped and recreated, and that stage re-runs for every document. The text and
 image spaces are independent, so a text-dimension change does not disturb image

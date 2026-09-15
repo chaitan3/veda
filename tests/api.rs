@@ -32,6 +32,7 @@ fn config(db: &str) -> Config {
             doc_prefix: None,
             onnx_model: None,
             onnx_tokenizer: None,
+            max_tokens: 512,
         },
         extract: ExtractPipeline::Onnx,
         image: ImageEmbedConfig {

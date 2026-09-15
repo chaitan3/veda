@@ -48,6 +48,10 @@ pub struct EmbedConfig {
     pub doc_prefix: Option<String>,
     pub onnx_model: Option<String>,
     pub onnx_tokenizer: Option<String>,
+    /// Cap on the encoded sequence length for the `onnx` provider. Must not
+    /// exceed the model's position-embedding table (512 for BGE-style
+    /// encoders); longer chunks are truncated with a warning.
+    pub max_tokens: usize,
 }
 
 /// How images are embedded for cross-modal search (text→image, image→image).
@@ -270,6 +274,11 @@ impl Config {
                     .or_else(|| Some(format!("{embed_dir}/bge-small-en-v1.5.onnx"))),
                 onnx_tokenizer: var("LS_ONNX_TOKENIZER")
                     .or_else(|| Some(format!("{embed_dir}/tokenizer.json"))),
+                max_tokens: var("LS_EMBED_MAX_TOKENS")
+                    .map(|v| v.parse::<usize>())
+                    .transpose()
+                    .map_err(|_| Error::config("LS_EMBED_MAX_TOKENS must be an integer"))?
+                    .unwrap_or(512),
             },
             image,
             extract,

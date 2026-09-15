@@ -29,6 +29,11 @@ pub struct OnnxEmbedder {
     needs_token_type_ids: bool,
     /// The output to read; its rank decides pooled-vs-hidden at run time.
     output_name: String,
+    /// Hard cap on encoded sequence length. Position-embedding tables are
+    /// fixed at export time (512 for BGE-style encoders) and the tokenizer
+    /// ships no truncation config, so an over-long chunk would fail inside
+    /// the graph (`/embeddings/Add_1` broadcast error) rather than at input.
+    max_tokens: usize,
 }
 
 impl OnnxEmbedder {
@@ -73,6 +78,7 @@ impl OnnxEmbedder {
             id: format!("onnx:{model_path}"),
             needs_token_type_ids,
             output_name,
+            max_tokens: cfg.embed.max_tokens,
         })
     }
 
@@ -81,29 +87,7 @@ impl OnnxEmbedder {
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| Error::embedding(format!("tokenize: {e}")))?;
-        let batch = encodings.len();
-        let seq = encodings
-            .iter()
-            .map(|e| e.get_ids().len())
-            .max()
-            .unwrap_or(0)
-            .max(1);
-
-        // Right-pad ids / mask / type-ids to a uniform sequence length.
-        let mut ids = vec![0i64; batch * seq];
-        let mut mask = vec![0i64; batch * seq];
-        let types = vec![0i64; batch * seq];
-        for (b, enc) in encodings.iter().enumerate() {
-            for (t, (&id, &m)) in enc
-                .get_ids()
-                .iter()
-                .zip(enc.get_attention_mask())
-                .enumerate()
-            {
-                ids[b * seq + t] = id as i64;
-                mask[b * seq + t] = m as i64;
-            }
-        }
+        let (batch, seq, ids, mask, types) = pad_batch(&encodings, self.max_tokens);
 
         let id_tensor =
             Tensor::from_array(([batch, seq], ids)).map_err(|e| Error::embedding(e.to_string()))?;
@@ -184,6 +168,7 @@ impl Embedder for OnnxEmbedder {
         let session = self.session.clone();
         let tokenizer = self.tokenizer.clone();
         let dim = self.dim;
+        let max_tokens = self.max_tokens;
         let id = self.id.clone();
         let needs_token_type_ids = self.needs_token_type_ids;
         let output_name = self.output_name.clone();
@@ -198,6 +183,7 @@ impl Embedder for OnnxEmbedder {
                 id,
                 needs_token_type_ids,
                 output_name,
+                max_tokens,
             };
             embedder.run(&texts)
         })
@@ -211,5 +197,91 @@ impl Embedder for OnnxEmbedder {
 
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+/// Right-pad a tokenized batch to a uniform sequence length, truncating every
+/// sequence to `max_tokens`.
+///
+/// The cap is not optional: encoders carry a fixed position-embedding table
+/// (`/embeddings/Add_1` in BGE graphs, 512 rows for bge-small), and the
+/// tokenizer JSON ships neither truncation nor a model max length — so an
+/// over-long chunk fails *inside the graph* as a broadcast error instead of
+/// at the input. Chunk sizes are counted in words, and tables / OCR noise /
+/// code tokenize to far more BPE tokens than words, so truncation is the
+/// embedder's last line of defence.
+///
+/// Returns `(batch, seq, input_ids, attention_mask, token_type_ids)`; pads
+/// with zeros (mask 0) so padded positions are ignored by the model.
+fn pad_batch(
+    encodings: &[tokenizers::Encoding],
+    max_tokens: usize,
+) -> (usize, usize, Vec<i64>, Vec<i64>, Vec<i64>) {
+    let batch = encodings.len();
+    if batch == 0 {
+        return (0, 1, Vec::new(), Vec::new(), Vec::new());
+    }
+    let longest = encodings
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(0);
+    let seq = longest.min(max_tokens).max(1);
+    if longest > max_tokens {
+        tracing::warn!(
+            longest_tokens = longest,
+            max_tokens = max_tokens,
+            "truncating over-long chunk(s) for embedding; consider a smaller LS_CHUNK_SIZE"
+        );
+    }
+
+    let mut ids = vec![0i64; batch * seq];
+    let mut mask = vec![0i64; batch * seq];
+    let mut types = vec![0i64; batch * seq];
+    for (b, enc) in encodings.iter().enumerate() {
+        let eids = enc.get_ids();
+        let emask = enc.get_attention_mask();
+        let etypes = enc.get_type_ids();
+        // Only real positions; the rest stays zero-padded.
+        let n = seq.min(eids.len()).min(emask.len()).min(etypes.len());
+        for t in 0..n {
+            ids[b * seq + t] = eids[t] as i64;
+            mask[b * seq + t] = emask[t] as i64;
+            types[b * seq + t] = etypes[t] as i64;
+        }
+    }
+    (batch, seq, ids, mask, types)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tokenizer whose sequences exceed the cap must be truncated, with the
+    /// mask cut at exactly the cap. Uses the real bge tokenizer when present.
+    #[test]
+    fn pad_batch_truncates_long_sequences() {
+        let Ok(tokenizer) = Tokenizer::from_file(".models/embed/tokenizer.json") else {
+            return; // models not downloaded; nothing to assert here
+        };
+        // 300 words of token-heavy noise → comfortably over 512 BPE tokens.
+        let long_text = "no. 12345678 ".repeat(600);
+        let short_text = "hello world";
+        let encodings = tokenizer
+            .encode_batch(vec![long_text, short_text.to_string()], true)
+            .unwrap();
+        assert!(encodings[0].get_ids().len() > 512);
+        assert!(encodings[1].get_ids().len() < 512);
+
+        let (batch, seq, ids, mask, types) = pad_batch(&encodings, 512);
+        assert_eq!(batch, 2);
+        assert_eq!(seq, 512);
+        assert_eq!(ids.len(), 2 * 512);
+        assert_eq!(mask.len(), 2 * 512);
+        // First sequence: full 512 real tokens; second: padded tail.
+        assert_eq!(mask[0], 1);
+        assert_eq!(mask[511], 1);
+        assert_eq!(mask[512 + encodings[1].get_ids().len()], 0);
+        assert_eq!(types[512], 0, "token_type_ids are per-token, not zeros");
     }
 }
