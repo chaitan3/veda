@@ -354,10 +354,23 @@ impl Pipeline {
         let want_extract =
             !image_only && (stages.wants("extract") || (stages.wants("text_embed") && !has_text));
         let extract_fp = self.store.document_stage(&doc_id, "extract").await?;
+        // Why extract would run — also the skip reason when empty. A matching
+        // fingerprint always skips: a document with no text chunks (scanned or
+        // blank pages) must not re-convert on every run, conversion being
+        // deterministic it would produce no chunks again.
+        let extract_reason = if force_extract {
+            "forced"
+        } else if extract_fp.as_deref() != Some(fp.extract.as_str()) {
+            if extract_fp.is_some() {
+                "fingerprint-changed"
+            } else {
+                "fingerprint-missing"
+            }
+        } else {
+            ""
+        };
         let mut extract_ran = false;
-        if want_extract
-            && (force_extract || extract_fp.as_deref() != Some(fp.extract.as_str()) || !has_text)
-        {
+        if want_extract && !extract_reason.is_empty() {
             let t = Instant::now();
             let converted = convert::convert(&self.cfg, name, &bytes)?;
             let parse_secs = t.elapsed().as_secs_f64();
@@ -367,12 +380,23 @@ impl Pipeline {
             self.store
                 .replace_text_chunks(&doc_id, &text_chunks)
                 .await?;
-            self.store
-                .set_document_stage(&doc_id, "extract", &fp.extract)
-                .await?;
+            // Order matters: drop the text-embed fingerprint *before* the new
+            // extract fingerprint is recorded, so a crash in between leaves the
+            // stage missing (re-embed the fresh chunks) rather than stale.
             self.store
                 .clear_document_stage(&doc_id, "text_embed")
                 .await?;
+            self.store
+                .set_document_stage(&doc_id, "extract", &fp.extract)
+                .await?;
+
+            if text_chunks.is_empty() {
+                tracing::warn!(
+                    name = name,
+                    pages = converted.pages,
+                    "converted document produced no text chunks; not searchable in the text channel"
+                );
+            }
 
             let words = converted.markdown.split_whitespace().count();
             let title = first_heading(&converted.markdown).unwrap_or_else(|| stem(name));
@@ -480,7 +504,11 @@ impl Pipeline {
         }
 
         if !did_work {
-            tracing::info!(name = name, "up to date; skipping");
+            tracing::info!(
+                name = name,
+                text_chunks = self.store.count_text_chunks_for(&doc_id).await?,
+                "up to date; skipping"
+            );
             return Ok(IngestOutcome::Skipped);
         }
 
@@ -490,6 +518,11 @@ impl Pipeline {
             uri = source_uri,
             chunks = n_chunks,
             secs = started.elapsed().as_secs_f64(),
+            extract = if extract_ran {
+                extract_reason
+            } else {
+                "unchanged"
+            },
             "ingested"
         );
         Ok(IngestOutcome::Ingested(n_chunks))

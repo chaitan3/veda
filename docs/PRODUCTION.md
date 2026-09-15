@@ -196,6 +196,14 @@ There is **no need to rebuild the database from scratch** for a new pipeline:
   changing the text embedder re-embeds text only.
 - `ingest --stages extract|text_embed|image_embed` targets specific stages;
   `ingest --force` forces just the targeted ones.
+- A **matching stage fingerprint always skips**, even when the document has no
+  text chunks (scanned or blank pages): extraction is deterministic, so
+  re-running it would produce no chunks again. Re-extract triggers are a
+  missing or changed `extract` fingerprint, or `--force`. Each `ingested` log
+  line records why extract ran (`extract=fingerprint-missing|changed|forced`,
+  or `unchanged`), and skips report their `text_chunks` count — a document
+  that converts to zero text chunks also logs a warning, so image-only PDFs
+  are easy to spot.
 - **Per-folder policy — image-only folders.** Folders listed in
   `LS_IMAGE_ONLY_PATHS` (a path-separated list, like `LS_SOURCE_PATH`) index
   their image files through the image channel only: no docling conversion, no
