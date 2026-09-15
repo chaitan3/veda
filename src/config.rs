@@ -146,6 +146,9 @@ pub struct Config {
     pub db_path: String,
     /// Folders ingested by the CLI (from `LS_SOURCE_PATH`, a path-separated list).
     pub source_paths: Vec<String>,
+    /// Folders whose image files are indexed by the image channel only — no
+    /// docling conversion, no OCR, no text chunks (from `LS_IMAGE_ONLY_PATHS`).
+    pub image_only_paths: Vec<String>,
     /// Root holding docling models (`.models`) and the embedder model.
     pub models_dir: String,
     pub embed: EmbedConfig,
@@ -253,6 +256,7 @@ impl Config {
         Ok(Config {
             db_path: var_or("LS_DB_PATH", "data/local-search.db"),
             source_paths: parse_path_list(&var_or("LS_SOURCE_PATH", "docs")),
+            image_only_paths: parse_path_list(&var_or("LS_IMAGE_ONLY_PATHS", "")),
             models_dir,
             embed: EmbedConfig {
                 provider,

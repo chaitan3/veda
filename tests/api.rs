@@ -20,6 +20,7 @@ fn config(db: &str) -> Config {
     Config {
         db_path: db.to_string(),
         source_paths: vec!["docs".to_string()],
+        image_only_paths: Vec::new(),
         models_dir: ".models".to_string(),
         embed: EmbedConfig {
             provider: EmbedProvider::Hash,

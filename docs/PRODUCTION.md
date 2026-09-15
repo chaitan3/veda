@@ -196,6 +196,17 @@ There is **no need to rebuild the database from scratch** for a new pipeline:
   changing the text embedder re-embeds text only.
 - `ingest --stages extract|text_embed|image_embed` targets specific stages;
   `ingest --force` forces just the targeted ones.
+- **Per-folder policy — image-only folders.** Folders listed in
+  `LS_IMAGE_ONLY_PATHS` (a path-separated list, like `LS_SOURCE_PATH`) index
+  their image files through the image channel only: no docling conversion, no
+  OCR, no text chunks — just one SigLIP vector per image, so the ingest of
+  such folders is fast and touches no GPU model except the image embedder.
+  Non-image files in those folders ingest normally. The policy is re-derived
+  from the path on every run: removing a folder from the list *promotes* its
+  documents (the next plain ingest backfills conversion + text), adding one
+  *demotes* them (the text channel — chunks, vectors and stage rows — is
+  dropped on the next ingest; image vectors are kept). Transitions are
+  automatic; a `png(image-only)` row in the ingest summary shows the split.
 
 Changing an embedding **dimension** is structural: the affected `vec0` table is
 dropped and recreated, and that stage re-runs for every document. The text and

@@ -126,6 +126,36 @@ pub fn uri_under_roots(uri: &str, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+/// The image-only policy roots from config, canonicalized.
+///
+/// Unlike source roots, a missing policy path is skipped with a warning
+/// instead of erroring: a stale policy entry for a folder that is not (yet)
+/// there is inert, while a missing *source* root must fail loudly (`--sync`
+/// would otherwise sweep its documents).
+pub fn image_only_roots(cfg: &Config) -> Vec<PathBuf> {
+    cfg.image_only_paths
+        .iter()
+        .filter_map(|raw| match PathBuf::from(raw).canonicalize() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(path = %raw, error = %e, "LS_IMAGE_ONLY_PATHS entry unusable; ignored");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Is `path` inside an image-only root? Longest-prefix match, so a policy root
+/// nested inside a normal root (or vice versa) resolves to the deeper one.
+pub fn under_image_only(policy_roots: &[PathBuf], path: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let mut roots: Vec<&PathBuf> = policy_roots.iter().collect();
+    roots.sort_by_key(|r| std::cmp::Reverse(r.as_os_str().len()));
+    roots.iter().any(|root| path.starts_with(*root))
+}
+
 /// Build the folder source from config.
 pub fn from_config(cfg: &Config) -> FolderSource {
     FolderSource::from_roots(cfg.source_paths.iter().map(PathBuf::from).collect())

@@ -22,6 +22,7 @@ fn config(db: &str, roots: Vec<PathBuf>) -> Config {
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
+        image_only_paths: Vec::new(),
         models_dir: ".models".to_string(),
         embed: EmbedConfig {
             provider: EmbedProvider::Hash,

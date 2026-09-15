@@ -188,12 +188,19 @@ impl Pipeline {
         let src = source::from_config(&self.cfg);
         let roots = src.canonical_roots()?;
         let refs = src.list()?;
+        // Folders whose image files skip the docling/OCR/text path entirely.
+        let policy_roots = source::image_only_roots(&self.cfg);
         let mut report = IngestReport::default();
         let mut current: Vec<String> = Vec::with_capacity(refs.len());
 
         for r in &refs {
             current.push(r.uri.clone());
-            let kind = file_type(&r.name);
+            let image_only = source::under_image_only(&policy_roots, &r.path);
+            let kind = if image_only && is_image_name(&r.name) {
+                format!("{}(image-only)", file_type(&r.name))
+            } else {
+                file_type(&r.name)
+            };
             let started = Instant::now();
             let bytes = match std::fs::read(&r.path) {
                 Ok(b) => b,
@@ -207,7 +214,7 @@ impl Pipeline {
                 }
             };
             let outcome = self
-                .ingest_bytes(&r.uri, &r.name, bytes, force, stages)
+                .ingest_bytes(&r.uri, &r.name, bytes, force, stages, image_only)
                 .await;
             let secs = started.elapsed().as_secs_f64();
             let stats = report.by_type.entry(kind).or_default();
@@ -252,6 +259,12 @@ impl Pipeline {
     /// Ingest a single document, running only the stages that are stale (or
     /// forced). Unchanged content keeps its document id, so per-document stage
     /// rows and content-addressed image vectors persist across runs.
+    ///
+    /// `image_only` marks a file under an `LS_IMAGE_ONLY_PATHS` root: image
+    /// files there get the image channel only — no conversion, no OCR, no
+    /// text chunks. The policy is applied per run, and a document whose
+    /// stored policy disagrees (the folder was added to or removed from the
+    /// list) transitions on the next ingest.
     pub async fn ingest_bytes(
         &self,
         source_uri: &str,
@@ -259,15 +272,24 @@ impl Pipeline {
         bytes: Vec<u8>,
         force: bool,
         stages: StageSet,
+        image_only_folder: bool,
     ) -> Result<IngestOutcome> {
         let started = Instant::now();
-        let method = self.method_label(name);
+        // The policy means "image files in this folder are image-only"; other
+        // file types there ingest normally.
+        let image_only = image_only_folder && is_image_name(name);
+        let method = if image_only {
+            "image-only".to_string()
+        } else {
+            self.method_label(name)
+        };
         let chunker = format!("{:?}", self.chunker.kind()).to_lowercase();
         tracing::info!(
             name = name,
             uri = source_uri,
             bytes = bytes.len(),
             method = %method,
+            policy = if image_only { "image-only" } else { "default" },
             chunker = %chunker,
             "ingesting"
         );
@@ -287,6 +309,13 @@ impl Pipeline {
                 doc.id
             }
         };
+        let mut doc = self
+            .store
+            .get_document(&doc_id)
+            .await?
+            .ok_or_else(|| Error::store("document vanished mid-ingest"))?;
+        let stored_image_only =
+            doc.metadata.get("folder_policy").and_then(|v| v.as_str()) == Some("image-only");
 
         let force_extract = force && stages.wants("extract");
         let force_text = force && stages.wants("text_embed");
@@ -294,9 +323,36 @@ impl Pipeline {
         let mut did_work = false;
         let mut n_chunks = 0usize;
 
+        // Policy transition, image-only direction: drop the text channel (its
+        // chunks, vectors and stage rows) — but only when there is one; a
+        // brand-new image-only document has nothing to drop. The reverse
+        // transition needs no code here — a promoted document has no `extract`
+        // fingerprint, so the normal stage logic below converts and embeds it.
+        if image_only && !stored_image_only {
+            let had_text_channel = self
+                .store
+                .document_stage(&doc_id, "extract")
+                .await?
+                .is_some()
+                || self.store.count_text_chunks_for(&doc_id).await? > 0;
+            if had_text_channel {
+                self.store.replace_text_chunks(&doc_id, &[]).await?;
+                self.store.clear_document_stage(&doc_id, "extract").await?;
+                self.store
+                    .clear_document_stage(&doc_id, "text_embed")
+                    .await?;
+                did_work = true;
+                tracing::info!(
+                    name = name,
+                    "folder policy image-only; text channel dropped"
+                );
+            }
+        }
+
         // --- extract: convert + chunk (coupled, since we cache no conversion)
         let has_text = self.store.count_text_chunks_for(&doc_id).await? > 0;
-        let want_extract = stages.wants("extract") || (stages.wants("text_embed") && !has_text);
+        let want_extract =
+            !image_only && (stages.wants("extract") || (stages.wants("text_embed") && !has_text));
         let extract_fp = self.store.document_stage(&doc_id, "extract").await?;
         let mut extract_ran = false;
         if want_extract
@@ -332,11 +388,6 @@ impl Pipeline {
                     embed_secs: 0.0,
                 },
             );
-            let mut doc = self
-                .store
-                .get_document(&doc_id)
-                .await?
-                .ok_or_else(|| Error::store("document vanished mid-ingest"))?;
             doc.title = title;
             doc.hash = hash.clone();
             doc.metadata = serde_json::json!({
@@ -353,7 +404,8 @@ impl Pipeline {
 
         // --- text_embed: (re)embed the stored text chunks in place
         let text_fp = self.store.document_stage(&doc_id, "text_embed").await?;
-        let run_text = (stages.wants("text_embed") || extract_ran)
+        let run_text = !image_only
+            && (stages.wants("text_embed") || extract_ran)
             && (extract_ran || force_text || text_fp.as_deref() != Some(fp.text_embed.as_str()));
         if run_text {
             let chunks = self.store.text_chunks(&doc_id).await?;
@@ -405,6 +457,26 @@ impl Pipeline {
                 did_work = true;
                 n_chunks += 1;
             }
+        }
+
+        // Image-only documents never pass through extract, which is what
+        // normally records title/hash/metadata — do it here instead.
+        if image_only && did_work {
+            doc.title = stem(name);
+            doc.hash = hash.clone();
+            doc.metadata = serde_json::json!({
+                "source": source_uri,
+                "folder_policy": "image-only",
+            });
+            self.store.upsert_document(&doc).await?;
+        }
+
+        if image_only && self.image.is_none() {
+            tracing::warn!(
+                name = name,
+                "image-only folder but the image embedder is off; file not indexed"
+            );
+            return Ok(IngestOutcome::Skipped);
         }
 
         if !did_work {
