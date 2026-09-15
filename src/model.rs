@@ -158,13 +158,17 @@ pub enum RetrievalMode {
     Bm25,
     /// Vector + BM25, fused with Reciprocal Rank Fusion.
     Hybrid,
+    /// Text query, image results only: the query is embedded by the image
+    /// embedder's text tower and matched against image chunks.
+    Image,
 }
 
 impl RetrievalMode {
-    pub const ALL: [RetrievalMode; 3] = [
+    pub const ALL: [RetrievalMode; 4] = [
         RetrievalMode::Vector,
         RetrievalMode::Bm25,
         RetrievalMode::Hybrid,
+        RetrievalMode::Image,
     ];
 }
 
@@ -174,6 +178,7 @@ impl std::fmt::Display for RetrievalMode {
             RetrievalMode::Vector => "vector",
             RetrievalMode::Bm25 => "bm25",
             RetrievalMode::Hybrid => "hybrid",
+            RetrievalMode::Image => "image",
         };
         f.write_str(s)
     }
@@ -187,6 +192,7 @@ impl FromStr for RetrievalMode {
             "vector" | "dense" | "semantic" => Ok(RetrievalMode::Vector),
             "bm25" | "keyword" | "sparse" | "fts" => Ok(RetrievalMode::Bm25),
             "hybrid" => Ok(RetrievalMode::Hybrid),
+            "image" | "image-text" | "images" => Ok(RetrievalMode::Image),
             other => Err(crate::Error::config(format!(
                 "unknown retrieval mode '{other}'"
             ))),

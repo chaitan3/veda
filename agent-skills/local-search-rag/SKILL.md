@@ -46,6 +46,8 @@ Read-only: nothing indexed here can be modified through these tools.
    - use `mode="bm25"` for exact identifiers, error codes, quoted phrases;
    - use `mode="vector"` for paraphrases ("what's the deadline for X" when the
      document says "must be submitted by…");
+   - use `mode="image"` to find images with a text query (image hits only —
+     the hybrid image channel without text results competing for slots);
    - start with `k=5`; raise only if the first page misses.
 3. **Expand when needed**: a hit is a ~paragraph slice. If it's plausibly part
    of a larger passage, call `get_context_around(doc_id, ordinal)`. If the

@@ -146,6 +146,37 @@ async fn search_hits_are_self_contained() {
 }
 
 #[tokio::test]
+async fn image_mode_reports_a_disabled_image_channel() {
+    let (app, _doc_id) = setup().await;
+    // The test config has LS_IMAGE_EMBED_PROVIDER off: mode=image must say
+    // so, rather than returning text hits (this corpus has no image space).
+    let resp = app
+        .oneshot(get("/api/search?q=mountain%20lake&mode=image"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("LS_IMAGE_EMBED_PROVIDER"),
+        "unexpected error body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_mode_falls_back_to_hybrid() {
+    let (app, _doc_id) = setup().await;
+    let resp = app
+        .oneshot(get("/api/search?q=mountain&mode=banana"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["mode"], "hybrid");
+}
+
+#[tokio::test]
 async fn item_endpoint_pages_chunks() {
     let (app, doc_id) = setup().await;
     let resp = app

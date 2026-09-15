@@ -200,7 +200,7 @@ document (no silent drops).
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | liveness + counts + corpus version |
-| GET | `/api/search?q=&mode=&k=` | search (`vector` \| `bm25` \| `hybrid`) |
+| GET | `/api/search?q=&mode=&k=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
 | POST | `/api/search` | `{"query","mode","top_k"}` |
 | GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
 | GET | `/api/documents?offset=&limit=` | stored documents (paged) |
@@ -241,10 +241,10 @@ re-runs only the stages whose configuration or models changed.
 - **Image search** (SigLIP2, images only for now): **on by default**
   (`LS_IMAGE_EMBED_PROVIDER=siglip`; set `off` to disable). Standalone
   PNG/JPG/… get an image chunk in a shared image+text space, so `mode=hybrid`
-  text queries also match images and `POST /api/search/image` does
-  query-by-image. Image chunks carry a `media_url` served by
-  `GET /api/media/{chunk_id}` (from the source file; nothing is stored). PDF
-  figure extraction is not implemented yet.
+  text queries also match images, `mode=image` returns image hits only, and
+  `POST /api/search/image` does query-by-image. Image chunks carry a
+  `media_url` served by `GET /api/media/{chunk_id}` (from the source file;
+  nothing is stored). PDF figure extraction is not implemented yet.
 - **Code/formula enrichment** (CodeFormulaV2): on by default on **CPU**, off
   when the provider resolves to **CUDA** (`LS_EXTRACT_CODE_FORMULA`). Requires
   the models fetched by `download-models`; if they're missing the pass is

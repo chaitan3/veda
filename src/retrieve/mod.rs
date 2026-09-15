@@ -44,7 +44,21 @@ impl Retriever {
             RetrievalMode::Vector => self.vector(query, k).await,
             RetrievalMode::Bm25 => self.store.keyword_search(query, k).await,
             RetrievalMode::Hybrid => self.hybrid(query, k).await,
+            RetrievalMode::Image => self.image_text(query, k).await,
         }
+    }
+
+    /// Text query, image results only: the image embedder's text tower embeds
+    /// the query, which is matched against image chunks. The image-text half
+    /// of hybrid search, without the text channels eating result slots.
+    async fn image_text(&self, query: &str, k: usize) -> Result<Vec<Scored>> {
+        let image = self.image.as_ref().ok_or_else(|| {
+            crate::Error::embedding(
+                "image search needs an image embedder (LS_IMAGE_EMBED_PROVIDER is off)",
+            )
+        })?;
+        let iq = image.embed_query_text(query).await?;
+        self.store.image_search(&iq, k).await
     }
 
     async fn vector(&self, query: &str, k: usize) -> Result<Vec<Scored>> {

@@ -32,7 +32,7 @@ import urllib.request
 
 BASE_URL = os.environ.get("LS_API_URL", "http://127.0.0.1:8080").rstrip("/")
 API_KEY = os.environ.get("LS_API_KEY", "").strip()
-VALID_MODES = ("hybrid", "vector", "bm25")
+VALID_MODES = ("hybrid", "vector", "bm25", "image")
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +236,9 @@ TOOL_SCHEMAS = [
                         "description": (
                             "hybrid (default): semantic+keyword fused; bm25: "
                             "exact keywords/identifiers/quotes; vector: "
-                            "paraphrases and meaning-based queries"
+                            "paraphrases and meaning-based queries; image: "
+                            "text query, image hits only (needs the image "
+                            "embedder on)"
                         ),
                     },
                     "k": {"type": "integer", "description": "Hits to return (1-100, default 5)"},
