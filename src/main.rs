@@ -43,7 +43,7 @@ enum Command {
     Query {
         /// The query text.
         query: String,
-        /// Retrieval mode: vector | bm25 | hybrid.
+        /// Retrieval mode: hybrid | vector | bm25 | image.
         #[arg(long, default_value = "hybrid")]
         mode: String,
         /// Number of results.
@@ -186,7 +186,22 @@ async fn main() -> anyhow::Result<()> {
                     hit.chunk.kind.as_str(),
                     hit.chunk.doc_id
                 );
-                println!("    {snippet}");
+                if snippet.is_empty() && hit.chunk.kind == local_search::model::ChunkKind::Image {
+                    // Image chunks have no text: name the source file instead.
+                    let doc = pipeline.store().get_document(&hit.chunk.doc_id).await?;
+                    let name = doc
+                        .map(|d| {
+                            d.source_uri
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&d.source_uri)
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| hit.chunk.id.chars().take(12).collect());
+                    println!("    [image] {name}");
+                } else {
+                    println!("    {snippet}");
+                }
             }
         }
 
