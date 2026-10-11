@@ -236,3 +236,32 @@ async fn collection_is_paginated() {
     assert!(body["documents"][0]["source_uri"].is_string());
     assert!(body["documents"][0].get("metadata").is_none());
 }
+
+#[tokio::test]
+async fn documents_query_matches_title_and_path() {
+    let (app, doc_id) = setup().await;
+
+    // Path fragment, title, and case-insensitive forms all match.
+    for q in ["sample.txt", "Sample", "SAMPLE"] {
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/documents?query={q}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json(resp).await;
+        assert_eq!(body["total"].as_u64(), Some(1), "query={q}");
+        assert_eq!(body["documents"][0]["id"].as_str().unwrap(), doc_id);
+    }
+
+    // No match: an empty page, not an error.
+    let resp = app
+        .oneshot(get("/api/documents?query=nothing-matches-this"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+    assert_eq!(body["count"].as_u64(), Some(0));
+    assert_eq!(body["total"].as_u64(), Some(0));
+    assert!(body["next"].is_null());
+}

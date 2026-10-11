@@ -203,7 +203,7 @@ document (no silent drops).
 | GET | `/api/search?q=&mode=&k=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
 | POST | `/api/search` | `{"query","mode","top_k"}` |
 | GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
-| GET | `/api/documents?offset=&limit=` | stored documents (paged) |
+| GET | `/api/documents?offset=&limit=&query=` | stored documents (paged; `query` = case-insensitive title/path substring) |
 | GET | `/api/documents/{id}?offset=&limit=` | one document + a bounded, pageable chunk slice |
 | POST | `/api/search/image` | query-by-image: `{"image_base64","top_k"}` (needs `LS_IMAGE_EMBED_PROVIDER`) |
 | GET | `/api/media/{chunk_id}` | bytes of an image chunk (from its source document) |

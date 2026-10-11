@@ -132,13 +132,16 @@ def search_image(image: str, k: int = 5) -> dict:
     return _hits_from_search(payload)
 
 
-def list_documents(offset: int = 0, limit: int = 100) -> dict:
-    """Browse the corpus. GET /api/documents — use `next` from the response
-    to page; don't pull the whole index into context."""
-    payload = _request(
-        "GET",
-        f"/api/documents?offset={int(offset)}&limit={max(1, min(int(limit), 1000))}",
-    )
+def list_documents(offset: int = 0, limit: int = 100, query: str | None = None) -> dict:
+    """Browse the corpus, or find a document by file name / title / folder.
+
+    GET /api/documents — `query` is a case-insensitive substring over the
+    title and source path; use `next` from the response to page. Don't pull
+    the whole index into context."""
+    url = f"/api/documents?offset={int(offset)}&limit={max(1, min(int(limit), 1000))}"
+    if query and query.strip():
+        url += "&query=" + urllib.parse.quote(query.strip())
+    payload = _request("GET", url)
     return {
         "total": payload["total"],
         "next": payload["next"],
@@ -270,7 +273,8 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "list_documents",
             "description": (
-                "List indexed documents (id, title, source path). Use to "
+                "List indexed documents (id, title, source path), optionally "
+                "filtered by file name / title / folder substring. Use to "
                 "discover what the corpus contains; page via the returned `next`."
             ),
             "parameters": {
@@ -278,6 +282,14 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "offset": {"type": "integer", "description": "Skip N documents (default 0)"},
                     "limit": {"type": "integer", "description": "Docs per page (default 100)"},
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Case-insensitive substring to match against the "
+                            "title and source path — use for 'find the file "
+                            "named X' or 'docs under folder Y'"
+                        ),
+                    },
                 },
             },
         },
@@ -379,10 +391,13 @@ if __name__ == "__main__":
     elif name == "doc" and args:
         result = dispatch("get_document", doc_id=args[0])
     elif name == "docs":
-        result = dispatch("list_documents")
+        result = dispatch("list_documents", query=args[0] if args else None)
     elif name == "stats":
         result = dispatch("corpus_stats")
     else:
-        print(f"usage: {sys.argv[0]} search <q> | image <path> | doc <id> | docs | stats")
+        print(
+            f"usage: {sys.argv[0]} "
+            "search <q> | image <path> | doc <id> | docs [query] | stats"
+        )
         sys.exit(2)
     print(json.dumps(result, indent=2, ensure_ascii=False))

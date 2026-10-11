@@ -283,6 +283,9 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
 struct PageParams {
     offset: Option<usize>,
     limit: Option<usize>,
+    /// Case-insensitive substring match over the document title / source path
+    /// (`/api/documents` only; ignored elsewhere).
+    query: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -297,21 +300,39 @@ struct DocumentsResponse {
 
 async fn documents(State(state): State<AppState>, Query(p): Query<PageParams>) -> Response {
     let store = state.pipeline.store();
-    let total = match store.count_documents().await {
-        Ok(n) => n,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
     let limit = p.limit.unwrap_or(DEFAULT_DOC_PAGE).clamp(1, MAX_DOC_PAGE);
     let offset = p.offset.unwrap_or(0);
-    let documents: Vec<DocumentRef> = match store.list_documents().await {
-        Ok(all) => all
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .map(DocumentRef::from)
-            .collect(),
+    // `query` is a case-insensitive substring match over the title and the
+    // source path — the way to find a document by file name or folder. The
+    // whole documents table is loaded for paging anyway, so filtering here
+    // costs no extra query; move it into SQL if a corpus ever outgrows memory.
+    let needle = p
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+    let all = match store.list_documents().await {
+        Ok(all) => all,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    let matched: Vec<&Document> = match &needle {
+        Some(needle) => all
+            .iter()
+            .filter(|d| {
+                d.title.to_lowercase().contains(needle)
+                    || d.source_uri.to_lowercase().contains(needle)
+            })
+            .collect(),
+        None => all.iter().collect(),
+    };
+    let total = matched.len();
+    let documents: Vec<DocumentRef> = matched
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|d| DocumentRef::from(*d))
+        .collect();
     let next = (offset + documents.len() < total).then_some(offset + documents.len());
     Json(DocumentsResponse {
         count: documents.len(),

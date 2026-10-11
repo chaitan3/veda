@@ -56,7 +56,11 @@ Read-only: nothing indexed here can be modified through these tools.
    `fetch_image_chunk(chunk_id)` and open the returned path with vision
    capabilities. To search by an image the user provides, call
    `search_image(path_or_url)`.
-5. **Answer with citations**: cite the `source` (document title) for every
+5. **Find a file by name/title/folder**: `list_documents(query="…")` — a
+   case-insensitive substring over document titles and source paths. Search
+   channels index *content*, not file names, so a file-name question needs
+   this call (never `search_image`, which takes an image, not text).
+6. **Answer with citations**: cite the `source` (document title) for every
    factual claim drawn from a hit. If search returns nothing relevant, say so
    plainly — do not pad with model-prior knowledge and imply it came from the
    corpus.
