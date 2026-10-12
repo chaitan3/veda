@@ -19,21 +19,28 @@ seams — while the data model is shaped for the image channel from day one.
   pipeline.
 - **Execution provider**: CUDA when usable, with an automatic CPU fallback that
   is reported in the log (see below).
-- **Embeddings**: in-process ONNX sentence encoder (default, bge-small-en-v1.5),
-  an OpenAI-compatible llama.cpp endpoint, or a deterministic `hash` embedder.
-  Standalone images additionally get a **SigLIP2** embedding in a shared
-  image+text space.
-- **Store**: SQLite (documents + chunks + FTS5 + two `vec0` spaces), WAL,
+- **Embeddings**: in-process ONNX text encoders (default bge-small-en-v1.5, or
+  **EmbeddingGemma 2** — 768-d, multilingual, task-prefixed), an
+  OpenAI-compatible llama.cpp endpoint, or a deterministic `hash` embedder.
+  Images get **SigLIP2** (shared image+text space) or **EmbeddingGemma 2
+  vision**; with EG2 on both sides text and images share **one** space and
+  **one** vector index.
+- **Store**: SQLite (documents + chunks + FTS5 + `vec0` vector space(s)), WAL,
   corpus versioning, per-document stage fingerprints.
-- **Retrieval**: text vector (`vec0` cosine KNN), BM25 (FTS5), Hybrid via RRF
-  with an image channel; query-by-image.
+- **Retrieval**: dense KNN over `vec0`, BM25 (FTS5), Hybrid via RRF, and
+  `mode=image` (a kind filter in the unified layout, a second index otherwise);
+  query-by-image.
+- **Evaluation**: `eval` scores a gold set (recall@k / MRR / nDCG@k per mode)
+  and `eval-gen` mines one from the corpus — the way to compare embedders on
+  *your* data (docs/EVAL.md).
 - **Chunking**: `hybrid` (default) and `hierarchical` via docling's
   structure-aware chunkers, plus `window` (and the plain-text fallback).
 - **CLI**: `init-db`, `ingest` (`--sync`, `--force`, `--stages`), `query`,
-  `stats`, `prune`, `download-models`, `serve`.
-- **Service**: read-only `/api/search`, `/api/search/image`, `/api/stats`,
+  `eval`, `eval-gen`, `stats`, `prune`, `download-models`, `serve`.
+- **Service**: `/api/search`, `/api/search/image`, `/api/stats`,
   `/api/documents`, `/api/documents/{id}`, `/api/media/{chunk_id}`, `/health`;
-  optional API-key auth.
+  optional API-key auth; optionally **scheduled ingest** while it serves
+  (`LS_INGEST_INTERVAL`).
 
 **Not yet:** PDF figure extraction, image captioning, Multi-Query/HyDE.
 
@@ -120,24 +127,30 @@ summary by type:
 ## Architecture
 
 ```
-source folder ──ingest CLI──▶ docling convert → chunk → embed → SQLite (docs/chunks/FTS5)
-                                                                      ▲
-                                                    serve ──▶ /api/search (vector + bm25 → RRF)
+source folder ──ingest CLI──▶ docling convert → chunk → embed → SQLite (docs/chunks/FTS5/vec0)
+        ▲                                                             ▲
+        └── serve can schedule the same ingest (LS_INGEST_INTERVAL)   │
+                                             serve ──▶ /api/search (vector + bm25 → RRF)
 ```
 
 - **Documents vs images.** One `Document` (asset) fans out to many `Chunk`
   fragments. A chunk is `text` or `image`; an image chunk is a standalone image
   file (content-addressed), served from its source on demand.
-- **Two vector spaces, kept apart.** Text and image embeddings have different
-  dimensionality and live in two `vec0` tables, so a text query reaches images
-  through SigLIP's shared space without mixing the vectors.
+- **One space or two.** By default text (bge, 384-d) and images (SigLIP2,
+  768-d) live in two `vec0` tables and a text query reaches images through
+  SigLIP's shared space. With `LS_EMBED_PROVIDER=eg2` **and**
+  `LS_IMAGE_EMBED_PROVIDER=eg2` both sides produce the same 768-d space, the
+  two tables become **one**, the query is embedded once, and `mode=image` is a
+  kind filter. `/api/stats` reports which layout is active (`image_space`).
 - **Stage-scoped ingest.** Each document records a fingerprint per stage
   (`extract` / `text_embed` / `image_embed`); `ingest` re-runs only the stages
   whose configuration or models changed. `--stages` targets specific stages and
   `--force` forces just those.
-- **Out-of-process ingest.** The service never ingests, so it is
-  side-effect-free. Every successful ingest bumps a `corpus_version`, the seam
-  for cross-process cache invalidation.
+- **Ingest is separate — unless you schedule it.** The `ingest` CLI is the
+  primary path; `serve` can also re-ingest on an interval
+  (`LS_INGEST_INTERVAL`, one background task, one run at a time). Either way
+  every successful ingest bumps a `corpus_version`, the seam for cross-process
+  cache invalidation.
 - **Docling config passthrough.** `DOCLING_*` / `DOCLING_RS_*` are read by
   docling directly; only RAG-layer settings use `LS_*`.
 
@@ -152,11 +165,18 @@ See `.env.example` for the full list. Key RAG-layer settings:
 | `LS_MODELS_DIR` | `.models` | model tree; fans out to docling's `DOCLING_*` vars |
 | `LS_EXTRACT_PIPELINE` | `onnx` | `onnx` (local) or `vlm` (remote, llama.cpp) |
 | `LS_EXTRACT_CODE_FORMULA` | `true` on CPU / `false` on CUDA | CodeFormulaV2 code/formula enrichment (skipped if models absent) |
-| `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `llamacpp` \| `hash` |
-| `LS_IMAGE_EMBED_PROVIDER` | `siglip` | `siglip` \| `off` \| `hash` — image channel (SigLIP2 shared space) |
-| `LS_EMBED_DIM` | `384` | must match the embedder; sizes the `vec0` index |
+| `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `eg2` \| `llamacpp` \| `hash` |
+| `LS_IMAGE_EMBED_PROVIDER` | `siglip` | `siglip` \| `eg2` \| `off` \| `hash` — `eg2` + `eg2` unifies the two spaces |
+| `LS_EMBED_DIM` | per provider (`384` onnx, `768` eg2) | overrides the index dimension; warns when it disagrees with the provider |
+| `LS_IMAGE_SOFT_TOKENS` | `280` | EG2 vision budget per image: `70`\|`140`\|`280`\|`560`\|`1120` (quality vs compute) |
+| `LS_INGEST_INTERVAL` | — | `serve` re-ingests every interval (`24h`, `30m`, `90s`); unset = manual |
+| `LS_INGEST_SYNC` | `false` | scheduled runs also drop documents whose source files disappeared |
 | `LS_ONNX_MODEL` | `.models/embed/bge-small-en-v1.5.onnx` | ONNX embedder graph |
 | `LS_ONNX_TOKENIZER` | `.models/embed/tokenizer.json` | ONNX embedder tokenizer |
+| `LS_EG2_TEXT_MODEL` | `.models/eg2/text/model.onnx` | EG2 text graph |
+| `LS_EG2_TOKENIZER` | `.models/eg2/tokenizer.json` | EG2 tokenizer |
+| `LS_EG2_VISION_MODEL` | `.models/eg2/vision/vision_encoder.onnx` | EG2 vision graph |
+| `LS_EG2_PROCESSOR` | `.models/eg2/processor_config.json` | EG2 patch grid / budget |
 | `LS_LLAMACPP_URL` | `http://127.0.0.1:8080/v1` | OpenAI-compatible embeddings |
 | `LS_EMBED_MODEL` | — | model name for `llamacpp` |
 | `LS_CHUNKER` | `hybrid` | `hybrid` \| `hierarchical` \| `window` |
@@ -167,9 +187,15 @@ See `.env.example` for the full list. Key RAG-layer settings:
 ### Models
 
 `download-models` fetches docling's native assets (pdfium + layout / PP-OCR /
-TableFormer ONNX) from the docling.rs releases, and the ONNX embedder from
-Hugging Face, into `.models/` and `.pdfium/`. Mirrors: `DOCLING_RS_MODELS_URL`
-and `LS_ONNX_MODELS_URL`. Use `--no-embed` to skip the embedder.
+TableFormer ONNX) from the docling.rs releases and the embedders from Hugging
+Face into `.models/` and `.pdfium/`: bge-small-en-v1.5 (text, default),
+SigLIP2 (images, default) and EmbeddingGemma 2 (text + vision, ~1.8 GB fp32,
+used by the `eg2` providers). Mirrors: `DOCLING_RS_MODELS_URL`,
+`LS_ONNX_MODELS_URL`, `LS_IMAGE_MODELS_URL`, `LS_EG2_MODELS_URL`. `--no-embed`
+/ `--no-image` / `--no-enrich` skip the text, image and code/formula sets.
+
+EmbeddingGemma 2 runs **fp32 only** — its model card is explicit that fp16
+returns NaN or silently degraded embeddings.
 
 Docling honours its own per-model overrides — `DOCLING_LAYOUT_ONNX`,
 `DOCLING_OCR_REC_ONNX` / `DOCLING_OCR_DICT`, `DOCLING_TABLEFORMER_*`,
@@ -212,7 +238,7 @@ document (no silent drops).
 | GET | `/health` | liveness only (`{"status":"ok"}`), public — corpus details are at `/api/stats` |
 | GET | `/api/search?query=&mode=&limit=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
 | POST | `/api/search` | `{"query","mode","limit"}` |
-| GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
+| GET | `/api/stats` | counts, embedders, active vector layout (`image_space`), extraction pipeline, corpus version |
 | GET | `/api/documents?offset=&limit=&query=` | stored documents (paged; `query` = case-insensitive title/path substring) |
 | GET | `/api/documents/{id}?offset=&limit=` | one document + a bounded, pageable chunk slice |
 | POST | `/api/search/image` | query-by-image: `{"image_base64","limit"}` (needs `LS_IMAGE_EMBED_PROVIDER`) |
@@ -252,13 +278,19 @@ re-runs only the stages whose configuration or models changed.
 
 ## Notes
 
-- **Unified space.** With `LS_EMBED_PROVIDER=eg2` **and**
-  `LS_IMAGE_EMBED_PROVIDER=eg2`, text chunks and image chunks are embedded by
-  one model into one 768-d space and stored in a **single** vector index: a
-  query is embedded once and matches both, `mode=vector`/`hybrid` return text
-  *and* images, and `mode=image` is a kind filter rather than a second index.
-  Any other provider pair keeps the two-space layout (below). `/api/stats`
-  reports which layout is active (`image_space`).
+- **Unified space (EG2 both sides).** Text and images are embedded by one model
+  into one 768-d space and one vector index: the query is embedded once and
+  matches both, `mode=vector`/`hybrid` return text *and* images, `mode=image`
+  is a kind filter, and no second copy of the text graph is loaded. Switching
+  the layout (or the dimension) drops the vector tables and forgets the embed
+  stages, so a plain re-ingest re-embeds without re-extracting. EmbeddingGemma 2
+  is ~4.6x slower than bge for text and ~5-28x slower than SigLIP2 for images
+  (budget dependent) — see `examples/eg2_bench.rs` for measured numbers, and
+  `docs/EVAL.md` for how to check what that buys on your corpus.
+- **Scheduled ingest.** `serve` with `LS_INGEST_INTERVAL` (e.g. `24h`) ingests
+  once at startup and then every interval, in one background task; a failed
+  run is logged and retried next tick. Queries stay available throughout.
+  `LS_INGEST_SYNC=true` also drops documents whose files disappeared.
 - **Image search** (SigLIP2, images only for now): **on by default**
   (`LS_IMAGE_EMBED_PROVIDER=siglip`; set `off` to disable). Standalone
   PNG/JPG/… get an image chunk in a shared image+text space, so `mode=hybrid`
