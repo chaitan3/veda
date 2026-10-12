@@ -16,14 +16,130 @@
 //!   provider never asks for fp16 and runs fp32 on both CPU and CUDA.
 
 use crate::config::Config;
-use crate::embed::onnx::pad_batch;
 use crate::embed::Embedder;
+use crate::embed::onnx::pad_batch;
 use crate::{Error, Result};
 use async_trait::async_trait;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
+
+/// Run the EG2 text graph for a tokenised batch, optionally injecting
+/// pre-encoded image features (the image path feeds the vision encoder's
+/// output here alongside the `<|image|>` placeholder tokens).
+///
+/// Blocking; call inside `spawn_blocking`. Returns L2-normalised vectors.
+pub(crate) fn forward(
+    session: &mut Session,
+    batch: usize,
+    seq: usize,
+    ids: Vec<i64>,
+    mask: Vec<i64>,
+    image_features: Option<(usize, Vec<f32>)>,
+    dim: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let mask_data = mask.clone();
+    let names: Vec<String> = session
+        .inputs()
+        .iter()
+        .map(|i| i.name().to_string())
+        .collect();
+    let has = |n: &str| names.iter().any(|x| x == n);
+
+    let id_tensor =
+        Tensor::from_array(([batch, seq], ids)).map_err(|e| Error::embedding(e.to_string()))?;
+    let mask_tensor =
+        Tensor::from_array(([batch, seq], mask)).map_err(|e| Error::embedding(e.to_string()))?;
+    let empty = || {
+        Tensor::from_array(([0usize, 512], Vec::<f32>::new()))
+            .map_err(|e| Error::embedding(e.to_string()))
+    };
+
+    let mut feed: Vec<(&str, ort::value::Value)> = vec![("input_ids", id_tensor.into())];
+    if has("attention_mask") {
+        feed.push(("attention_mask", mask_tensor.into()));
+    }
+    let (image_rows, image_data) = match image_features {
+        Some((rows, data)) => (rows, Some(data)),
+        None => (0, None),
+    };
+    if has("image_features") {
+        match image_data {
+            Some(data) => {
+                let t = Tensor::from_array(([image_rows, 512], data))
+                    .map_err(|e| Error::embedding(e.to_string()))?;
+                feed.push(("image_features", t.into()));
+            }
+            None => feed.push(("image_features", empty()?.into())),
+        }
+    }
+    for name in ["video_features", "audio_features"] {
+        if has(name) {
+            feed.push((name, empty()?.into()));
+        }
+    }
+
+    let outputs = session
+        .run_with_options(feed, docling_onnx::shrink_run_options())
+        .map_err(|e| Error::embedding(format!("eg2 run: {e}")))?;
+    let value = if let Some(v) = outputs.get("sentence_embedding") {
+        v
+    } else {
+        outputs
+            .get("last_hidden_state")
+            .ok_or_else(|| Error::embedding("EG2 run returned no usable output"))?
+    };
+    let (shape, data) = value
+        .try_extract_tensor::<f32>()
+        .map_err(|e| Error::embedding(e.to_string()))?;
+    let dims: Vec<i64> = shape.to_vec();
+    let data: Vec<f32> = data.to_vec();
+
+    let hidden = *dims.last().unwrap_or(&0) as usize;
+    if hidden != dim {
+        return Err(Error::embedding(format!(
+            "EG2 output dim {hidden} does not match the configured {dim}"
+        )));
+    }
+    let mut out = Vec::with_capacity(batch);
+    if dims.len() == 2 {
+        for b in 0..batch {
+            let mut v = data[b * hidden..(b + 1) * hidden].to_vec();
+            crate::math::normalize(&mut v);
+            out.push(v);
+        }
+    } else if dims.len() == 3 {
+        let seq_out = dims[1] as usize;
+        for b in 0..batch {
+            let mut v = vec![0f32; hidden];
+            let mut count = 0.0f32;
+            for t in 0..seq_out {
+                if mask_data[b * seq_out + t] == 0 {
+                    continue;
+                }
+                let base = (b * seq_out + t) * hidden;
+                for (h, acc) in v.iter_mut().enumerate() {
+                    *acc += data[base + h];
+                }
+                count += 1.0;
+            }
+            if count > 0.0 {
+                for acc in v.iter_mut() {
+                    *acc /= count;
+                }
+            }
+            crate::math::normalize(&mut v);
+            out.push(v);
+        }
+    } else {
+        return Err(Error::embedding(format!(
+            "unexpected EG2 output rank {} (shape {dims:?})",
+            dims.len()
+        )));
+    }
+    Ok(out)
+}
 
 /// EG2's default task prefixes (see the model card's prompt table).
 pub const DEFAULT_QUERY_PREFIX: &str = "task: search result | query: ";
@@ -96,103 +212,11 @@ impl Eg2TextEmbedder {
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| Error::embedding(format!("tokenize: {e}")))?;
         let (batch, seq, ids, mask, _types) = pad_batch(&encodings, self.max_tokens);
-        // Keep a copy: the pooling fallback needs the mask, and the graph
-        // consumes the tensor.
-        let mask_data = mask.clone();
-
-        let (_input_names, dims, data) = {
-            let mut session = self
-                .session
-                .lock()
-                .map_err(|_| Error::embedding("onnx session mutex poisoned"))?;
-            let names: Vec<String> =
-                session.inputs().iter().map(|i| i.name().to_string()).collect();
-            let has = |n: &str| names.iter().any(|x| x == n);
-
-            let id_tensor = Tensor::from_array(([batch, seq], ids))
-                .map_err(|e| Error::embedding(e.to_string()))?;
-            let mask_tensor = Tensor::from_array(([batch, seq], mask))
-                .map_err(|e| Error::embedding(e.to_string()))?;
-            // The text graph also takes pre-encoded modality features; empty
-            // for pure-text inputs.
-            let empty = || {
-                Tensor::from_array(([0usize, 512], Vec::<f32>::new()))
-                    .map_err(|e| Error::embedding(e.to_string()))
-            };
-
-            let mut feed: Vec<(&str, ort::value::Value)> = vec![("input_ids", id_tensor.into())];
-            if has("attention_mask") {
-                feed.push(("attention_mask", mask_tensor.into()));
-            }
-            for name in ["image_features", "video_features", "audio_features"] {
-                if has(name) {
-                    feed.push((name, empty()?.into()));
-                }
-            }
-
-            let outputs = session
-                .run_with_options(feed, docling_onnx::shrink_run_options())
-                .map_err(|e| Error::embedding(format!("eg2 run: {e}")))?;
-            // Prefer the pooled head; fall back to mean-pooling last_hidden_state.
-            let value = if let Some(v) = outputs.get("sentence_embedding") {
-                v
-            } else {
-                outputs
-                    .get("last_hidden_state")
-                    .ok_or_else(|| Error::embedding("EG2 run returned no usable output"))?
-            };
-            let (shape, data) = value
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::embedding(e.to_string()))?;
-            // Copy out: the values borrow the session's output buffers.
-            (names, shape.to_vec(), data.to_vec())
-        };
-        let hidden = *dims.last().unwrap_or(&0) as usize;
-        if hidden != self.dim {
-            return Err(Error::embedding(format!(
-                "EG2 output dim {hidden} does not match LS_EMBED_DIM {}",
-                self.dim
-            )));
-        }
-        let mut out = Vec::with_capacity(batch);
-        if dims.len() == 2 {
-            // [batch, dim] — already pooled (and normalised by the graph).
-            for b in 0..batch {
-                let mut v = data[b * hidden..(b + 1) * hidden].to_vec();
-                crate::math::normalize(&mut v);
-                out.push(v);
-            }
-        } else if dims.len() == 3 {
-            // [batch, seq, hidden] — mean-pool over the attention mask.
-            let seq_out = dims[1] as usize;
-            for b in 0..batch {
-                let mut v = vec![0f32; hidden];
-                let mut count = 0.0f32;
-                for t in 0..seq_out {
-                    if mask_data[b * seq_out + t] == 0 {
-                        continue;
-                    }
-                    let base = (b * seq_out + t) * hidden;
-                    for (h, acc) in v.iter_mut().enumerate() {
-                        *acc += data[base + h];
-                    }
-                    count += 1.0;
-                }
-                if count > 0.0 {
-                    for acc in v.iter_mut() {
-                        *acc /= count;
-                    }
-                }
-                crate::math::normalize(&mut v);
-                out.push(v);
-            }
-        } else {
-            return Err(Error::embedding(format!(
-                "unexpected EG2 output rank {} (shape {dims:?})",
-                dims.len()
-            )));
-        }
-        Ok(out)
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| Error::embedding("onnx session mutex poisoned"))?;
+        forward(&mut session, batch, seq, ids, mask, None, self.dim)
     }
 }
 

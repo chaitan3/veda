@@ -9,6 +9,7 @@
 pub mod hash;
 
 #[cfg(feature = "image-embed")]
+pub mod eg2;
 pub mod siglip;
 use crate::config::{Config, ImageEmbedProvider};
 use crate::{Error, Result};
@@ -55,6 +56,19 @@ pub fn from_config(cfg: &Config) -> Result<Option<Arc<dyn ImageEmbedder>>> {
             {
                 Err(Error::FeatureDisabled(
                     "image embedder (LS_IMAGE_EMBED_PROVIDER=siglip)".into(),
+                    "image-embed".into(),
+                ))
+            }
+        }
+        ImageEmbedProvider::Eg2 => {
+            #[cfg(feature = "image-embed")]
+            {
+                Ok(Some(Arc::new(eg2::Eg2ImageEmbedder::from_config(cfg)?)))
+            }
+            #[cfg(not(feature = "image-embed"))]
+            {
+                Err(Error::FeatureDisabled(
+                    "EG2 image embedder (LS_IMAGE_EMBED_PROVIDER=eg2)".into(),
                     "image-embed".into(),
                 ))
             }

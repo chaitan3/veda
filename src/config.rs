@@ -83,6 +83,10 @@ pub enum ImageEmbedProvider {
     Hash,
     /// In-process SigLIP ONNX (feature `image-embed`).
     Siglip,
+    /// EmbeddingGemma 2 vision encoder (feature `image-embed`): 768-d, 280
+    /// soft tokens by default, and — with `LS_EMBED_PROVIDER=eg2` — the same
+    /// space as the text embedder, so one query vector serves both.
+    Eg2,
 }
 
 impl ImageEmbedProvider {
@@ -91,8 +95,11 @@ impl ImageEmbedProvider {
             "" | "off" | "none" => Ok(ImageEmbedProvider::Off),
             "hash" => Ok(ImageEmbedProvider::Hash),
             "siglip" | "siglip2" | "siglip-2" | "onnx" => Ok(ImageEmbedProvider::Siglip),
+            "eg2" | "embeddinggemma2" | "embeddinggemma-2" | "embedding-gemma-2" => {
+                Ok(ImageEmbedProvider::Eg2)
+            }
             other => Err(Error::config(format!(
-                "LS_IMAGE_EMBED_PROVIDER must be off|hash|siglip, got '{other}'"
+                "LS_IMAGE_EMBED_PROVIDER must be off|hash|siglip|eg2, got '{other}'"
             ))),
         }
     }
@@ -109,6 +116,11 @@ pub struct ImageEmbedConfig {
     pub text_model: Option<String>,
     pub tokenizer: Option<String>,
     pub preprocessor: Option<String>,
+    /// EG2 vision graph and processor config (`LS_IMAGE_EMBED_PROVIDER=eg2`).
+    pub eg2_vision_model: Option<String>,
+    pub eg2_processor: Option<String>,
+    /// Overrides `max_soft_tokens` from the processor config (70|140|280|560|1120).
+    pub soft_tokens: Option<usize>,
 }
 
 impl ImageEmbedConfig {
@@ -287,6 +299,14 @@ impl Config {
                 .or_else(|| Some(format!("{image_dir}/tokenizer.json"))),
             preprocessor: var("LS_SIGLIP_PREPROCESSOR")
                 .or_else(|| Some(format!("{image_dir}/preprocessor_config.json"))),
+            eg2_vision_model: var("LS_EG2_VISION_MODEL")
+                .or_else(|| Some(format!("{models_dir}/eg2/vision/vision_encoder.onnx"))),
+            eg2_processor: var("LS_EG2_PROCESSOR")
+                .or_else(|| Some(format!("{models_dir}/eg2/processor_config.json"))),
+            soft_tokens: var("LS_IMAGE_SOFT_TOKENS")
+                .map(|v| v.parse::<usize>())
+                .transpose()
+                .map_err(|_| Error::config("LS_IMAGE_SOFT_TOKENS must be an integer"))?,
         };
 
         Ok(Config {

@@ -132,6 +132,23 @@ pub async fn download_models(
     }
 
     if with_images {
+        // EmbeddingGemma 2 vision encoder (`LS_IMAGE_EMBED_PROVIDER=eg2`),
+        // plus the processor config that defines the patch grid / budget.
+        assets.push(Asset {
+            dest: docling("eg2/vision/vision_encoder.onnx"),
+            urls: vec![format!("{eg2_base}/onnx/vision_encoder.onnx")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: docling("eg2/vision/vision_encoder.onnx_data"),
+            urls: vec![format!("{eg2_base}/onnx/vision_encoder.onnx_data")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: docling("eg2/processor_config.json"),
+            urls: vec![format!("{eg2_base}/processor_config.json")],
+            optional: false,
+        });
         let image = |rel: &str| models.join("image").join(rel);
         assets.push(Asset {
             dest: image("vision_model.onnx"),
