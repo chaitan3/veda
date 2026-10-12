@@ -193,11 +193,11 @@ async fn respond(state: &AppState, query: String, mode: String, hits: Vec<Scored
     }
 }
 
-async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, k: usize) -> Response {
+async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, limit: usize) -> Response {
     if query.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "query must not be empty");
     }
-    match state.pipeline.query(mode, query, k).await {
+    match state.pipeline.query(mode, query, limit).await {
         Ok(hits) => respond(state, query.to_string(), mode.to_string(), hits).await,
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -205,19 +205,19 @@ async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, k: usize
 
 #[derive(Deserialize)]
 struct SearchParams {
-    q: Option<String>,
+    query: Option<String>,
     mode: Option<String>,
-    k: Option<usize>,
+    limit: Option<usize>,
 }
 
 async fn search_get(State(state): State<AppState>, Query(p): Query<SearchParams>) -> Response {
-    let query = p.q.unwrap_or_default();
+    let query = p.query.unwrap_or_default();
     let mode = p
         .mode
         .and_then(|m| m.parse().ok())
         .unwrap_or(RetrievalMode::Hybrid);
-    let k = p.k.unwrap_or(5).clamp(1, 100);
-    run_search(&state, &query, mode, k).await
+    let limit = p.limit.unwrap_or(5).clamp(1, 100);
+    run_search(&state, &query, mode, limit).await
 }
 
 #[derive(Deserialize)]
@@ -226,9 +226,7 @@ struct SearchBody {
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
-    top_k: Option<usize>,
-    #[serde(default)]
-    k: Option<usize>,
+    limit: Option<usize>,
 }
 
 async fn search_post(State(state): State<AppState>, Json(body): Json<SearchBody>) -> Response {
@@ -236,8 +234,8 @@ async fn search_post(State(state): State<AppState>, Json(body): Json<SearchBody>
         .mode
         .and_then(|m| m.parse().ok())
         .unwrap_or(RetrievalMode::Hybrid);
-    let k = body.top_k.or(body.k).unwrap_or(5).clamp(1, 100);
-    run_search(&state, &body.query, mode, k).await
+    let limit = body.limit.unwrap_or(5).clamp(1, 100);
+    run_search(&state, &body.query, mode, limit).await
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -405,9 +403,7 @@ struct ImageSearchBody {
     /// Base64-encoded query image bytes (PNG/JPEG/…).
     image_base64: String,
     #[serde(default)]
-    top_k: Option<usize>,
-    #[serde(default)]
-    k: Option<usize>,
+    limit: Option<usize>,
 }
 
 /// Query-by-image: embed the posted image and search the image space.
@@ -415,7 +411,7 @@ async fn search_image(
     State(state): State<AppState>,
     Json(body): Json<ImageSearchBody>,
 ) -> Response {
-    let k = body.top_k.or(body.k).unwrap_or(5).clamp(1, 100);
+    let limit = body.limit.unwrap_or(5).clamp(1, 100);
     let bytes = match base64::engine::general_purpose::STANDARD.decode(body.image_base64.as_bytes())
     {
         Ok(b) => b,
@@ -429,7 +425,7 @@ async fn search_image(
     if bytes.is_empty() {
         return err(StatusCode::BAD_REQUEST, "image is empty");
     }
-    match state.pipeline.query_image(&bytes, k).await {
+    match state.pipeline.query_image(&bytes, limit).await {
         Ok(hits) => respond(&state, String::new(), "image".to_string(), hits).await,
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

@@ -46,9 +46,9 @@ enum Command {
         /// Retrieval mode: hybrid | vector | bm25 | image.
         #[arg(long, default_value = "hybrid")]
         mode: String,
-        /// Number of results.
-        #[arg(short, long, default_value_t = 5)]
-        k: usize,
+        /// Number of results (1-100).
+        #[arg(short = 'k', long, default_value_t = 5)]
+        limit: usize,
     },
     /// Show store statistics.
     Stats,
@@ -170,10 +170,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Query { query, mode, k } => {
+        Command::Query { query, mode, limit } => {
             let mode: RetrievalMode = mode.parse()?;
             let pipeline = Pipeline::from_config(&cfg).await?;
-            let hits = pipeline.query(mode, &query, k).await?;
+            let hits = pipeline.query(mode, &query, limit).await?;
             if hits.is_empty() {
                 println!("no results");
             }

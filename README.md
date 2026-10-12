@@ -53,11 +53,11 @@ cargo run --release -- ingest --stages text_embed         # re-embed text only
 cargo run --release -- prune                  # drop docs with no chunks
 
 # 3. query
-cargo run --release -- query "mountain lake" --mode hybrid -k 5
+cargo run --release -- query "mountain lake" --mode hybrid --limit 5
 
 # 4. serve the read-only API
 cargo run --release -- serve
-curl 'localhost:8080/api/search?q=mountain+lake&k=5'
+curl 'localhost:8080/api/search?query=mountain+lake&limit=5'
 ```
 
 Default end-to-end is fully local/ONNX: docling's ONNX extraction plus the
@@ -200,12 +200,12 @@ document (no silent drops).
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | liveness + counts + corpus version |
-| GET | `/api/search?q=&mode=&k=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
-| POST | `/api/search` | `{"query","mode","top_k"}` |
+| GET | `/api/search?query=&mode=&limit=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
+| POST | `/api/search` | `{"query","mode","limit"}` |
 | GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
 | GET | `/api/documents?offset=&limit=&query=` | stored documents (paged; `query` = case-insensitive title/path substring) |
 | GET | `/api/documents/{id}?offset=&limit=` | one document + a bounded, pageable chunk slice |
-| POST | `/api/search/image` | query-by-image: `{"image_base64","top_k"}` (needs `LS_IMAGE_EMBED_PROVIDER`) |
+| POST | `/api/search/image` | query-by-image: `{"image_base64","limit"}` (needs `LS_IMAGE_EMBED_PROVIDER`) |
 | GET | `/api/media/{chunk_id}` | bytes of an image chunk (from its source document) |
 
 Each search hit carries its `chunk` (including the `ordinal`), its `score`, and

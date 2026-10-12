@@ -113,6 +113,15 @@ fn get(uri: &str) -> Request<Body> {
     Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 async fn json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -122,7 +131,7 @@ async fn json(resp: axum::response::Response) -> serde_json::Value {
 async fn search_hits_are_self_contained() {
     let (app, doc_id) = setup().await;
     let resp = app
-        .oneshot(get("/api/search?q=mountain%20lake&mode=vector&k=5"))
+        .oneshot(get("/api/search?query=mountain%20lake&mode=vector&limit=5"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -151,7 +160,7 @@ async fn image_mode_reports_a_disabled_image_channel() {
     // The test config has LS_IMAGE_EMBED_PROVIDER off: mode=image must say
     // so, rather than returning text hits (this corpus has no image space).
     let resp = app
-        .oneshot(get("/api/search?q=mountain%20lake&mode=image"))
+        .oneshot(get("/api/search?query=mountain%20lake&mode=image"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -166,10 +175,49 @@ async fn image_mode_reports_a_disabled_image_channel() {
 }
 
 #[tokio::test]
+async fn post_search_honours_query_mode_and_limit() {
+    let (app, _doc_id) = setup().await;
+    let resp = app
+        .oneshot(post_json(
+            "/api/search",
+            serde_json::json!({"query": "mountain lake", "mode": "vector", "limit": 1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+    assert_eq!(body["mode"], "vector");
+    assert_eq!(body["count"].as_u64(), Some(1));
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn post_image_search_honours_limit() {
+    let (app, _doc_id) = setup().await;
+    // 1×1 PNG; the image channel is off in the test config, so this asserts
+    // the body parses (limit included) and reports the disabled channel.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let resp = app
+        .oneshot(post_json(
+            "/api/search/image",
+            serde_json::json!({"image_base64": png, "limit": 1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("LS_IMAGE_EMBED_PROVIDER")
+    );
+}
+
+#[tokio::test]
 async fn unknown_mode_falls_back_to_hybrid() {
     let (app, _doc_id) = setup().await;
     let resp = app
-        .oneshot(get("/api/search?q=mountain&mode=banana"))
+        .oneshot(get("/api/search?query=mountain&mode=banana"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

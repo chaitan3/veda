@@ -41,14 +41,14 @@ Read-only: nothing indexed here can be modified through these tools.
    run `python3 agent_rag_tools.py stats` — or call `corpus_stats()`. Note
    `documents`/`chunks` counts. If unreachable, tell the user the `serve`
    process isn't running; do not retry silently in a loop.
-2. **Search** with `search_documents(q=…)`:
+2. **Search** with `search_documents(query=…)`:
    - default to `mode="hybrid"` (semantic + keyword fused);
    - use `mode="bm25"` for exact identifiers, error codes, quoted phrases;
    - use `mode="vector"` for paraphrases ("what's the deadline for X" when the
      document says "must be submitted by…");
    - use `mode="image"` to find images with a text query (image hits only —
      the hybrid image channel without text results competing for slots);
-   - start with `k=5`; raise only if the first page misses.
+   - start with `limit=5`; raise only if the first page misses.
 3. **Expand when needed**: a hit is a ~paragraph slice. If it's plausibly part
    of a larger passage, call `get_context_around(doc_id, ordinal)`. If the
    whole document matters, call `get_document(doc_id)` and page with `next`.

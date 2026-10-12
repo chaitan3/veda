@@ -101,20 +101,21 @@ def _hits_from_search(payload: dict) -> dict:
 # tools (one function per agent-facing capability)
 # ---------------------------------------------------------------------------
 
-def search_documents(q: str, mode: str = "hybrid", k: int = 5) -> dict:
+def search_documents(query: str, mode: str = "hybrid", limit: int = 5) -> dict:
     """Rank text chunks for a query. GET /api/search."""
-    if not q or not q.strip():
+    if not query or not query.strip():
         return {"error": "query must not be empty"}
     if mode not in VALID_MODES:
         return {"error": f"mode must be one of {VALID_MODES}"}
-    k = max(1, min(int(k), 100))
+    limit = max(1, min(int(limit), 100))
     payload = _request(
-        "GET", f"/api/search?q={urllib.parse.quote(q)}&mode={mode}&k={k}"
+        "GET",
+        f"/api/search?query={urllib.parse.quote(query)}&mode={mode}&limit={limit}",
     )
     return _hits_from_search(payload)
 
 
-def search_image(image: str, k: int = 5) -> dict:
+def search_image(image: str, limit: int = 5) -> dict:
     """Find indexed images similar to `image` (local path or http(s) URL).
     POST /api/search/image with base64-encoded bytes."""
     if image.startswith(("http://", "https://")):
@@ -123,11 +124,11 @@ def search_image(image: str, k: int = 5) -> dict:
     else:
         with open(os.path.expanduser(image), "rb") as f:
             data = f.read()
-    k = max(1, min(int(k), 100))
+    limit = max(1, min(int(limit), 100))
     payload = _request(
         "POST",
         "/api/search/image",
-        {"image_base64": base64.b64encode(data).decode(), "k": k},
+        {"image_base64": base64.b64encode(data).decode(), "limit": limit},
     )
     return _hits_from_search(payload)
 
@@ -232,7 +233,7 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "q": {"type": "string", "description": "Search query"},
+                    "query": {"type": "string", "description": "Search query"},
                     "mode": {
                         "type": "string",
                         "enum": list(VALID_MODES),
@@ -244,9 +245,12 @@ TOOL_SCHEMAS = [
                             "embedder on)"
                         ),
                     },
-                    "k": {"type": "integer", "description": "Hits to return (1-100, default 5)"},
+                    "limit": {
+                        "type": "integer",
+                        "description": "Hits to return (1-100, default 5)",
+                    },
                 },
-                "required": ["q"],
+                "required": ["query"],
             },
         },
     },
@@ -262,7 +266,10 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "image": {"type": "string", "description": "Local path or http(s) URL of the query image"},
-                    "k": {"type": "integer", "description": "Hits to return (default 5)"},
+                    "limit": {
+                        "type": "integer",
+                        "description": "Hits to return (1-100, default 5)",
+                    },
                 },
                 "required": ["image"],
             },
@@ -385,7 +392,7 @@ if __name__ == "__main__":
         sys.exit(2)
     name, *args = sys.argv[1:]
     if name == "search" and args:
-        result = dispatch("search_documents", q=args[0])
+        result = dispatch("search_documents", query=args[0])
     elif name == "image" and args:
         result = dispatch("search_image", image=args[0])
     elif name == "doc" and args:
