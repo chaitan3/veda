@@ -52,8 +52,12 @@ Provide via the environment (systemd `EnvironmentFile` or container env).
 | `LS_ADDR` | `127.0.0.1:8080` | keep loopback; proxy if public |
 | `LS_API_KEYS` | a random key | required if exposed; empty disables auth |
 | `LS_CHUNKER` | `hybrid` | `hybrid` \| `hierarchical` \| `window` |
-| `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `llamacpp` \| `hash` |
-| `LS_EMBED_DIM` | `384` | must match the embedder; sizes the `vec0` index |
+| `LS_EMBED_PROVIDER` | `onnx` | `onnx` (bge-small) \| `eg2` (EmbeddingGemma 2) \| `llamacpp` \| `hash` |
+| `LS_IMAGE_EMBED_PROVIDER` | `siglip` | `siglip` \| `eg2` \| `off` \| `hash`; `eg2` + `eg2` = one unified space |
+| `LS_EMBED_DIM` | per provider | `384` onnx, `768` eg2; overrides the index dimension |
+| `LS_IMAGE_SOFT_TOKENS` | `280` | EG2 vision budget (`70`\|`140`\|`280`\|`560`\|`1120`) |
+| `LS_INGEST_INTERVAL` | — | `serve` re-ingests every interval (e.g. `24h`); unset = manual |
+| `LS_INGEST_SYNC` | `false` | scheduled runs also prune documents whose files disappeared |
 | `LS_EXTRACT_PIPELINE` | `onnx` | `vlm` requires `DOCLING_RS_VLM_*` |
 | `LS_RRF_K` | `60` | fusion constant |
 
