@@ -55,6 +55,10 @@ cargo run --release -- prune                  # drop docs with no chunks
 # 3. query
 cargo run --release -- query "mountain lake" --mode hybrid --limit 5
 
+# 3b. measure retrieval (gold set mined from the corpus; see docs/EVAL.md)
+cargo run --release -- eval-gen --out eval/queries.jsonl
+cargo run --release -- eval --queries eval/queries.jsonl --k 1,5,10
+
 # 4. serve the read-only API
 cargo run --release -- serve
 curl 'localhost:8080/api/search?query=mountain+lake&limit=5'

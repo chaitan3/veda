@@ -14,6 +14,7 @@ pub mod convert;
 pub mod download;
 pub mod embed;
 pub mod error;
+pub mod eval;
 pub mod fingerprint;
 pub mod math;
 pub mod metrics;

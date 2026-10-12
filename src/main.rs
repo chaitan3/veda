@@ -50,6 +50,30 @@ enum Command {
         #[arg(short = 'k', long, default_value_t = 5)]
         limit: usize,
     },
+    /// Score a gold set (JSONL) against the current store.
+    Eval {
+        /// Path to the gold-set JSONL.
+        #[arg(long, value_name = "FILE")]
+        queries: String,
+        /// Comma-separated retrieval modes (default: hybrid,vector,bm25).
+        #[arg(long, default_value = "hybrid,vector,bm25")]
+        modes: String,
+        /// Comma-separated cutoffs for recall/nDCG.
+        #[arg(long, default_value = "1,5,10")]
+        k: String,
+        /// Emit the report as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mine a synthetic gold set from the corpus (see docs/EVAL.md).
+    EvalGen {
+        /// Where to write the JSONL.
+        #[arg(long, value_name = "FILE", default_value = "eval/queries.jsonl")]
+        out: String,
+        /// Phrase queries per document.
+        #[arg(long, default_value_t = 3)]
+        per_doc: usize,
+    },
     /// Show store statistics.
     Stats,
     /// Remove documents left with no chunks.
@@ -203,6 +227,37 @@ async fn main() -> anyhow::Result<()> {
                     println!("    {snippet}");
                 }
             }
+        }
+
+        Command::Eval {
+            queries,
+            modes,
+            k,
+            json,
+        } => {
+            let gold = local_search::eval::load(&queries)?;
+            let modes = local_search::eval::parse_modes(&modes)?;
+            let cutoffs = local_search::eval::parse_cutoffs(&k)?;
+            let pipeline = Pipeline::from_config(&cfg).await?;
+            println!(
+                "gold:   {} queries from {queries}\nmodes:  {modes:?}\ncutoff: {cutoffs:?}",
+                gold.len()
+            );
+            let reports = local_search::eval::run(&pipeline, &gold, &modes, &cutoffs).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            } else {
+                local_search::eval::print_reports(&reports, &cutoffs);
+            }
+        }
+
+        Command::EvalGen { out, per_doc } => {
+            let pipeline = Pipeline::from_config(&cfg).await?;
+            if let Some(parent) = std::path::Path::new(&out).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let n = local_search::eval::generate(&pipeline, per_doc, &out).await?;
+            println!("wrote {n} queries to {out}");
         }
 
         Command::Stats => {

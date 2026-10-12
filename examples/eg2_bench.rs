@@ -75,23 +75,27 @@ const EG2_DIR: &str = "/tmp/opencode/eg2";
 fn session(path: &str) -> anyhow::Result<Session> {
     let builder = Session::builder().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut builder = docling_onnx::apply(builder).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(builder
+    builder
         .commit_from_file(path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Read a raw little-endian tensor dump produced by the parity setup script.
 fn read_f32(path: &str) -> anyhow::Result<Vec<f32>> {
     let b = std::fs::read(path)?;
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    Ok(b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
 fn read_i64(path: &str) -> anyhow::Result<Vec<i64>> {
     let b = std::fs::read(path)?;
-    Ok(b.chunks_exact(8)
-        .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+    Ok(b.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect())
 }
 
