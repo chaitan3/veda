@@ -318,9 +318,22 @@ async fn main() -> anyhow::Result<()> {
                 pipeline,
                 api_keys: Arc::new(cfg.api_keys.clone()),
             };
+            let ingest_pipeline = state.pipeline.clone();
             let app = local_search::api::router(state);
             let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
             println!("local-search listening on http://{}", cfg.addr);
+            // Periodic ingest (LS_INGEST_INTERVAL): starts after the listener
+            // is bound, so the API is responsive while the first catch-up run
+            // works through the corpus.
+            if let Some(interval) = cfg.ingest_interval {
+                tracing::info!(
+                    secs = interval.as_secs(),
+                    sync = cfg.ingest_sync,
+                    sources = %cfg.source_paths.join(", "),
+                    "scheduled ingest enabled (first run now, then every interval)"
+                );
+                local_search::schedule::spawn(ingest_pipeline, interval, cfg.ingest_sync);
+            }
             axum::serve(listener, app).await?;
         }
     }

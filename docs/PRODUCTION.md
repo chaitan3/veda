@@ -130,7 +130,11 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 ## Service
 
 Install `deploy/local-search.service`, set `LS_DB_PATH` to a path under
-`ReadWritePaths`, then `systemctl enable --now local-search`. Health:
+`ReadWritePaths`, then `systemctl enable --now local-search`. With
+`LS_INGEST_INTERVAL` set (e.g. `24h`) the service also ingests on its own: one
+background task, one run at a time, a catch-up run at startup, and failures
+logged without stopping the server. `LS_INGEST_SYNC=true` additionally drops
+documents whose source files disappeared. Health:
 `GET /health` (public, liveness only), `GET /api/stats` (auth, corpus
 details). Logs to stderr/journald
 (`RUST_LOG=info` includes the execution provider, per-file ingest lines, and a

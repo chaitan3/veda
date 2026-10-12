@@ -22,6 +22,7 @@ pub mod model;
 pub mod pipeline;
 pub mod retrieve;
 pub mod runtime;
+pub mod schedule;
 pub mod source;
 pub mod store;
 

@@ -522,11 +522,11 @@ impl Pipeline {
         }
 
         if !did_work {
-            tracing::info!(
-                name = name,
-                text_chunks = self.store.count_text_chunks_for(&doc_id).await?,
-                "up to date; skipping"
-            );
+            // Compute before logging: an `.await` inside the macro's argument
+            // list makes the whole future non-`Send` (it would block running
+            // ingest on a spawned task).
+            let text_chunks = self.store.count_text_chunks_for(&doc_id).await?;
+            tracing::info!(name = name, text_chunks, "up to date; skipping");
             return Ok(IngestOutcome::Skipped);
         }
 

@@ -61,6 +61,10 @@ cargo run --release -- eval --queries eval/queries.jsonl --k 1,5,10
 
 # 4. serve the read-only API
 cargo run --release -- serve
+# ...optionally re-ingesting the source folders on a schedule (catch-up run
+# at startup, then every interval; LS_INGEST_SYNC=true also prunes removed
+# files):
+# LS_INGEST_INTERVAL=24h cargo run --release -- serve
 curl 'localhost:8080/api/search?query=mountain+lake&limit=5'
 ```
 

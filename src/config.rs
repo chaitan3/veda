@@ -227,6 +227,12 @@ pub struct Config {
     pub api_keys: Vec<String>,
     /// Bind address for `serve`.
     pub addr: String,
+    /// Periodic ingest while serving (`LS_INGEST_INTERVAL`, e.g. `24h`);
+    /// `None` disables it.
+    pub ingest_interval: Option<std::time::Duration>,
+    /// Whether the scheduled run also prunes documents whose source files
+    /// disappeared (`LS_INGEST_SYNC`, default off).
+    pub ingest_sync: bool,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -388,6 +394,11 @@ impl Config {
                 })
                 .unwrap_or_default(),
             addr: var_or("LS_ADDR", "127.0.0.1:8080"),
+            ingest_interval: match var("LS_INGEST_INTERVAL") {
+                Some(raw) => crate::schedule::parse_interval(&raw).map_err(Error::config)?,
+                None => None,
+            },
+            ingest_sync: bool_or("LS_INGEST_SYNC", false),
         })
     }
 

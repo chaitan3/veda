@@ -2,6 +2,7 @@
 //! vector table, so a text query matches both and `mode=image` is a kind
 //! filter rather than a second index.
 
+use local_search::RetrievalMode;
 use local_search::config::{
     ChunkerKind, Config, EmbedConfig, EmbedProvider, ExtractPipeline, ImageEmbedConfig,
     ImageEmbedProvider,
@@ -9,7 +10,6 @@ use local_search::config::{
 use local_search::model::ChunkKind;
 use local_search::pipeline::{Pipeline, StageSet};
 use local_search::store::ImageSpace;
-use local_search::RetrievalMode;
 use std::path::PathBuf;
 
 fn temp_base(tag: &str) -> PathBuf {
@@ -64,6 +64,8 @@ fn config(db: &str, root: PathBuf, image_only: Vec<PathBuf>) -> Config {
         rrf_k: 60.0,
         api_keys: Vec::new(),
         addr: "127.0.0.1:0".to_string(),
+        ingest_interval: None,
+        ingest_sync: false,
     }
 }
 

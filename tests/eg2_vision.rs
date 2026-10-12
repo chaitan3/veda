@@ -74,6 +74,8 @@ fn config(text: String, tokenizer: String, vision: String, processor: String) ->
         rrf_k: 60.0,
         api_keys: Vec::new(),
         addr: "127.0.0.1:0".to_string(),
+        ingest_interval: None,
+        ingest_sync: false,
     }
 }
 
