@@ -48,10 +48,15 @@ impl Retriever {
         }
     }
 
-    /// Text query, image results only: the image embedder's text tower embeds
-    /// the query, which is matched against image chunks. The image-text half
-    /// of hybrid search, without the text channels eating result slots.
+    /// Text query, image results only. In a unified space (EG2 both sides) the
+    /// query is embedded by the *text* embedder and filtered to image chunks —
+    /// one model, one space. With two spaces the image embedder's text tower
+    /// embeds it instead.
     async fn image_text(&self, query: &str, k: usize) -> Result<Vec<Scored>> {
+        if self.unified() {
+            let q = self.embedder.embed_query(query).await?;
+            return self.store.image_search(&q, k).await;
+        }
         let image = self.image.as_ref().ok_or_else(|| {
             crate::Error::embedding(
                 "image search needs an image embedder (LS_IMAGE_EMBED_PROVIDER is off)",
@@ -59,6 +64,11 @@ impl Retriever {
         })?;
         let iq = image.embed_query_text(query).await?;
         self.store.image_search(&iq, k).await
+    }
+
+    /// Whether text and image chunks share one vector space.
+    fn unified(&self) -> bool {
+        self.store.image_space() == crate::store::ImageSpace::Unified
     }
 
     async fn vector(&self, query: &str, k: usize) -> Result<Vec<Scored>> {
@@ -73,10 +83,13 @@ impl Retriever {
         let dense = self.store.vector_search(&q, wide).await?;
         let sparse = self.store.keyword_search(query, wide).await?;
         let mut lists = vec![dense, sparse];
-        // The image channel: the same text query, embedded by the shared-space
-        // text tower, against image chunks. Fused by rank, so the incomparable
-        // score scales don't matter.
-        if let Some(image) = &self.image {
+        // Two-space layouts need an explicit image channel: the text query,
+        // embedded by the image model's text tower, against image chunks.
+        // In a unified space the dense list already contains image chunks, so
+        // no extra channel is needed (and the query is embedded once).
+        if !self.unified()
+            && let Some(image) = &self.image
+        {
             let iq = image.embed_query_text(query).await?;
             lists.push(self.store.image_search(&iq, wide).await?);
         }

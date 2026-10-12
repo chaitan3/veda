@@ -246,6 +246,13 @@ re-runs only the stages whose configuration or models changed.
 
 ## Notes
 
+- **Unified space.** With `LS_EMBED_PROVIDER=eg2` **and**
+  `LS_IMAGE_EMBED_PROVIDER=eg2`, text chunks and image chunks are embedded by
+  one model into one 768-d space and stored in a **single** vector index: a
+  query is embedded once and matches both, `mode=vector`/`hybrid` return text
+  *and* images, and `mode=image` is a kind filter rather than a second index.
+  Any other provider pair keeps the two-space layout (below). `/api/stats`
+  reports which layout is active (`image_space`).
 - **Image search** (SigLIP2, images only for now): **on by default**
   (`LS_IMAGE_EMBED_PROVIDER=siglip`; set `off` to disable). Standalone
   PNG/JPG/… get an image chunk in a shared image+text space, so `mode=hybrid`

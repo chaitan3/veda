@@ -4,7 +4,7 @@
 
 use local_search::embed::{Embedder, hash::HashEmbedder};
 use local_search::model::{Chunk, ChunkKind, Document};
-use local_search::store::{VectorStore, sqlite::SqliteStore};
+use local_search::store::{ImageSpace, VectorStore, sqlite::SqliteStore};
 
 async fn temp_store() -> SqliteStore {
     let mut path = std::env::temp_dir();
@@ -13,7 +13,7 @@ async fn temp_store() -> SqliteStore {
         .unwrap()
         .as_nanos();
     path.push(format!("ls-test-{}-{nanos}.db", std::process::id()));
-    let store = SqliteStore::connect(path.to_str().unwrap(), 64, None)
+    let store = SqliteStore::connect(path.to_str().unwrap(), 64, ImageSpace::Off)
         .await
         .unwrap();
     store.migrate().await.unwrap();
@@ -111,7 +111,7 @@ async fn image_space_is_separate_from_text() {
         .unwrap()
         .as_nanos();
     path.push(format!("ls-img-{}-{nanos}.db", std::process::id()));
-    let store = SqliteStore::connect(path.to_str().unwrap(), 64, Some(8))
+    let store = SqliteStore::connect(path.to_str().unwrap(), 64, ImageSpace::Split(8))
         .await
         .unwrap();
     store.migrate().await.unwrap();
@@ -159,7 +159,7 @@ async fn deleting_a_document_purges_its_image_vectors() {
         .unwrap()
         .as_nanos();
     path.push(format!("ls-imgdel-{}-{nanos}.db", std::process::id()));
-    let store = SqliteStore::connect(path.to_str().unwrap(), 64, Some(8))
+    let store = SqliteStore::connect(path.to_str().unwrap(), 64, ImageSpace::Split(8))
         .await
         .unwrap();
     store.migrate().await.unwrap();

@@ -23,8 +23,8 @@ use serde_json::Value;
 fn eg2_paths() -> Option<(String, String, String, String)> {
     let text = std::env::var("LS_EG2_TEXT_MODEL")
         .unwrap_or_else(|_| ".models/eg2/text/model.onnx".to_string());
-    let tokenizer =
-        std::env::var("LS_EG2_TOKENIZER").unwrap_or_else(|_| ".models/eg2/tokenizer.json".to_string());
+    let tokenizer = std::env::var("LS_EG2_TOKENIZER")
+        .unwrap_or_else(|_| ".models/eg2/tokenizer.json".to_string());
     let vision = std::env::var("LS_EG2_VISION_MODEL")
         .unwrap_or_else(|_| ".models/eg2/vision/vision_encoder.onnx".to_string());
     let processor = std::env::var("LS_EG2_PROCESSOR")
@@ -83,9 +83,10 @@ async fn eg2_vision_matches_the_reference_embedding() {
         eprintln!("skipping: EG2 vision model not present");
         return;
     };
-    let reference: Value =
-        serde_json::from_str(&std::fs::read_to_string("tests/fixtures/eg2/reference.json").unwrap())
-            .unwrap();
+    let reference: Value = serde_json::from_str(
+        &std::fs::read_to_string("tests/fixtures/eg2/reference.json").unwrap(),
+    )
+    .unwrap();
     let bytes = std::fs::read("tests/fixtures/eg2/test_image.png").unwrap();
 
     // 1. preprocessing parity (positions are exact; patches may differ by the

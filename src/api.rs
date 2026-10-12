@@ -7,6 +7,7 @@
 
 use crate::model::{Chunk, ChunkKind, Document, RetrievalMode, Scored};
 use crate::pipeline::Pipeline;
+use crate::store::ImageSpace;
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
@@ -266,6 +267,11 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
         "status": "ok",
         "embedder": pipeline.embedder().id(),
         "embed_dim": pipeline.embedder().dim(),
+        "image_space": match pipeline.store().image_space() {
+            ImageSpace::Off => "off",
+            ImageSpace::Split(_) => "split",
+            ImageSpace::Unified => "unified",
+        },
         "image_embedder": pipeline.image_embedder().map(|e| e.id()).unwrap_or("off"),
         "image_embed_dim": pipeline.image_embedder().map(|e| e.dim()).unwrap_or(0),
         "extract_pipeline": format!("{:?}", pipeline.config().extract).to_lowercase(),

@@ -268,6 +268,15 @@ async fn main() -> anyhow::Result<()> {
             println!("source (cfg):   {}", cfg.source_paths.join(", "));
             println!("embedder:       {}", pipeline.embedder().id());
             println!("embed dim:      {}", pipeline.embedder().dim());
+            println!(
+                "image space:    {}",
+                match pipeline.store().image_space() {
+                    local_search::store::ImageSpace::Off => "off".to_string(),
+                    local_search::store::ImageSpace::Split(d) => format!("split ({d}-d)"),
+                    local_search::store::ImageSpace::Unified =>
+                        "unified (text + images in one index)".to_string(),
+                }
+            );
             match pipeline.image_embedder() {
                 Some(image) => {
                     println!("image embedder: {}", image.id());

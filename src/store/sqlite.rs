@@ -10,7 +10,7 @@
 //! completion without awaiting, which is fine for a single-user local store.
 //! WAL mode lets the out-of-process ingest CLI write while the service reads.
 
-use super::VectorStore;
+use super::{ImageSpace, VectorStore};
 use crate::math;
 use crate::model::{Chunk, ChunkKind, Document, Scored, now_rfc3339};
 use crate::{Error, Result};
@@ -22,10 +22,30 @@ use std::sync::{Arc, Mutex, Once};
 /// SQLite-backed [`VectorStore`].
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
-    /// Text-space dimensionality.
+    /// Text-space dimensionality (also the image dimension in unified mode).
     dim: usize,
-    /// Image-space dimensionality, when the image channel is enabled.
-    image_dim: Option<usize>,
+    /// How image vectors relate to the text space.
+    space: ImageSpace,
+}
+
+impl SqliteStore {
+    /// The image vector dimension, when the channel is enabled (in unified
+    /// mode it is the same space, so the same dimension).
+    fn image_dim(&self) -> Option<usize> {
+        match self.space {
+            ImageSpace::Off => None,
+            ImageSpace::Split(d) => Some(d.max(1)),
+            ImageSpace::Unified => Some(self.dim),
+        }
+    }
+
+    fn is_unified(&self) -> bool {
+        matches!(self.space, ImageSpace::Unified)
+    }
+
+    fn has_split_images(&self) -> bool {
+        matches!(self.space, ImageSpace::Split(_))
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -95,7 +115,7 @@ fn register_sqlite_vec() {
 impl SqliteStore {
     /// Open (creating if needed) the database at `path`, with a text vector
     /// index sized for `dim` and, optionally, an image vector index.
-    pub async fn connect(path: &str, dim: usize, image_dim: Option<usize>) -> Result<Self> {
+    pub async fn connect(path: &str, dim: usize, space: ImageSpace) -> Result<Self> {
         register_sqlite_vec();
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.as_os_str().is_empty()
@@ -107,7 +127,7 @@ impl SqliteStore {
         Ok(SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             dim: dim.max(1),
-            image_dim: image_dim.map(|d| d.max(1)),
+            space,
         })
     }
 
@@ -174,6 +194,24 @@ impl VectorStore for SqliteStore {
         conn.execute_batch(SCHEMA)
             .map_err(|e| Error::store(format!("migration failed: {e}")))?;
 
+        // A change of layout (off <-> split <-> unified) invalidates every
+        // vector: drop both tables and forget both embed stages.
+        let current_space = match self.space {
+            ImageSpace::Off => "off",
+            ImageSpace::Split(_) => "split",
+            ImageSpace::Unified => "unified",
+        };
+        let stored_space = read_meta(&conn, "space")?;
+        if stored_space.as_deref().is_some_and(|s| s != current_space) {
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS chunk_vectors; DROP TABLE IF EXISTS image_vectors;",
+            )?;
+            conn.execute(
+                "DELETE FROM document_stages WHERE stage IN ('text_embed','image_embed')",
+                [],
+            )?;
+        }
+
         // Text space. If the configured dimension differs from what the vec0
         // table was created for, recreate it and forget the text-embed stage.
         let stored = read_meta(&conn, "dim.text")?.and_then(|s| s.parse::<usize>().ok());
@@ -191,26 +229,34 @@ impl VectorStore for SqliteStore {
         .map_err(|e| Error::store(format!("creating text vector index failed: {e}")))?;
         write_meta(&conn, "dim.text", &self.dim.to_string())?;
 
-        // Image space, only when the channel is enabled.
-        if let Some(image_dim) = self.image_dim {
-            let stored = read_meta(&conn, "dim.image")?.and_then(|s| s.parse::<usize>().ok());
-            if stored.is_some() && stored != Some(image_dim) {
-                conn.execute_batch("DROP TABLE IF EXISTS image_vectors;")?;
-                conn.execute(
-                    "DELETE FROM document_stages WHERE stage = 'image_embed'",
-                    [],
-                )?;
+        // Image vectors: a separate table in split mode; the *same* table as
+        // text in unified mode (so `image_vectors` is obsolete there).
+        match self.space {
+            ImageSpace::Off => {}
+            ImageSpace::Split(image_dim) => {
+                let stored = read_meta(&conn, "dim.image")?.and_then(|s| s.parse::<usize>().ok());
+                if stored.is_some() && stored != Some(image_dim) {
+                    conn.execute_batch("DROP TABLE IF EXISTS image_vectors;")?;
+                    conn.execute(
+                        "DELETE FROM document_stages WHERE stage = 'image_embed'",
+                        [],
+                    )?;
+                }
+                conn.execute_batch(&format!(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS image_vectors USING vec0(
+                         chunk_id TEXT PRIMARY KEY,
+                         embedding float[{}] distance_metric=cosine
+                     );",
+                    image_dim
+                ))
+                .map_err(|e| Error::store(format!("creating image vector index failed: {e}")))?;
+                write_meta(&conn, "dim.image", &image_dim.to_string())?;
             }
-            conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS image_vectors USING vec0(
-                     chunk_id TEXT PRIMARY KEY,
-                     embedding float[{}] distance_metric=cosine
-                 );",
-                image_dim
-            ))
-            .map_err(|e| Error::store(format!("creating image vector index failed: {e}")))?;
-            write_meta(&conn, "dim.image", &image_dim.to_string())?;
+            ImageSpace::Unified => {
+                conn.execute_batch("DROP TABLE IF EXISTS image_vectors;")?;
+            }
         }
+        write_meta(&conn, "space", current_space)?;
         Ok(())
     }
 
@@ -341,7 +387,7 @@ impl VectorStore for SqliteStore {
     }
 
     async fn upsert_image_chunk(&self, chunk: &Chunk, embedding: &[f32]) -> Result<()> {
-        let image_dim = self.image_dim.ok_or_else(|| {
+        let image_dim = self.image_dim().ok_or_else(|| {
             Error::store("image chunks require an image vector space (LS_IMAGE_EMBED_PROVIDER)")
         })?;
         if embedding.len() != image_dim {
@@ -353,6 +399,7 @@ impl VectorStore for SqliteStore {
         }
         let metadata = serde_json::to_string(&chunk.metadata)?;
         let blob = math::to_bytes(embedding);
+        let unified = self.is_unified();
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         {
@@ -370,12 +417,19 @@ impl VectorStore for SqliteStore {
                     metadata
                 ],
             )?;
+            // Unified mode keeps every vector in `chunk_vectors`, so a text
+            // query vector can match an image chunk directly.
+            let table = if unified {
+                "chunk_vectors"
+            } else {
+                "image_vectors"
+            };
             tx.execute(
-                "DELETE FROM image_vectors WHERE chunk_id = ?1",
+                &format!("DELETE FROM {table} WHERE chunk_id = ?1"),
                 params![chunk.id],
             )?;
             tx.execute(
-                "INSERT INTO image_vectors(chunk_id, embedding) VALUES (?1, ?2)",
+                &format!("INSERT INTO {table}(chunk_id, embedding) VALUES (?1, ?2)"),
                 params![chunk.id, blob],
             )?;
         }
@@ -410,7 +464,7 @@ impl VectorStore for SqliteStore {
 
     async fn image_search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>> {
         let image_dim = self
-            .image_dim
+            .image_dim()
             .ok_or_else(|| Error::store("image search requires an image vector space"))?;
         if query.len() != image_dim {
             return Err(Error::store(format!(
@@ -419,6 +473,41 @@ impl VectorStore for SqliteStore {
                 query.len(),
                 image_dim
             )));
+        }
+        if self.is_unified() {
+            // One table holds both kinds: over-fetch, keep image chunks, and
+            // widen until k are found (or the index is exhausted).
+            let blob = math::to_bytes(query);
+            let conn = self.lock()?;
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE kind = 'image'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let mut fetch = (k * 8).max(32) as i64;
+            loop {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {CHUNK_COLS_QUALIFIED}, v.distance
+                     FROM (SELECT chunk_id, distance FROM chunk_vectors
+                           WHERE embedding MATCH ?1 AND k = ?2) v
+                     JOIN chunks ON chunks.id = v.chunk_id
+                     WHERE chunks.kind = 'image'
+                     ORDER BY v.distance
+                     LIMIT ?3"
+                ))?;
+                let rows = stmt.query_map(params![blob, fetch, k as i64], |row| {
+                    let distance: f64 = row.get(7)?;
+                    let chunk = row_to_chunk_base(row)?;
+                    Ok(Scored::new(chunk, (1.0 - distance) as f32))
+                })?;
+                let hits = collect(rows)?;
+                if hits.len() >= k || fetch >= total.max(k as i64) {
+                    return Ok(hits);
+                }
+                fetch = fetch.saturating_mul(4);
+            }
         }
         let blob = math::to_bytes(query);
         let conn = self.lock()?;
@@ -576,7 +665,7 @@ impl VectorStore for SqliteStore {
             "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = ?1)",
             params![doc_id],
         )?;
-        if self.image_dim.is_some() {
+        if self.has_split_images() {
             tx.execute(
                 "DELETE FROM image_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = ?1)",
                 params![doc_id],
@@ -615,7 +704,7 @@ impl VectorStore for SqliteStore {
             "DELETE FROM chunk_vectors; DELETE FROM chunks_fts; DELETE FROM chunks;
              DELETE FROM document_stages; DELETE FROM documents;",
         )?;
-        if self.image_dim.is_some() {
+        if self.has_split_images() {
             conn.execute("DELETE FROM image_vectors", [])?;
         }
         Ok(())
@@ -679,6 +768,10 @@ impl VectorStore for SqliteStore {
             params![doc_id, stage],
         )?;
         Ok(())
+    }
+
+    fn image_space(&self) -> ImageSpace {
+        self.space
     }
 
     async fn clear_stage_all(&self, stage: &str) -> Result<()> {

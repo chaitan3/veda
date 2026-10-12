@@ -123,7 +123,31 @@ pub struct ImageEmbedConfig {
     pub soft_tokens: Option<usize>,
 }
 
+impl EmbedConfig {
+    /// A stable identifier for the vector space this text embedder produces.
+    /// Two embedders with the same id (and the same dimension) can share one
+    /// index — see [`crate::store::ImageSpace::for_config`].
+    pub fn space_id(&self) -> &'static str {
+        match self.provider {
+            EmbedProvider::Hash => "hash",
+            EmbedProvider::LlamaCpp => "llamacpp",
+            EmbedProvider::Onnx => "onnx",
+            EmbedProvider::Eg2 => "eg2",
+        }
+    }
+}
+
 impl ImageEmbedConfig {
+    /// A stable identifier for the vector space this image embedder produces.
+    pub fn space_id(&self) -> &'static str {
+        match self.provider {
+            ImageEmbedProvider::Off => "off",
+            ImageEmbedProvider::Hash => "hash",
+            ImageEmbedProvider::Siglip => "siglip",
+            ImageEmbedProvider::Eg2 => "eg2",
+        }
+    }
+
     /// Whether the image channel is active (any provider other than `Off`).
     pub fn enabled(&self) -> bool {
         self.provider != ImageEmbedProvider::Off

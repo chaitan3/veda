@@ -121,13 +121,48 @@ pub trait VectorStore: Send + Sync {
     /// Forget a stage fingerprint for every document (e.g. after a dimension
     /// change recreated that space).
     async fn clear_stage_all(&self, stage: &str) -> Result<()>;
+
+    /// How image vectors relate to the text space (drives retrieval wiring).
+    fn image_space(&self) -> ImageSpace;
+}
+
+/// How image vectors relate to the text vector space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSpace {
+    /// No image channel.
+    Off,
+    /// A separate image vector table (e.g. bge text + SigLIP images).
+    Split(usize),
+    /// Text and image chunks share one table and one dimension (EG2 both
+    /// sides): one query vector serves both, and `mode=image` is a kind
+    /// filter rather than a different index.
+    Unified,
+}
+
+impl ImageSpace {
+    /// Whether the two providers land in one space.
+    ///
+    /// True when both providers name the same space (EG2) *and* the
+    /// dimensions agree; anything else keeps the two-table layout.
+    pub fn for_config(cfg: &Config) -> Self {
+        if !cfg.image.enabled() {
+            return ImageSpace::Off;
+        }
+        let same_space = cfg.embed.space_id() == cfg.image.space_id();
+        if same_space && cfg.embed.dim == cfg.image.dim {
+            ImageSpace::Unified
+        } else {
+            ImageSpace::Split(cfg.image.dim)
+        }
+    }
 }
 
 /// Build and connect the store selected by `cfg`.
 pub async fn from_config(cfg: &Config) -> Result<Arc<dyn VectorStore>> {
-    let image_dim = cfg.image.enabled().then_some(cfg.image.dim);
-    let store: Arc<dyn VectorStore> =
-        Arc::new(sqlite::SqliteStore::connect(&cfg.db_path, cfg.embed.dim, image_dim).await?);
+    let store: Arc<dyn VectorStore> = Arc::new(
+        sqlite::SqliteStore::connect(&cfg.db_path, cfg.embed.dim, ImageSpace::for_config(cfg))
+            .await?,
+    );
     store.migrate().await?;
     Ok(store)
 }
