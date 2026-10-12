@@ -43,6 +43,24 @@
 //!     5.07 GB attention buffer. Image batching buys nothing for either
 //!     model, so embedding one image per call (as the pipeline does) is fine.
 //!
+//! CPU (Ryzen 9 5950X, 16c/32t, DOCLING_RS_EP=cpu; idle-desktop frequency
+//! scaling makes these vary ~±30%):
+//!
+//!   kind                     ms/iter   items/s   GPU items/s (shrink)
+//!   bge-text (32 x 244)        962        33.3      536.5
+//!   siglip-text (32 x 64)      551        58.1      -
+//!   siglip-vision (224px)       60        16.7      154.2
+//!   eg2-text-fp32 (32 x 217)  4445         7.2      117.6
+//!   eg2-text-q8 (32 x 217)    5472         5.8      111.9
+//!   eg2-vision-fp32 @70        278-516    1.9-3.6    30.3
+//!   eg2-vision-fp32 @280      1596         0.6        5.4
+//!
+//! CPU is ~16x slower than the GPU for EG2 text, ~9-16x for vision. Thread
+//! scaling is flat (8 threads = 32 threads = same throughput), so threads can
+//! be capped without loss. q8 is slower than fp32 on CPU too (Zen 3 has no
+//! VNNI). Bulk CPU ingest is impractical (100k chunks ~ 4 h); incremental is
+//! fine (1k chunks ~ 2.5 min, 100 images @70 ~ 30-50 s).
+//!
 //! Takeaways: q8 is not faster on this GPU (slightly slower) but saves 20-40%
 //! VRAM, with parity-level quality (see examples/eg2_parity.py); EG2 text is
 //! ~4.6x slower than bge at equal (fp32) precision; EG2 vision is ~5x (budget
