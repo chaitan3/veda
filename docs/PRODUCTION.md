@@ -131,7 +131,8 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 
 Install `deploy/local-search.service`, set `LS_DB_PATH` to a path under
 `ReadWritePaths`, then `systemctl enable --now local-search`. Health:
-`GET /health` (public), `GET /api/stats` (auth). Logs to stderr/journald
+`GET /health` (public, liveness only), `GET /api/stats` (auth, corpus
+details). Logs to stderr/journald
 (`RUST_LOG=info` includes the execution provider, per-file ingest lines, and a
 per-type timing summary).
 

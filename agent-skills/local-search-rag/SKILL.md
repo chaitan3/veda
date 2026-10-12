@@ -88,6 +88,11 @@ SKILL.md — endpoint wrappers + `TOOL_SCHEMAS` function-calling definitions +
   (quoted strings in vector mode, prose in bm25).
 - **Don't fetch whole documents unless needed** — chunk text is sized for
   context windows; `limit` on `get_document` caps at 100.
+- **Parameters are strict**: unknown or renamed options are rejected (400/422),
+  never ignored — e.g. `get_document` takes only `offset`/`limit` (use
+  `list_documents(query=…)` to find a document; it has no per-document filter).
+  If a call errors with "unknown field", fix the parameter name rather than
+  retrying — don't invent option names.
 
 ## Verification
 

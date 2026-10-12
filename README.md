@@ -199,7 +199,7 @@ document (no silent drops).
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | liveness + counts + corpus version |
+| GET | `/health` | liveness only (`{"status":"ok"}`), public — corpus details are at `/api/stats` |
 | GET | `/api/search?query=&mode=&limit=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
 | POST | `/api/search` | `{"query","mode","limit"}` |
 | GET | `/api/stats` | counts, embedder, extraction pipeline, corpus version |
@@ -213,6 +213,10 @@ a hydrated `document` reference (`id`, `title`, `source_uri`, `created_at`), so
 results are self-contained and citable in one call. The reference is
 deliberately compact: `metadata` — which can embed the full converted text — and
 the internal content hash are never sent.
+
+Unknown or stale request options are **rejected** (`400` for query parameters,
+`422` for JSON bodies) rather than ignored, so a typo or a renamed option is
+visible instead of silently changing behaviour.
 
 `/api/documents/{id}` is the **single expansion call**: with no params it returns
 the first 20 chunks, and callers page with `offset`/`next` (capped at 100). An

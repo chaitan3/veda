@@ -204,6 +204,7 @@ async fn run_search(state: &AppState, query: &str, mode: RetrievalMode, limit: u
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchParams {
     query: Option<String>,
     mode: Option<String>,
@@ -221,6 +222,7 @@ async fn search_get(State(state): State<AppState>, Query(p): Query<SearchParams>
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchBody {
     query: String,
     #[serde(default)]
@@ -238,11 +240,12 @@ async fn search_post(State(state): State<AppState>, Json(body): Json<SearchBody>
     run_search(&state, &body.query, mode, limit).await
 }
 
-async fn health(State(state): State<AppState>) -> Response {
-    match stats_json(&state).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
+/// Liveness probe. Deliberately public and minimal: any authenticated caller
+/// wanting corpus details uses `GET /api/stats` (same handler, protected).
+/// Keeping the body free of counts/embedder paths means an unauthenticated
+/// probe cannot enumerate the corpus.
+async fn health() -> Response {
+    Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
 async fn stats(State(state): State<AppState>) -> Response {
@@ -277,13 +280,24 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
     }))
 }
 
+/// Paging for the document listing, plus the file-name/title filter.
 #[derive(Deserialize)]
-struct PageParams {
+#[serde(deny_unknown_fields)]
+struct DocumentListParams {
     offset: Option<usize>,
     limit: Option<usize>,
-    /// Case-insensitive substring match over the document title / source path
-    /// (`/api/documents` only; ignored elsewhere).
+    /// Case-insensitive substring match over the document title / source path.
     query: Option<String>,
+}
+
+/// Paging for one document's chunk slice — no filter: a single document is
+/// already the scope. Unknown parameters are rejected, so a `query` sent here
+/// by mistake fails loudly instead of paging the whole document unfiltered.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkPageParams {
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -296,7 +310,7 @@ struct DocumentsResponse {
     documents: Vec<DocumentRef>,
 }
 
-async fn documents(State(state): State<AppState>, Query(p): Query<PageParams>) -> Response {
+async fn documents(State(state): State<AppState>, Query(p): Query<DocumentListParams>) -> Response {
     let store = state.pipeline.store();
     let limit = p.limit.unwrap_or(DEFAULT_DOC_PAGE).clamp(1, MAX_DOC_PAGE);
     let offset = p.offset.unwrap_or(0);
@@ -352,7 +366,7 @@ async fn documents(State(state): State<AppState>, Query(p): Query<PageParams>) -
 async fn document_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(p): Query<PageParams>,
+    Query(p): Query<ChunkPageParams>,
 ) -> Response {
     let store = state.pipeline.store();
     let document = match store.get_document(&id).await {
@@ -399,6 +413,7 @@ async fn document_by_id(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ImageSearchBody {
     /// Base64-encoded query image bytes (PNG/JPEG/…).
     image_base64: String,

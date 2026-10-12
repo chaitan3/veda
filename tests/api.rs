@@ -214,6 +214,50 @@ async fn post_image_search_honours_limit() {
 }
 
 #[tokio::test]
+async fn unknown_parameters_are_rejected() {
+    let (app, doc_id) = setup().await;
+
+    // GET /api/search with a stale/typo'd option.
+    let resp = app
+        .clone()
+        .oneshot(get("/api/search?q=mountain&k=5"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // POST body with a stale option: silently ignoring it would look like the
+    // limit was honoured, so this must fail too.
+    let resp = app
+        .clone()
+        .oneshot(post_json(
+            "/api/search",
+            serde_json::json!({"query": "mountain", "top_k": 3}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A document-scoped chunk page takes no filter.
+    let resp = app
+        .oneshot(get(&format!("/api/documents/{doc_id}?query=sample")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn health_is_public_liveness_only() {
+    let (app, _doc_id) = setup().await;
+    let resp = app.oneshot(get("/health")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+    assert_eq!(body["status"], "ok");
+    // Corpus details are auth-side only (`/api/stats`), never on the probe.
+    assert!(body.get("documents").is_none());
+    assert!(body.get("embedder").is_none());
+}
+
+#[tokio::test]
 async fn unknown_mode_falls_back_to_hybrid() {
     let (app, _doc_id) = setup().await;
     let resp = app
