@@ -19,6 +19,11 @@ const DEFAULT_MODELS_BASE: &str =
 const DEFAULT_EMBED_BASE: &str = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main";
 const DEFAULT_IMAGE_BASE: &str =
     "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main";
+/// EmbeddingGemma 2 (Apache-2.0) — the unified text+image space used by the
+/// `eg2` providers. fp32 only: the model card is explicit that fp16 returns
+/// NaN or silently degraded embeddings.
+const DEFAULT_EG2_BASE: &str =
+    "https://huggingface.co/onnx-community/embeddinggemma-2-ONNX/resolve/main";
 
 struct Asset {
     dest: PathBuf,
@@ -40,6 +45,7 @@ pub async fn download_models(
     let base = env_or("DOCLING_RS_MODELS_URL", DEFAULT_MODELS_BASE);
     let embed_base = env_or("LS_ONNX_MODELS_URL", DEFAULT_EMBED_BASE);
     let image_base = env_or("LS_IMAGE_MODELS_URL", DEFAULT_IMAGE_BASE);
+    let eg2_base = env_or("LS_EG2_MODELS_URL", DEFAULT_EG2_BASE);
     let models = PathBuf::from(&cfg.models_dir);
 
     let docling = |rel: &str| models.join(rel);
@@ -95,6 +101,24 @@ pub async fn download_models(
     ];
 
     if with_embed {
+        // EmbeddingGemma 2 text graph (`LS_EMBED_PROVIDER=eg2`). The external
+        // weights file must keep its upstream name: the graph references
+        // `model.onnx_data` next to it.
+        assets.push(Asset {
+            dest: docling("eg2/text/model.onnx"),
+            urls: vec![format!("{eg2_base}/onnx/model.onnx")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: docling("eg2/text/model.onnx_data"),
+            urls: vec![format!("{eg2_base}/onnx/model.onnx_data")],
+            optional: false,
+        });
+        assets.push(Asset {
+            dest: docling("eg2/tokenizer.json"),
+            urls: vec![format!("{eg2_base}/tokenizer.json")],
+            optional: false,
+        });
         assets.push(Asset {
             dest: docling("embed/bge-small-en-v1.5.onnx"),
             urls: vec![format!("{embed_base}/onnx/model.onnx")],

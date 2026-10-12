@@ -27,6 +27,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
+/// A relevant target expressed with **stable** keys, so one gold set can be
+/// scored against several stores (chunk/document ids are per-ingest UUIDs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceRef {
+    /// The document's `source_uri` (exact match).
+    pub source_uri: String,
+    /// When set, only this chunk ordinal of that document is relevant;
+    /// otherwise any chunk of the document counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<i64>,
+}
+
 /// One labelled query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoldQuery {
@@ -34,26 +46,94 @@ pub struct GoldQuery {
     /// Free-form label for grouping the report (`phrase`, `title`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Portable targets (preferred): resolved against the store under test.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relevant_sources: Vec<SourceRef>,
+    /// Direct ids, for hand-written queries against one specific store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relevant_chunk_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relevant_doc_ids: Vec<String>,
 }
 
-impl GoldQuery {
-    /// Is this result relevant to the query?
+/// A gold query with its portable targets resolved to this store's ids.
+#[derive(Debug, Clone)]
+pub struct ResolvedGold {
+    pub query: String,
+    pub kind: Option<String>,
+    chunk_ids: std::collections::HashSet<String>,
+    doc_ids: std::collections::HashSet<String>,
+    /// (doc_id, ordinal) targets for chunk-level relevance.
+    ordinals: std::collections::HashSet<(String, i64)>,
+    relevant_count: usize,
+}
+
+impl ResolvedGold {
     fn is_hit(&self, hit: &Scored) -> bool {
-        self.relevant_chunk_ids.iter().any(|id| id == &hit.chunk.id)
+        self.chunk_ids.contains(&hit.chunk.id)
+            || self.doc_ids.contains(&hit.chunk.doc_id)
             || self
-                .relevant_doc_ids
-                .iter()
-                .any(|id| id == &hit.chunk.doc_id)
+                .ordinals
+                .contains(&(hit.chunk.doc_id.clone(), hit.chunk.ordinal))
     }
 
-    /// Number of distinct relevant targets (used as the nDCG ideal).
     fn relevant_count(&self) -> usize {
-        (self.relevant_chunk_ids.len() + self.relevant_doc_ids.len()).max(1)
+        self.relevant_count.max(1)
     }
+}
+
+/// Resolve every query's `relevant_sources` against the store's documents.
+pub async fn resolve(pipeline: &Pipeline, gold: &[GoldQuery]) -> Result<Vec<ResolvedGold>> {
+    let documents = pipeline.store().list_documents().await?;
+    let by_uri: std::collections::HashMap<&str, &str> = documents
+        .iter()
+        .map(|d| (d.source_uri.as_str(), d.id.as_str()))
+        .collect();
+    let mut out = Vec::with_capacity(gold.len());
+    for g in gold {
+        let mut chunk_ids: std::collections::HashSet<String> =
+            g.relevant_chunk_ids.iter().cloned().collect();
+        let mut doc_ids: std::collections::HashSet<String> =
+            g.relevant_doc_ids.iter().cloned().collect();
+        let mut ordinals = std::collections::HashSet::new();
+        let mut missing = 0usize;
+        for r in &g.relevant_sources {
+            match by_uri.get(r.source_uri.as_str()) {
+                Some(id) => {
+                    let id = id.to_string();
+                    match r.ordinal {
+                        Some(ordinal) => {
+                            ordinals.insert((id, ordinal));
+                        }
+                        None => {
+                            doc_ids.insert(id);
+                        }
+                    }
+                }
+                None => missing += 1,
+            }
+        }
+        if missing > 0 {
+            tracing::warn!(
+                query = %g.query,
+                missing,
+                "gold-set source_uri(s) not present in this store; scoring them as unreachable"
+            );
+        }
+        let relevant_count = chunk_ids.len() + doc_ids.len() + ordinals.len();
+        // An unresolvable query must still count as a miss, not vanish.
+        let relevant_count = relevant_count.max(1);
+        let _ = &mut chunk_ids;
+        out.push(ResolvedGold {
+            query: g.query.clone(),
+            kind: g.kind.clone(),
+            chunk_ids,
+            doc_ids,
+            ordinals,
+            relevant_count,
+        });
+    }
+    Ok(out)
 }
 
 /// Per-query scores at the requested cutoffs.
@@ -85,7 +165,7 @@ pub struct KindReport {
 }
 
 /// Score one ranked result list against one query.
-pub fn score_query(ranked: &[Scored], gold: &GoldQuery, cutoffs: &[usize]) -> QueryScore {
+pub fn score_query(ranked: &[Scored], gold: &ResolvedGold, cutoffs: &[usize]) -> QueryScore {
     let mut out = QueryScore::default();
     let mut first_hit: Option<usize> = None;
     let mut hits_at: Vec<bool> = Vec::with_capacity(ranked.len());
@@ -138,7 +218,7 @@ pub fn load(path: &str) -> Result<Vec<GoldQuery>> {
 /// Run every mode over the gold set and aggregate.
 pub async fn run(
     pipeline: &Pipeline,
-    gold: &[GoldQuery],
+    gold: &[ResolvedGold],
     modes: &[crate::model::RetrievalMode],
     cutoffs: &[usize],
 ) -> Result<Vec<ModeReport>> {
@@ -155,8 +235,6 @@ pub async fn run(
         // kind -> (query count, accumulating report)
         let mut kinds: BTreeMap<String, (usize, KindReport)> = BTreeMap::new();
         for g in gold {
-            // Image-only queries are meaningless for text modes and vice
-            // versa; skip when the corpus cannot answer them at all.
             let ranked = pipeline.query(mode, &g.query, k_max).await?;
             let s = score_query(&ranked, g, cutoffs);
             report.queries += 1;
@@ -264,7 +342,11 @@ pub async fn generate(pipeline: &Pipeline, per_doc: usize, out: &str) -> Result<
                     &GoldQuery {
                         query,
                         kind: Some("phrase".into()),
-                        relevant_chunk_ids: vec![chunk.id.clone()],
+                        relevant_sources: vec![SourceRef {
+                            source_uri: doc.source_uri.clone(),
+                            ordinal: Some(chunk.ordinal),
+                        }],
+                        relevant_chunk_ids: Vec::new(),
                         relevant_doc_ids: Vec::new(),
                     },
                 )?;
@@ -278,8 +360,12 @@ pub async fn generate(pipeline: &Pipeline, per_doc: usize, out: &str) -> Result<
                 &GoldQuery {
                     query: doc.title.clone(),
                     kind: Some("title".into()),
+                    relevant_sources: vec![SourceRef {
+                        source_uri: doc.source_uri.clone(),
+                        ordinal: None,
+                    }],
                     relevant_chunk_ids: Vec::new(),
-                    relevant_doc_ids: vec![doc.id.clone()],
+                    relevant_doc_ids: Vec::new(),
                 },
             )?;
             written += 1;
@@ -302,8 +388,12 @@ pub async fn generate(pipeline: &Pipeline, per_doc: usize, out: &str) -> Result<
                 &GoldQuery {
                     query: name,
                     kind: Some("filename".into()),
+                    relevant_sources: vec![SourceRef {
+                        source_uri: doc.source_uri.clone(),
+                        ordinal: None,
+                    }],
                     relevant_chunk_ids: Vec::new(),
-                    relevant_doc_ids: vec![doc.id.clone()],
+                    relevant_doc_ids: Vec::new(),
                 },
             )?;
             written += 1;
@@ -425,17 +515,23 @@ mod tests {
         Scored { chunk, score: 1.0 }
     }
 
-    #[test]
-    fn metrics_are_computed_over_the_ranked_list() {
-        let gold = GoldQuery {
+    fn gold(chunk_ids: &[&str], doc_ids: &[&str]) -> ResolvedGold {
+        ResolvedGold {
             query: "q".into(),
             kind: None,
-            relevant_chunk_ids: vec!["b".into()],
-            relevant_doc_ids: vec![],
-        };
+            chunk_ids: chunk_ids.iter().map(|s| s.to_string()).collect(),
+            doc_ids: doc_ids.iter().map(|s| s.to_string()).collect(),
+            ordinals: Default::default(),
+            relevant_count: (chunk_ids.len() + doc_ids.len()).max(1),
+        }
+    }
+
+    #[test]
+    fn metrics_are_computed_over_the_ranked_list() {
+        let g = gold(&["b"], &[]);
         // Relevant target at rank 2.
         let ranked = vec![hit("a", "d1"), hit("b", "d2"), hit("c", "d3")];
-        let s = score_query(&ranked, &gold, &[1, 3]);
+        let s = score_query(&ranked, &g, &[1, 3]);
         assert_eq!(s.recall[&1], 0.0);
         assert_eq!(s.recall[&3], 1.0);
         assert!((s.mrr - 0.5).abs() < 1e-6);
@@ -446,14 +542,9 @@ mod tests {
 
     #[test]
     fn doc_level_relevance_counts_any_chunk() {
-        let gold = GoldQuery {
-            query: "q".into(),
-            kind: None,
-            relevant_chunk_ids: vec![],
-            relevant_doc_ids: vec!["d9".into()],
-        };
+        let g = gold(&[], &["d9"]);
         let ranked = vec![hit("x", "d1"), hit("y", "d9")];
-        let s = score_query(&ranked, &gold, &[2]);
+        let s = score_query(&ranked, &g, &[2]);
         assert_eq!(s.recall[&2], 1.0);
     }
 

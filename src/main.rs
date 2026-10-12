@@ -243,7 +243,9 @@ async fn main() -> anyhow::Result<()> {
                 "gold:   {} queries from {queries}\nmodes:  {modes:?}\ncutoff: {cutoffs:?}",
                 gold.len()
             );
-            let reports = local_search::eval::run(&pipeline, &gold, &modes, &cutoffs).await?;
+            let resolved = local_search::eval::resolve(&pipeline, &gold).await?;
+            let reports =
+                local_search::eval::run(&pipeline, &resolved, &modes, &cutoffs).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&reports)?);
             } else {

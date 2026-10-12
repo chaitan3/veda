@@ -11,6 +11,8 @@ pub mod image;
 pub mod llamacpp;
 
 #[cfg(feature = "onnx-embed")]
+pub mod eg2;
+#[cfg(feature = "onnx-embed")]
 pub mod onnx;
 
 use crate::config::{Config, EmbedProvider};
@@ -52,6 +54,19 @@ pub fn from_config(cfg: &Config) -> Result<Arc<dyn Embedder>> {
             {
                 Err(Error::FeatureDisabled(
                     "onnx embedder (LS_EMBED_PROVIDER=onnx)".into(),
+                    "onnx-embed".into(),
+                ))
+            }
+        }
+        EmbedProvider::Eg2 => {
+            #[cfg(feature = "onnx-embed")]
+            {
+                Ok(Arc::new(eg2::Eg2TextEmbedder::from_config(cfg)?))
+            }
+            #[cfg(not(feature = "onnx-embed"))]
+            {
+                Err(Error::FeatureDisabled(
+                    "EG2 embedder (LS_EMBED_PROVIDER=eg2)".into(),
                     "onnx-embed".into(),
                 ))
             }

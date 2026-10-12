@@ -17,6 +17,9 @@ pub enum EmbedProvider {
     LlamaCpp,
     /// In-process ONNX sentence encoder (feature `onnx-embed`).
     Onnx,
+    /// EmbeddingGemma 2 text graph (feature `onnx-embed`): 768-d, multilingual,
+    /// and — with the `eg2` image provider — one shared text+image space.
+    Eg2,
 }
 
 impl EmbedProvider {
@@ -25,9 +28,23 @@ impl EmbedProvider {
             "hash" => Ok(EmbedProvider::Hash),
             "llamacpp" | "llama.cpp" | "llama-cpp" | "openai" => Ok(EmbedProvider::LlamaCpp),
             "onnx" => Ok(EmbedProvider::Onnx),
+            "eg2" | "embeddinggemma2" | "embeddinggemma-2" | "embedding-gemma-2" => {
+                Ok(EmbedProvider::Eg2)
+            }
             other => Err(Error::config(format!(
-                "LS_EMBED_PROVIDER must be hash|llamacpp|onnx, got '{other}'"
+                "LS_EMBED_PROVIDER must be hash|llamacpp|onnx|eg2, got '{other}'"
             ))),
+        }
+    }
+
+    /// The output dimension of the provider's default model, used when
+    /// `LS_EMBED_DIM` is not set explicitly.
+    pub fn natural_dim(&self) -> usize {
+        match self {
+            EmbedProvider::Hash => 384,
+            EmbedProvider::LlamaCpp => 384, // auto-detected at runtime
+            EmbedProvider::Onnx => 384,     // bge-small-en-v1.5
+            EmbedProvider::Eg2 => 768,      // EmbeddingGemma 2
         }
     }
 }
@@ -48,6 +65,9 @@ pub struct EmbedConfig {
     pub doc_prefix: Option<String>,
     pub onnx_model: Option<String>,
     pub onnx_tokenizer: Option<String>,
+    /// EG2 text graph (`…/eg2/text/model.onnx`) and tokenizer.
+    pub eg2_model: Option<String>,
+    pub eg2_tokenizer: Option<String>,
     /// Cap on the encoded sequence length for the `onnx` provider. Must not
     /// exceed the model's position-embedding table (512 for BGE-style
     /// encoders); longer chunks are truncated with a warning.
@@ -215,11 +235,23 @@ impl Config {
         let extract = ExtractPipeline::parse(&var_or("LS_EXTRACT_PIPELINE", "onnx"))?;
         let chunker = ChunkerKind::parse(&var_or("LS_CHUNKER", "hybrid"))?;
 
-        let dim = var("LS_EMBED_DIM")
+        let explicit_dim = var("LS_EMBED_DIM")
             .map(|v| v.parse::<usize>())
             .transpose()
-            .map_err(|_| Error::config("LS_EMBED_DIM must be an integer"))?
-            .unwrap_or(384);
+            .map_err(|_| Error::config("LS_EMBED_DIM must be an integer"))?;
+        let natural_dim = provider.natural_dim();
+        let dim = explicit_dim.unwrap_or(natural_dim);
+        if let Some(explicit) = explicit_dim
+            && explicit != natural_dim
+        {
+            tracing::warn!(
+                provider = ?provider,
+                explicit,
+                natural = natural_dim,
+                "LS_EMBED_DIM differs from the provider's natural dimension; \
+                 make sure the vector table matches the model"
+            );
+        }
 
         let chunk_overlap = var("LS_CHUNK_OVERLAP")
             .map(|v| v.parse::<f32>())
@@ -261,15 +293,23 @@ impl Config {
             db_path: var_or("LS_DB_PATH", "data/local-search.db"),
             source_paths: parse_path_list(&var_or("LS_SOURCE_PATH", "docs")),
             image_only_paths: parse_path_list(&var_or("LS_IMAGE_ONLY_PATHS", "")),
-            models_dir,
+            models_dir: models_dir.clone(),
             embed: EmbedConfig {
                 provider,
                 model: var("LS_EMBED_MODEL"),
                 dim,
                 base_url: var_or("LS_LLAMACPP_URL", "http://127.0.0.1:8080/v1"),
                 api_key: var("LS_LLAMACPP_API_KEY"),
-                query_prefix: var("LS_EMBED_QUERY_PREFIX"),
-                doc_prefix: var("LS_EMBED_DOC_PREFIX"),
+                // EG2 is trained with task prefixes; default them so a plain
+                // `LS_EMBED_PROVIDER=eg2` gets the model's intended quality.
+                query_prefix: var("LS_EMBED_QUERY_PREFIX").or_else(|| {
+                    (provider == EmbedProvider::Eg2)
+                        .then(|| crate::embed::eg2::DEFAULT_QUERY_PREFIX.to_string())
+                }),
+                doc_prefix: var("LS_EMBED_DOC_PREFIX").or_else(|| {
+                    (provider == EmbedProvider::Eg2)
+                        .then(|| crate::embed::eg2::DEFAULT_DOC_PREFIX.to_string())
+                }),
                 onnx_model: var("LS_ONNX_MODEL")
                     .or_else(|| Some(format!("{embed_dir}/bge-small-en-v1.5.onnx"))),
                 onnx_tokenizer: var("LS_ONNX_TOKENIZER")
@@ -279,6 +319,10 @@ impl Config {
                     .transpose()
                     .map_err(|_| Error::config("LS_EMBED_MAX_TOKENS must be an integer"))?
                     .unwrap_or(512),
+                eg2_model: var("LS_EG2_TEXT_MODEL")
+                    .or_else(|| Some(format!("{models_dir}/eg2/text/model.onnx"))),
+                eg2_tokenizer: var("LS_EG2_TOKENIZER")
+                    .or_else(|| Some(format!("{models_dir}/eg2/tokenizer.json"))),
             },
             image,
             extract,

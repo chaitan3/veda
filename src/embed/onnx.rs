@@ -213,7 +213,7 @@ impl Embedder for OnnxEmbedder {
 ///
 /// Returns `(batch, seq, input_ids, attention_mask, token_type_ids)`; pads
 /// with zeros (mask 0) so padded positions are ignored by the model.
-fn pad_batch(
+pub(crate) fn pad_batch(
     encodings: &[tokenizers::Encoding],
     max_tokens: usize,
 ) -> (usize, usize, Vec<i64>, Vec<i64>, Vec<i64>) {
