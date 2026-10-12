@@ -70,7 +70,11 @@ async fn scheduled_ingest_picks_up_new_files() {
     std::fs::write(docs.join("one.md"), "# One\nfirst document body").unwrap();
     let db = base.join("app.db").to_string_lossy().to_string();
 
-    let pipeline = Arc::new(Pipeline::from_config(&config(&db, base.clone())).await.unwrap());
+    let pipeline = Arc::new(
+        Pipeline::from_config(&config(&db, base.clone()))
+            .await
+            .unwrap(),
+    );
     // First run happens immediately (catch-up), then every 50 ms.
     let handle = schedule::spawn(pipeline.clone(), Duration::from_millis(50), false);
 
