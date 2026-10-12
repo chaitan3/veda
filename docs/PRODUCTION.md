@@ -18,7 +18,7 @@ The packaged directory is the service's **working directory** — docling resolv
 |---|---|---|
 | `local-search` | yes | the product binary |
 | `libonnxruntime_providers_*.so` | GPU only | next to the binary; CPU runs fine without them (logs a fallback) |
-| `.models/` | yes | ~2 GB: docling assets, ONNX text embedder, SigLIP2 towers, CodeFormulaV2 |
+| `.models/` | yes | ~2 GB (bge + SigLIP2) to ~4 GB with EmbeddingGemma 2: docling assets, ONNX text embedder, SigLIP2 towers, CodeFormulaV2, and optionally `eg2/` (text + vision graphs, fp32) |
 | `.pdfium/lib/libpdfium.so` | yes (PDF) | ~7.5 MB |
 | SQLite DB (`*.db`, `-wal`, `-shm`) | yes | all state |
 | CUDA runtime + cuDNN 9 | GPU only | must match the ONNX Runtime build |

@@ -42,7 +42,9 @@ seams — while the data model is shaped for the image channel from day one.
 ```bash
 cp .env.example .env            # optional; every key has a default
 
-# 1. fetch the local model set (docling assets + bge-small embedder, ~0.5 GB)
+# 1. fetch the local model set (docling assets + bge-small + SigLIP2, ~2 GB;
+#    add EmbeddingGemma 2 with LS_EMBED_PROVIDER=eg2 / LS_IMAGE_EMBED_PROVIDER=eg2
+#    — `download-models` fetches those too)
 cargo run --release -- download-models
 
 # 2. create the schema and ingest a folder

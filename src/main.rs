@@ -81,10 +81,12 @@ enum Command {
     /// Download the default model set (docling assets, text + image embedders,
     /// code/formula).
     DownloadModels {
-        /// Skip the local ONNX text embedder (bge-small-en-v1.5).
+        /// Skip the local text embedders (bge-small-en-v1.5 and the
+        /// EmbeddingGemma 2 text graph).
         #[arg(long)]
         no_embed: bool,
-        /// Skip the SigLIP2 image+text towers (~700 MB).
+        /// Skip the image embedders (SigLIP2 towers ~700 MB and the
+        /// EmbeddingGemma 2 vision encoder).
         #[arg(long)]
         no_image: bool,
         /// Skip the CodeFormulaV2 code/formula models (~0.8 GB).
