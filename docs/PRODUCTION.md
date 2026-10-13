@@ -269,4 +269,6 @@ detected as a change.
 
 No PDF figure extraction, no image captioning, no metrics endpoint, no
 graceful-shutdown hook, no folder watcher, static API keys only, no
-reranker/Multi-Query/HyDE, no eval harness.
+reranker/Multi-Query/HyDE. Retrieval quality is measured with `local-search
+eval` / `eval-gen` (see docs/EVAL.md); the corpus-wide numbers still need
+hand-written queries from the operator, since mined queries are lexical.
