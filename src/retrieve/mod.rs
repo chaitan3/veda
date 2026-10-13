@@ -93,7 +93,39 @@ impl Retriever {
             let iq = image.embed_query_text(query).await?;
             lists.push(self.store.image_search(&iq, wide).await?);
         }
+        // Document names: no retrieval channel indexes file names, so a query
+        // that matches a title or source path contributes that document's
+        // chunks by rank. This is what makes "find the file called X" work
+        // through /api/search (previously it only worked via
+        // /api/documents?query=).
+        lists.push(self.name_channel(query, wide).await?);
         Ok(rrf_fuse(&lists, self.rrf_k, k))
+    }
+
+    /// Chunks of documents whose title or source path contains `query`
+    /// (case-insensitive substring), newest documents first and in ordinal
+    /// order within a document. Ranks only — RRF ignores the scores.
+    async fn name_channel(&self, query: &str, limit: usize) -> Result<Vec<Scored>> {
+        let needle = query.trim().to_lowercase();
+        if needle.chars().count() < 3 {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::new();
+        for doc in self.store.list_documents().await? {
+            let name_matches = doc.title.to_lowercase().contains(&needle)
+                || doc.source_uri.to_lowercase().contains(&needle);
+            if !name_matches {
+                continue;
+            }
+            // Any chunk kind: an image-only document's only chunk is the image.
+            for chunk in self.store.get_chunks_range(&doc.id, 0, limit).await? {
+                hits.push(Scored::new(chunk, 0.0));
+                if hits.len() >= limit {
+                    return Ok(hits);
+                }
+            }
+        }
+        Ok(hits)
     }
 
     /// Image→image: embed the query image and search the image space.

@@ -56,10 +56,12 @@ Read-only: nothing indexed here can be modified through these tools.
    `fetch_image_chunk(chunk_id)` and open the returned path with vision
    capabilities. To search by an image the user provides, call
    `search_image(path_or_url)`.
-5. **Find a file by name/title/folder**: `list_documents(query="…")` — a
-   case-insensitive substring over document titles and source paths. Search
-   channels index *content*, not file names, so a file-name question needs
-   this call (never `search_image`, which takes an image, not text).
+5. **Find a file by name/title/folder**: `list_documents(query="…")` is the
+   precise lookup — a case-insensitive substring over titles and source paths.
+   `search_documents(query=…)` in `mode="hybrid"` also matches names (it adds
+   the chunks of any document whose name contains the query), so a name-shaped
+   query can just be searched; `bm25`/`vector` alone search content only.
+   Never use `search_image` for text — it takes an image.
 6. **Answer with citations**: cite the `source` (document title) for every
    factual claim drawn from a hit. If search returns nothing relevant, say so
    plainly — do not pad with model-prior knowledge and imply it came from the

@@ -65,11 +65,13 @@ get title/filename queries.
 - **Phrase queries are lexically identical to the corpus**, which flatters
   bm25. They are useful for regression detection (a drop means something
   broke) but not for ranking semantic quality.
-- **`filename` queries are a control, not a goal.** No retrieval channel
-  indexes file names — `mode=bm25`/`vector`/`hybrid` search *content*. Expect
-  near-zero scores for non-descriptive names (`frame_00000`, `scan_0042`) and
-  near-perfect scores when the name's words appear in the content
-  (`boiler_notes`). For name lookup use `GET /api/documents?query=…`.
+- **`filename` queries**: `mode=hybrid` matches document names directly (its
+  name channel contributes the chunks of any document whose title or source
+  path contains the query), so these score high on hybrid even for
+  non-descriptive names like `frame_00000`. `mode=bm25`/`vector` search
+  content only and stay near zero for those — the gap between the two is
+  itself the measurement. `GET /api/documents?query=…` remains the precise
+  name lookup.
 - **No image→image evaluation yet.** Query images need labels; `mode=image`
   is exercised indirectly (text→image) only through hybrid.
 - **Small corpora give noisy numbers.** A handful of documents makes MRR jump

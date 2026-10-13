@@ -322,11 +322,7 @@ async fn main() -> anyhow::Result<()> {
             no_eg2,
         } => {
             local_search::download::download_models(
-                &cfg,
-                !no_embed,
-                !no_image,
-                !no_enrich,
-                !no_eg2,
+                &cfg, !no_embed, !no_image, !no_enrich, !no_eg2,
             )
             .await?;
         }

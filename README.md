@@ -29,7 +29,9 @@ seams — while the data model is shaped for the image channel from day one.
   corpus versioning, per-document stage fingerprints.
 - **Retrieval**: dense KNN over `vec0`, BM25 (FTS5), Hybrid via RRF, and
   `mode=image` (a kind filter in the unified layout, a second index otherwise);
-  query-by-image.
+  query-by-image. Hybrid also matches **document names**: a query hitting a
+  title or source path contributes that document's chunks, so "find the file
+  called X" works through search (including image-only documents).
 - **Evaluation**: `eval` scores a gold set (recall@k / MRR / nDCG@k per mode)
   and `eval-gen` mines one from the corpus — the way to compare embedders on
   *your* data (docs/EVAL.md).
@@ -293,6 +295,11 @@ re-runs only the stages whose configuration or models changed.
   is ~4.6x slower than bge for text and ~5-28x slower than SigLIP2 for images
   (budget dependent) — see `examples/eg2_bench.rs` for measured numbers, and
   `docs/EVAL.md` for how to check what that buys on your corpus.
+- **File names in search.** `mode=hybrid` contributes the chunks of any
+  document whose title or source path contains the query, so a file-name query
+  finds the document (and an image-only document's image chunk) directly.
+  `GET /api/documents?query=` remains the precise name lookup; `mode=bm25` and
+  `mode=vector` search content only.
 - **Scheduled ingest.** `serve` with `LS_INGEST_INTERVAL` (e.g. `24h`) ingests
   once at startup and then every interval, in one background task; a failed
   run is logged and retried next tick. Queries stay available throughout.
