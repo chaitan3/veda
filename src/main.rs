@@ -50,6 +50,14 @@ enum Command {
         #[arg(short = 'k', long, default_value_t = 5)]
         limit: usize,
     },
+    /// Run a query by image (image→image search).
+    QueryImage {
+        /// Path to the query image (PNG/JPEG/…).
+        image: String,
+        /// Number of results (1-100).
+        #[arg(short = 'k', long, default_value_t = 5)]
+        limit: usize,
+    },
     /// Score a gold set (JSONL) against the current store.
     Eval {
         /// Path to the gold-set JSONL.
@@ -99,6 +107,43 @@ enum Command {
     },
     /// Serve the read-only search API.
     Serve,
+}
+
+/// Print search hits: text snippets, or the source file name for image chunks
+/// (which carry no text).
+async fn print_hits(
+    pipeline: &Pipeline,
+    hits: &[local_search::model::Scored],
+) -> anyhow::Result<()> {
+    if hits.is_empty() {
+        println!("no results");
+    }
+    for (i, hit) in hits.iter().enumerate() {
+        let snippet: String = hit.chunk.text.chars().take(240).collect();
+        println!(
+            "{:>2}. [{:.4}] {}  ({})",
+            i + 1,
+            hit.score,
+            hit.chunk.kind.as_str(),
+            hit.chunk.doc_id
+        );
+        if snippet.is_empty() && hit.chunk.kind == local_search::model::ChunkKind::Image {
+            let doc = pipeline.store().get_document(&hit.chunk.doc_id).await?;
+            let name = doc
+                .map(|d| {
+                    d.source_uri
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&d.source_uri)
+                        .to_string()
+                })
+                .unwrap_or_else(|| hit.chunk.id.chars().take(12).collect());
+            println!("    [image] {name}");
+        } else {
+            println!("    {snippet}");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -212,35 +257,15 @@ async fn main() -> anyhow::Result<()> {
             let mode: RetrievalMode = mode.parse()?;
             let pipeline = Pipeline::from_config(&cfg).await?;
             let hits = pipeline.query(mode, &query, limit).await?;
-            if hits.is_empty() {
-                println!("no results");
-            }
-            for (i, hit) in hits.iter().enumerate() {
-                let snippet: String = hit.chunk.text.chars().take(240).collect();
-                println!(
-                    "{:>2}. [{:.4}] {}  ({})",
-                    i + 1,
-                    hit.score,
-                    hit.chunk.kind.as_str(),
-                    hit.chunk.doc_id
-                );
-                if snippet.is_empty() && hit.chunk.kind == local_search::model::ChunkKind::Image {
-                    // Image chunks have no text: name the source file instead.
-                    let doc = pipeline.store().get_document(&hit.chunk.doc_id).await?;
-                    let name = doc
-                        .map(|d| {
-                            d.source_uri
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(&d.source_uri)
-                                .to_string()
-                        })
-                        .unwrap_or_else(|| hit.chunk.id.chars().take(12).collect());
-                    println!("    [image] {name}");
-                } else {
-                    println!("    {snippet}");
-                }
-            }
+            print_hits(&pipeline, &hits).await?;
+        }
+
+        Command::QueryImage { image, limit } => {
+            let bytes = std::fs::read(&image)
+                .map_err(|e| anyhow::anyhow!("reading query image '{image}': {e}"))?;
+            let pipeline = Pipeline::from_config(&cfg).await?;
+            let hits = pipeline.query_image(&bytes, limit).await?;
+            print_hits(&pipeline, &hits).await?;
         }
 
         Command::Eval {

@@ -38,7 +38,8 @@ seams — while the data model is shaped for the image channel from day one.
 - **Chunking**: `hybrid` (default) and `hierarchical` via docling's
   structure-aware chunkers, plus `window` (and the plain-text fallback).
 - **CLI**: `init-db`, `ingest` (`--sync`, `--force`, `--stages`), `query`,
-  `eval`, `eval-gen`, `stats`, `prune`, `download-models`, `serve`.
+  `query-image`, `eval`, `eval-gen`, `stats`, `prune`, `download-models`,
+  `serve`.
 - **Service**: `/api/search`, `/api/search/image`, `/api/stats`,
   `/api/documents`, `/api/documents/{id}`, `/api/media/{chunk_id}`, `/health`;
   optional API-key auth; optionally **scheduled ingest** while it serves
@@ -63,8 +64,9 @@ cargo run --release -- ingest ./docs ./more-docs --sync   # also drop deleted fi
 cargo run --release -- ingest --stages text_embed         # re-embed text only
 cargo run --release -- prune                  # drop docs with no chunks
 
-# 3. query
+# 3. query (text, or by example image)
 cargo run --release -- query "mountain lake" --mode hybrid --limit 5
+cargo run --release -- query-image ./photos/sunset.jpg --limit 5
 
 # 3b. measure retrieval (gold set mined from the corpus; see docs/EVAL.md)
 cargo run --release -- eval-gen --out eval/queries.jsonl
