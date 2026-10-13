@@ -92,6 +92,10 @@ enum Command {
         /// Skip the CodeFormulaV2 code/formula models (~0.8 GB).
         #[arg(long)]
         no_enrich: bool,
+        /// Skip the EmbeddingGemma 2 graphs (~1.8 GB fp32); use when neither
+        /// LS_EMBED_PROVIDER nor LS_IMAGE_EMBED_PROVIDER is `eg2`.
+        #[arg(long)]
+        no_eg2: bool,
     },
     /// Serve the read-only search API.
     Serve,
@@ -315,8 +319,16 @@ async fn main() -> anyhow::Result<()> {
             no_embed,
             no_image,
             no_enrich,
+            no_eg2,
         } => {
-            local_search::download::download_models(&cfg, !no_embed, !no_image, !no_enrich).await?;
+            local_search::download::download_models(
+                &cfg,
+                !no_embed,
+                !no_image,
+                !no_enrich,
+                !no_eg2,
+            )
+            .await?;
         }
 
         Command::Serve => {

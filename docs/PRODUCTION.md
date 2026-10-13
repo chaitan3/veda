@@ -130,6 +130,11 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 - **Single writer**: SQLite is single-writer. Run the ingest container to
   completion before/around serving; do not run two ingests at once.
 - Health: the image healthcheck polls `GET /health` on `${LS_ADDR}`.
+- Models: the entrypoint runs `download-models` on first run (skippable with
+  `LS_SKIP_MODEL_DOWNLOAD=1`). It passes `--no-eg2` unless
+  `LS_EMBED_PROVIDER`/`LS_IMAGE_EMBED_PROVIDER` is `eg2` (in the environment or
+  `/config/.env`), so the ~1.8 GB EmbeddingGemma 2 graphs are fetched only when
+  they will be used.
 
 ## Service
 

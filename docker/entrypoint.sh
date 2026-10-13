@@ -30,8 +30,24 @@ fi
 # existing volume only fetches models added by a newer version. Skip entirely
 # for a pre-provisioned volume or a remote-VLM / llama.cpp setup.
 if [ "${LS_SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
+    # EmbeddingGemma 2 is the largest download (~1.8 GB) and most deployments
+    # run bge + SigLIP2, so only fetch it when a provider asks for it -- from
+    # the environment (docker -e) or the mounted /config/.env.
+    eg2_wanted=0
+    for v in "${LS_EMBED_PROVIDER:-}" "${LS_IMAGE_EMBED_PROVIDER:-}"; do
+        [ "$v" = "eg2" ] && eg2_wanted=1
+    done
+    if [ -f /config/.env ] && grep -Eq '^[[:space:]]*(LS_EMBED_PROVIDER|LS_IMAGE_EMBED_PROVIDER)[[:space:]]*=[[:space:]]*eg2' /config/.env; then
+        eg2_wanted=1
+    fi
+    eg2_flag="--no-eg2"
+    if [ "$eg2_wanted" = "1" ]; then
+        eg2_flag=""
+        echo "[entrypoint] eg2 provider configured; fetching EmbeddingGemma 2 (~1.8 GB)" >&2
+    fi
     echo "[entrypoint] ensuring model tree in $MODELS_DIR (idempotent)" >&2
-    /app/local-search download-models
+    # shellcheck disable=SC2086
+    /app/local-search download-models $eg2_flag
 fi
 
 if [ "$(id -u)" = "0" ]; then

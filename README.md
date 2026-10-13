@@ -196,7 +196,9 @@ Face into `.models/` and `.pdfium/`: bge-small-en-v1.5 (text, default),
 SigLIP2 (images, default) and EmbeddingGemma 2 (text + vision, ~1.8 GB fp32,
 used by the `eg2` providers). Mirrors: `DOCLING_RS_MODELS_URL`,
 `LS_ONNX_MODELS_URL`, `LS_IMAGE_MODELS_URL`, `LS_EG2_MODELS_URL`. `--no-embed`
-/ `--no-image` / `--no-enrich` skip the text, image and code/formula sets.
+/ `--no-image` / `--no-enrich` / `--no-eg2` skip the text, image,
+code/formula and EmbeddingGemma 2 sets (the container entrypoint passes
+`--no-eg2` unless a provider is set to `eg2`, so default installs stay ~2 GB).
 
 EmbeddingGemma 2 runs **fp32 only** — its model card is explicit that fp16
 returns NaN or silently degraded embeddings.
