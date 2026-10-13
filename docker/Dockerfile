@@ -2,6 +2,10 @@
 
 # local-search, container image.
 #
+# Build from the repository root (the build context must include src/, vendor/,
+# Cargo.toml and docker/):
+#   docker build -f docker/Dockerfile -t local-search .
+#
 # Two stages, because the binary must be compiled against the same glibc the
 # image ships: NVIDIA's CUDA 13 / cuDNN 9 images are Ubuntu 24.04 (glibc 2.39),
 # and a binary built on a rolling distro (glibc >= 2.43) fails to load with
@@ -67,7 +71,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # work here: bind the API on all interfaces and keep state on volumes.
 ENV LS_ADDR=0.0.0.0:8080 \
     LS_DB_PATH=/data/local-search.db \
-    LS_BLOB_ROOT=/data/blobs \
     LS_SOURCE_PATH=/documents \
     LS_MODELS_DIR=/models \
     LS_EXTRACT_PIPELINE=onnx \

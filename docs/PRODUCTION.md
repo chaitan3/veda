@@ -95,7 +95,7 @@ Do **not** copy a host-built binary into the image: one built on a rolling
 distro requires `GLIBC_2.43` (re-versioned libm functions) and will not load.
 
 ```bash
-docker build -t local-search .
+docker build -f docker/Dockerfile -t local-search .
 
 # one-off ingest (same volumes as the server)
 docker run --rm --gpus all \
@@ -124,7 +124,7 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
   (`LS_EXTRACT_PIPELINE=vlm`) or `LS_EMBED_PROVIDER=llamacpp` setup.
 - **Non-root**: the entrypoint runs as root only to prepare volumes, then drops
   to `PUID:PGID` (default `1000:1000`). Match a bind-mounted host directory with
-  `docker build --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .`
+  `docker build -f docker/Dockerfile --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .`
 - **GPU**: `--gpus all` requires nvidia-container-toolkit. Without it, drop the
   flag and the ONNX runtime falls back to CPU (logged).
 - **Single writer**: SQLite is single-writer. Run the ingest container to
@@ -133,7 +133,7 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 
 ## Service
 
-Install `deploy/local-search.service`, set `LS_DB_PATH` to a path under
+Install `scripts/local-search.service`, set `LS_DB_PATH` to a path under
 `ReadWritePaths`, then `systemctl enable --now local-search`. With
 `LS_INGEST_INTERVAL` set (e.g. `24h`) the service also ingests on its own: one
 background task, one run at a time, a catch-up run at startup, and failures

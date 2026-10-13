@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Run local-search in Docker (image built from ./Dockerfile).
+# Run local-search in Docker (image built from docker/Dockerfile).
+#
+# Mounts live next to the repo root, so the script works from any directory:
+#   docker build -f docker/Dockerfile -t local-search .
+#   ./docker/run-container.sh
 #
 # Mounts (point the host side wherever you want):
 #   ./documents -> /documents  text corpus, full pipeline (read-only)
@@ -24,6 +28,10 @@ LS_SOURCE_PATH="${LS_SOURCE_PATH:-/documents:/photos}"
 # Non-image files in that folder still ingest normally.
 LS_IMAGE_ONLY_PATHS="${LS_IMAGE_ONLY_PATHS:-/photos}"
 
+# Mounts are relative to the repository root (this script's parent), so the
+# caller's working directory does not matter.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 mkdir -p documents photos data models config
 
 docker run --rm --gpus all \
@@ -33,9 +41,9 @@ docker run --rm --gpus all \
   -e PGID="$(id -g)" \
   -e LS_SOURCE_PATH="$LS_SOURCE_PATH" \
   -e LS_IMAGE_ONLY_PATHS="$LS_IMAGE_ONLY_PATHS" \
-  -v "$PWD/documents:/documents:ro" \
-  -v "$PWD/photos:/photos:ro" \
-  -v "$PWD/data:/data" \
-  -v "$PWD/models:/models" \
-  -v "$PWD/config:/config" \
+  -v "$ROOT/documents:/documents:ro" \
+  -v "$ROOT/photos:/photos:ro" \
+  -v "$ROOT/data:/data" \
+  -v "$ROOT/models:/models" \
+  -v "$ROOT/config:/config" \
   local-search serve

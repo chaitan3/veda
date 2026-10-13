@@ -88,7 +88,11 @@ glibc matches) and downloads the models into a volume on first run. GPU runs
 need [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/).
 
 ```bash
-docker build -t local-search .
+docker build -f docker/Dockerfile -t local-search .
+
+# or use the wrapper: builds nothing, just runs with the standard mounts
+# (documents/ + photos/ + data/ + models/ + config/, from the repo root)
+./docker/run-container.sh
 
 # ingest (one-shot; shares the data + model volumes with the server)
 docker run --rm --gpus all \
@@ -272,7 +276,7 @@ cargo build --release
 scripts/package.sh dist/local-search
 ```
 
-`deploy/local-search.service` is a systemd unit template. Upgrades need no
+`scripts/local-search.service` is a systemd unit template. Upgrades need no
 database reset: each document records a per-stage fingerprint, so `ingest`
 re-runs only the stages whose configuration or models changed.
 

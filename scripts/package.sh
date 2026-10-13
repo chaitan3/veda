@@ -81,10 +81,8 @@ if [ -f "$ROOT/docs/PRODUCTION.md" ]; then
   mkdir -p "$OUT/docs"
   cp -a "$ROOT/docs/PRODUCTION.md" "$OUT/docs/PRODUCTION.md"
 fi
-if [ -f "$ROOT/deploy/local-search.service" ]; then
-  mkdir -p "$OUT/deploy"
-  cp -a "$ROOT/deploy/local-search.service" "$OUT/deploy/local-search.service"
-fi
+[ -f "$ROOT/scripts/local-search.service" ] && \
+  cp -a "$ROOT/scripts/local-search.service" "$OUT/local-search.service"
 
 echo
 echo "contents of $OUT:"
@@ -101,4 +99,5 @@ Next steps on the target host:
   4. ./local-search init-db
   5. ./local-search ingest /path/to/documents
   6. ./local-search serve             # see docs/PRODUCTION.md
+  7. systemd: copy ./local-search.service to /etc/systemd/system/ and adjust it
 EOF
