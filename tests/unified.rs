@@ -143,15 +143,79 @@ async fn unified_space_indexes_text_and_images_together() {
 }
 
 #[tokio::test]
-async fn switching_layout_rebuilds_the_vector_tables() {
-    let base = temp_base("switch");
+async fn toggling_the_image_channel_keeps_text_vectors() {
+    let base = temp_base("toggle");
     let docs = base.join("docs");
+    let photos = base.join("photos");
     std::fs::create_dir_all(&docs).unwrap();
-    std::fs::write(docs.join("a.md"), "# A\nsome words about pumps").unwrap();
+    std::fs::create_dir_all(&photos).unwrap();
+    std::fs::write(
+        docs.join("notes.md"),
+        "# Notes\nprocess control loops and drum level measurements",
+    )
+    .unwrap();
+    std::fs::write(photos.join("shot.png"), png_bytes()).unwrap();
     let db = base.join("app.db").to_string_lossy().to_string();
 
-    // 1. split layout (different dims).
-    let mut cfg = config(&db, base.clone(), Vec::new());
+    // 1. unified: one table holds text and image vectors.
+    let cfg = config(&db, base.clone(), vec![photos.clone()]);
+    let pipeline = Pipeline::from_config(&cfg).await.unwrap();
+    pipeline
+        .ingest_all(false, false, StageSet::all())
+        .await
+        .unwrap();
+    let dense = pipeline
+        .query(RetrievalMode::Vector, "process control", 10)
+        .await
+        .unwrap();
+    assert!(dense.iter().any(|h| h.chunk.kind == ChunkKind::Image));
+
+    // 2. image channel off: the image rows leave the shared table, the text
+    //    vectors stay (no re-embedding needed for text).
+    let mut off = config(&db, base.clone(), Vec::new());
+    off.image.provider = ImageEmbedProvider::Off;
+    let pipeline = Pipeline::from_config(&off).await.unwrap();
+    assert_eq!(pipeline.store().image_space(), ImageSpace::Off);
+    let dense = pipeline
+        .query(RetrievalMode::Vector, "process control", 10)
+        .await
+        .unwrap();
+    assert!(
+        dense.iter().all(|h| h.chunk.kind != ChunkKind::Image),
+        "image rows must be removed from the unified table"
+    );
+    assert!(
+        dense.iter().any(|h| h.chunk.kind == ChunkKind::Text),
+        "text vectors must survive an image-channel change"
+    );
+
+    // 3. and back to split: text vectors are still there.
+    let mut split = config(&db, base.clone(), Vec::new());
+    split.image.dim = 32;
+    let pipeline = Pipeline::from_config(&split).await.unwrap();
+    assert_eq!(pipeline.store().image_space(), ImageSpace::Split(32));
+    let dense = pipeline
+        .query(RetrievalMode::Vector, "process control", 10)
+        .await
+        .unwrap();
+    assert!(dense.iter().any(|h| h.chunk.kind == ChunkKind::Text));
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[tokio::test]
+async fn switching_layout_re_embeds_only_the_image_side() {
+    let base = temp_base("switch");
+    let docs = base.join("docs");
+    let photos = base.join("photos");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::create_dir_all(&photos).unwrap();
+    std::fs::write(docs.join("a.md"), "# A\nsome words about pumps").unwrap();
+    std::fs::write(photos.join("shot.png"), png_bytes()).unwrap();
+    let db = base.join("app.db").to_string_lossy().to_string();
+
+    // 1. split layout (different dims: text 64, image 32).
+    let mut cfg = config(&db, base.clone(), vec![photos.clone()]);
     cfg.image.dim = 32;
     let pipeline = Pipeline::from_config(&cfg).await.unwrap();
     assert_eq!(pipeline.store().image_space(), ImageSpace::Split(32));
@@ -159,19 +223,29 @@ async fn switching_layout_rebuilds_the_vector_tables() {
         .ingest_all(false, false, StageSet::all())
         .await
         .unwrap();
-    let before = pipeline.store().count_chunks().await.unwrap();
 
-    // 2. unified layout (same dims): the vector tables are rebuilt and the
-    //    embed stages forgotten, so a plain re-ingest re-embeds.
-    let cfg = config(&db, base.clone(), Vec::new());
+    // 2. unified layout: only the image stage is invalidated, so the text
+    //    document is skipped (its vectors stay valid) and the image is
+    //    re-embedded into the shared table.
+    let cfg = config(&db, base.clone(), vec![photos.clone()]);
     let pipeline = Pipeline::from_config(&cfg).await.unwrap();
     assert_eq!(pipeline.store().image_space(), ImageSpace::Unified);
     let report = pipeline
         .ingest_all(false, false, StageSet::all())
         .await
         .unwrap();
-    assert_eq!(report.documents_ingested, 1, "layout change re-embeds");
-    assert_eq!(pipeline.store().count_chunks().await.unwrap(), before);
+    assert_eq!(report.documents_ingested, 1, "the image is re-embedded");
+    assert_eq!(
+        report.documents_skipped, 1,
+        "the text document is untouched"
+    );
+
+    // The text vector survived the layout change without re-embedding.
+    let dense = pipeline
+        .query(RetrievalMode::Vector, "words about pumps", 10)
+        .await
+        .unwrap();
+    assert!(dense.iter().any(|h| h.chunk.kind == ChunkKind::Text));
 
     std::fs::remove_dir_all(&base).ok();
 }

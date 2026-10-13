@@ -194,22 +194,53 @@ impl VectorStore for SqliteStore {
         conn.execute_batch(SCHEMA)
             .map_err(|e| Error::store(format!("migration failed: {e}")))?;
 
-        // A change of layout (off <-> split <-> unified) invalidates every
-        // vector: drop both tables and forget both embed stages.
+        // Layout changes (off <-> split <-> unified) invalidate only the
+        // *image* side: text vectors stay valid unless the text space itself
+        // changed, so they are never dropped here.
         let current_space = match self.space {
             ImageSpace::Off => "off",
             ImageSpace::Split(_) => "split",
             ImageSpace::Unified => "unified",
         };
         let stored_space = read_meta(&conn, "space")?;
-        if stored_space.as_deref().is_some_and(|s| s != current_space) {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS chunk_vectors; DROP TABLE IF EXISTS image_vectors;",
-            )?;
-            conn.execute(
-                "DELETE FROM document_stages WHERE stage IN ('text_embed','image_embed')",
-                [],
-            )?;
+        if let Some(stored) = stored_space.as_deref()
+            && stored != current_space
+        {
+            match stored {
+                // Image vectors lived in their own table: drop it.
+                "split" => {
+                    conn.execute_batch("DROP TABLE IF EXISTS image_vectors;")?;
+                }
+                // Image vectors lived in the text table: remove those rows.
+                "unified" => {
+                    let ids: Vec<String> = {
+                        let mut stmt =
+                            conn.prepare("SELECT id FROM chunks WHERE kind = 'image'")?;
+                        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                        let mut v = Vec::new();
+                        for r in rows {
+                            v.push(r?);
+                        }
+                        v
+                    };
+                    for id in ids {
+                        conn.execute("DELETE FROM chunk_vectors WHERE chunk_id = ?1", params![id])?;
+                    }
+                }
+                // "off": nothing image-side was stored.
+                _ => {}
+            }
+            if current_space != "off" || stored != "off" {
+                conn.execute(
+                    "DELETE FROM document_stages WHERE stage = 'image_embed'",
+                    [],
+                )?;
+            }
+            tracing::info!(
+                from = stored,
+                to = current_space,
+                "image vector layout changed; image embeddings will be recomputed"
+            );
         }
 
         // Text space. If the configured dimension differs from what the vec0
@@ -218,6 +249,13 @@ impl VectorStore for SqliteStore {
         if stored.is_some() && stored != Some(self.dim) {
             conn.execute_batch("DROP TABLE IF EXISTS chunk_vectors;")?;
             conn.execute("DELETE FROM document_stages WHERE stage = 'text_embed'", [])?;
+            // In unified mode the image vectors lived in that same table.
+            if self.is_unified() {
+                conn.execute(
+                    "DELETE FROM document_stages WHERE stage = 'image_embed'",
+                    [],
+                )?;
+            }
         }
         conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(

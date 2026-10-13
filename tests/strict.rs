@@ -76,7 +76,11 @@ async fn strict_mode_refuses_an_oversized_chunk_budget() {
     // since the non-strict path continues into the embedder).
     if std::path::Path::new(".models/embed/bge-small-en-v1.5.onnx").exists() {
         let db = base.join("b.db").to_string_lossy().to_string();
-        assert!(Pipeline::from_config(&config(&db, 200, false)).await.is_ok());
+        assert!(
+            Pipeline::from_config(&config(&db, 200, false))
+                .await
+                .is_ok()
+        );
     } else {
         eprintln!("skipping the non-strict half: bge model not present");
     }
