@@ -3,13 +3,13 @@
 //! "find the file called X" works through search — including for image-only
 //! documents, whose only chunk is the image.
 
+use local_search::RetrievalMode;
 use local_search::config::{
     ChunkerKind, Config, EmbedConfig, EmbedProvider, ExtractPipeline, ImageEmbedConfig,
     ImageEmbedProvider,
 };
 use local_search::model::ChunkKind;
 use local_search::pipeline::{Pipeline, StageSet};
-use local_search::RetrievalMode;
 use std::path::PathBuf;
 
 fn temp_base(tag: &str) -> PathBuf {
