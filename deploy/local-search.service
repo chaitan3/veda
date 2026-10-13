@@ -1,7 +1,9 @@
 # local-search systemd unit (template — adjust paths and user).
 #
-# The service is read-only; ingestion runs separately (see docs/PRODUCTION.md),
-# typically from a systemd timer or cron.
+# Ingestion normally runs separately (see docs/PRODUCTION.md), typically from a
+# systemd timer or cron -- or let the service do it itself by setting
+# LS_INGEST_INTERVAL (and optionally LS_INGEST_SYNC=true) in the EnvironmentFile:
+# one background task, a catch-up run at startup, then every interval.
 
 [Unit]
 Description=local-search (text + image search service)

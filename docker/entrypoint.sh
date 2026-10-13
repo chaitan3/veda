@@ -24,7 +24,8 @@ if [ ! -e /app/.pdfium ]; then
     ln -s "$MODELS_DIR/.pdfium" /app/.pdfium
 fi
 
-# Ensure the model tree: docling assets + bge-small + SigLIP2 + CodeFormulaV2.
+# Ensure the model tree: docling assets + bge-small + SigLIP2 + EmbeddingGemma 2
+# + CodeFormulaV2.
 # Idempotent — files already present are skipped without any network use, so an
 # existing volume only fetches models added by a newer version. Skip entirely
 # for a pre-provisioned volume or a remote-VLM / llama.cpp setup.
