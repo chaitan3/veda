@@ -158,6 +158,14 @@ async fn main() -> anyhow::Result<()> {
             let report = pipeline.ingest_all(sync, force, stages).await?;
             let wall = started.elapsed().as_secs_f64();
 
+            let truncated = local_search::embed::truncated_sequences();
+            if truncated > 0 {
+                println!(
+                    "\nnote: {truncated} sequence(s) truncated to the embedder window \
+                     (LS_EMBED_MAX_TOKENS={}); raise it or lower LS_CHUNK_SIZE",
+                    cfg.embed.max_tokens
+                );
+            }
             println!(
                 "\ningested {}  skipped {}  failed {}  deleted {}  chunks +{}",
                 report.documents_ingested,

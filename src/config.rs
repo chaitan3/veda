@@ -233,6 +233,10 @@ pub struct Config {
     /// Whether the scheduled run also prunes documents whose source files
     /// disappeared (`LS_INGEST_SYNC`, default off).
     pub ingest_sync: bool,
+    /// Turn the "chunk budget exceeds the embedder window" warning into a hard
+    /// startup error (`LS_CHUNK_STRICT`, default off). Truncation is silent
+    /// quality loss, so a strict deployment may prefer to refuse to start.
+    pub chunk_strict: bool,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -399,6 +403,7 @@ impl Config {
                 None => None,
             },
             ingest_sync: bool_or("LS_INGEST_SYNC", false),
+            chunk_strict: bool_or("LS_CHUNK_STRICT", false),
         })
     }
 

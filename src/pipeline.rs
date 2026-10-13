@@ -127,10 +127,20 @@ impl Pipeline {
         // position-embedding window (`LS_EMBED_MAX_TOKENS`, 512 for BGE-style
         // encoders). A chunk budget larger than that window is silently
         // truncated at embed time, so say so at startup instead.
-        if matches!(cfg.embed.provider, EmbedProvider::Onnx)
+        if matches!(cfg.embed.provider, EmbedProvider::Onnx | EmbedProvider::Eg2)
             && matches!(cfg.chunker, ChunkerKind::Hybrid | ChunkerKind::Window)
             && cfg.chunk_size + 2 > cfg.embed.max_tokens
         {
+            if cfg.chunk_strict {
+                return Err(crate::Error::config(format!(
+                    "LS_CHUNK_SIZE={} exceeds the embedder's sequence window \
+                     (LS_EMBED_MAX_TOKENS={}); lower it to {} or unset \
+                     LS_CHUNK_STRICT to allow truncation",
+                    cfg.chunk_size,
+                    cfg.embed.max_tokens,
+                    cfg.embed.max_tokens.saturating_sub(2)
+                )));
+            }
             tracing::warn!(
                 chunk_size = cfg.chunk_size,
                 max_tokens = cfg.embed.max_tokens,

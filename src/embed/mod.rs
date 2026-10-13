@@ -19,6 +19,23 @@ use crate::config::{Config, EmbedProvider};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How many sequences have been truncated to the embedder's window since this
+/// process started. Truncation is silent quality loss (the tail of a chunk is
+/// not embedded), so it is counted and surfaced in `stats` and the ingest
+/// summary instead of only being logged.
+static TRUNCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Record `n` truncated sequences (called by the ONNX batchers).
+pub(crate) fn note_truncated(n: u64) {
+    TRUNCATED.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Truncated-sequence count since process start.
+pub fn truncated_sequences() -> u64 {
+    TRUNCATED.load(Ordering::Relaxed)
+}
 
 /// A source of embedding vectors.
 #[async_trait]

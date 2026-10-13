@@ -227,10 +227,16 @@ pub(crate) fn pad_batch(
         .max()
         .unwrap_or(0);
     let seq = longest.min(max_tokens).max(1);
-    if longest > max_tokens {
+    let truncated = encodings
+        .iter()
+        .filter(|e| e.get_ids().len() > max_tokens)
+        .count() as u64;
+    if truncated > 0 {
+        crate::embed::note_truncated(truncated);
         tracing::warn!(
             longest_tokens = longest,
             max_tokens = max_tokens,
+            truncated,
             "truncating over-long chunk(s) for embedding; consider a smaller LS_CHUNK_SIZE"
         );
     }
@@ -273,7 +279,12 @@ mod tests {
         assert!(encodings[0].get_ids().len() > 512);
         assert!(encodings[1].get_ids().len() < 512);
 
+        let before = crate::embed::truncated_sequences();
         let (batch, seq, ids, mask, types) = pad_batch(&encodings, 512);
+        assert!(
+            crate::embed::truncated_sequences() > before,
+            "truncation must be counted"
+        );
         assert_eq!(batch, 2);
         assert_eq!(seq, 512);
         assert_eq!(ids.len(), 2 * 512);

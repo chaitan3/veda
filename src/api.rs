@@ -273,6 +273,9 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
             ImageSpace::Unified => "unified",
         },
         "image_embedder": pipeline.image_embedder().map(|e| e.id()).unwrap_or("off"),
+        // Sequences cut to the embedder's window since startup (silent quality
+        // loss otherwise; raise LS_EMBED_MAX_TOKENS or lower LS_CHUNK_SIZE).
+        "truncated_sequences": crate::embed::truncated_sequences(),
         "image_embed_dim": pipeline.image_embedder().map(|e| e.dim()).unwrap_or(0),
         "extract_pipeline": format!("{:?}", pipeline.config().extract).to_lowercase(),
         "documents": documents,

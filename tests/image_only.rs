@@ -67,6 +67,7 @@ fn config(db: &str, roots: Vec<PathBuf>, image_only: Vec<PathBuf>) -> Config {
         addr: "127.0.0.1:0".to_string(),
         ingest_interval: None,
         ingest_sync: false,
+        chunk_strict: false,
     }
 }
 
