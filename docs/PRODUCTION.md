@@ -246,9 +246,10 @@ prose, EG2 tokens ≈ 0.9-1.0x the chunk-token count; on token-dense text
 
 - `hybrid` (default for PDF/Office): `LS_CHUNK_SIZE=300` (default) is a good
   fit (~270 EG2 tokens); anything up to ~450 stays under the 512 window.
-- `window` (`.txt`/`.md` passthrough): counts *words*; 300 words ≈ 400-450 EG2
-  tokens for prose, so the default is near the window edge, and dense files can
-  overflow — lower it for log/data dumps.
+- `window` (`.txt`/`.md` passthrough): counts *words*; measured 300 words ≈
+  **370 EG2 tokens** on prose (411 with bge's tokenizer, hence the ratio), so
+  the default is comfortable — but dense files (numbers, IDs, logs) reached
+  1652 tokens per chunk and were truncated: lower it for log/data dumps.
 - Keep `LS_EMBED_MAX_TOKENS=512`: EG2's 8k context is a capability, not a
   target — mean pooling dilutes long spans and retrieval granularity drops.
   If you want longer chunks, raise both (e.g. chunk 600 / max 768) and measure

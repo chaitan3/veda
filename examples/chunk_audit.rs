@@ -25,7 +25,25 @@ async fn main() -> local_search::Result<()> {
         Some(doc) => chunker.chunk_document("audit", doc)?,
         None => chunker.chunk_markdown("audit", &converted.markdown)?,
     };
-    let tok = Tokenizer::from_file(".models/embed/tokenizer.json")
+    // Count with the *configured* embedder's tokenizer: bge uses a 30k
+    // WordPiece vocab, EG2 a 262k SentencePiece one, and the counts differ.
+    // A second argument overrides the path (for comparisons).
+    let tok_path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| match cfg.embed.provider {
+            EmbedProvider::Eg2 => cfg
+                .embed
+                .eg2_tokenizer
+                .clone()
+                .unwrap_or_else(|| ".models/eg2/tokenizer.json".to_string()),
+            _ => cfg
+                .embed
+                .onnx_tokenizer
+                .clone()
+                .unwrap_or_else(|| ".models/embed/tokenizer.json".to_string()),
+        });
+    println!("tokenizer={tok_path}");
+    let tok = Tokenizer::from_file(&tok_path)
         .map_err(|e| local_search::Error::embedding(e.to_string()))?;
     let mut over = 0;
     let mut max_n = 0;
