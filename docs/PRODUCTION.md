@@ -125,8 +125,13 @@ docker run -d --name local-search --restart unless-stopped --gpus all \
 - **Non-root**: the entrypoint runs as root only to prepare volumes, then drops
   to `PUID:PGID` (default `1000:1000`). Match a bind-mounted host directory with
   `docker build -f docker/Dockerfile --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .`
-- **GPU**: `--gpus all` requires nvidia-container-toolkit. Without it, drop the
-  flag and the ONNX runtime falls back to CPU (logged).
+- **GPU**: `--gpus all` requires nvidia-container-toolkit. Without it the ONNX
+  runtime falls back to CPU, logged as `CUDA execution provider unavailable …
+  libcuda.so.1: cannot open shared object file` — libcuda is the *host* driver,
+  so that message means the container has no GPU access rather than a missing
+  package. Check with `docker run --rm --gpus all <image> nvidia-smi`; if GPU
+  access is not possible, expect CPU throughput (see the EG2 numbers in
+  examples/eg2_bench.rs: roughly 16x slower text, 9-16x slower images).
 - **Single writer**: SQLite is single-writer. Run the ingest container to
   completion before/around serving; do not run two ingests at once.
 - Health: the image healthcheck polls `GET /health` on `${LS_ADDR}`.

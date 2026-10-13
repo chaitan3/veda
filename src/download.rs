@@ -340,7 +340,8 @@ async fn fetch_asset(client: &reqwest::Client, asset: &Asset) -> Result<bool> {
     }
 
     let mut last = String::new();
-    for url in &asset.urls {
+    let mirrors = asset.urls.len();
+    for (i, url) in asset.urls.iter().enumerate() {
         match download(client, url, &asset.dest).await {
             Ok(()) => {
                 println!("  > {}", asset.dest.display());
@@ -348,7 +349,13 @@ async fn fetch_asset(client: &reqwest::Client, asset: &Asset) -> Result<bool> {
             }
             Err(e) => {
                 last = e.to_string();
-                tracing::warn!(url = %url, error = %e, "download failed; trying next mirror");
+                // Only announce a retry when there is another mirror to try;
+                // otherwise the outcome line below says what happened.
+                if i + 1 < mirrors {
+                    tracing::warn!(url = %url, error = %e, "download failed; trying next mirror");
+                } else {
+                    tracing::debug!(url = %url, error = %e, "download failed");
+                }
             }
         }
     }

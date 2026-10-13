@@ -44,13 +44,20 @@ pub fn log_execution_provider() {
             }
         }
 
+        #[allow(unused_mut)]
+        let mut gpu = !matches!(choice, docling_onnx::Ep::Cpu);
         #[cfg(feature = "cuda")]
-        if !matches!(choice, docling_onnx::Ep::Cpu) {
-            probe_cuda();
+        if gpu {
+            // Registration is the only reliable signal: a provider that loads
+            // but cannot run (missing driver/runtime libs) must not count.
+            gpu = probe_cuda();
         }
-
         #[cfg(not(feature = "cuda"))]
-        tracing::info!("built without the 'cuda' feature; ONNX runs on CPU");
+        {
+            gpu = false;
+            tracing::info!("built without the 'cuda' feature; ONNX runs on CPU");
+        }
+        let _ = GPU_ACTIVE.set(gpu);
     }
 }
 
@@ -82,13 +89,23 @@ fn set_default(name: &str, value: &str) {
     }
 }
 
-/// Whether the resolved execution provider is a GPU. Used to pick GPU-safe
+/// The outcome of the startup CUDA probe: `true` only when the CUDA execution
+/// provider actually registered. Set by [`log_execution_provider`]; until then
+/// the resolved choice is the best guess.
+static GPU_ACTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether ONNX is *actually* running on the GPU. Used to pick GPU-safe
 /// defaults (code/formula enrichment off, since CodeFormulaV2's fp32 models do
-/// not fit alongside the rest of the pipeline on a modest card).
+/// not fit alongside the rest of the pipeline on a modest card). A requested
+/// CUDA provider that failed to register counts as "no GPU": otherwise a
+/// container without `--gpus all` gets GPU-only defaults on a CPU fallback.
 pub fn gpu_selected() -> bool {
     #[cfg(any(feature = "docling-extract", feature = "onnx-embed"))]
     {
-        !matches!(docling_onnx::choice(), docling_onnx::Ep::Cpu)
+        GPU_ACTIVE
+            .get()
+            .copied()
+            .unwrap_or_else(|| !matches!(docling_onnx::choice(), docling_onnx::Ep::Cpu))
     }
     #[cfg(not(any(feature = "docling-extract", feature = "onnx-embed")))]
     {
@@ -124,8 +141,8 @@ fn maybe_disable_cuda() -> bool {
         return false;
     }
     tracing::warn!(
-        "CUDA is compiled in but the CUDA runtime (libcudnn) is not loadable — \
-         cuDNN 9 (and the CUDA runtime matching the ONNX Runtime build) is required. \
+        "CUDA is compiled in but the CUDA runtime is not loadable — libcuda.so.1 \
+         (host driver; `--gpus all` in a container) and cuDNN 9 are required. \
          Falling back to CPU for ONNX inference."
     );
     // SAFETY: startup-time, single-threaded; nothing has read the provider
@@ -137,11 +154,18 @@ fn maybe_disable_cuda() -> bool {
 /// True when the CUDA runtime ONNX Runtime needs is loadable.
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 fn cuda_runtime_available() -> bool {
-    // ORT's CUDA EP dlopens cuDNN lazily at kernel execution; probe it now.
-    // cuDNN 9 is what the ORT 1.28 line requires.
-    ["libcudnn.so.9", "libcudnn.so"]
+    // Both halves are required:
+    //  - libcuda.so.1 is the *driver* library, supplied by the host (inside a
+    //    container: `--gpus all` / nvidia-container-toolkit). Without it ORT's
+    //    CUDA provider library cannot even be dlopen'd, so a container that
+    //    has cuDNN baked in but no GPU access would otherwise look "available".
+    //  - cuDNN 9 is what the ORT 1.28 line requires, loaded lazily at kernel
+    //    execution.
+    let driver = ["libcuda.so.1", "libcuda.so"].iter().any(|n| dlopen_ok(n));
+    let cudnn = ["libcudnn.so.9", "libcudnn.so"]
         .iter()
-        .any(|name| dlopen_ok(name))
+        .any(|n| dlopen_ok(n));
+    driver && cudnn
 }
 
 #[cfg(all(feature = "cuda", not(target_os = "linux")))]
@@ -176,18 +200,41 @@ fn dlopen_ok(name: &str) -> bool {
     feature = "cuda",
     any(feature = "docling-extract", feature = "onnx-embed")
 ))]
-fn probe_cuda() {
+fn probe_cuda() -> bool {
     use ort::ep::{ExecutionProvider as _, cuda::CUDA};
     match ort::session::Session::builder() {
         Ok(mut builder) => match CUDA::default().register(&mut builder) {
-            Ok(()) => tracing::info!("CUDA execution provider registered; GPU inference enabled"),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "CUDA execution provider unavailable; ONNX sessions will fall back to CPU"
-            ),
+            Ok(()) => {
+                tracing::info!("CUDA execution provider registered; GPU inference enabled");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CUDA execution provider unavailable; ONNX sessions will fall back to CPU \
+                     (in a container this usually means it was started without `--gpus all` \
+                     or nvidia-container-toolkit is missing)"
+                );
+                false
+            }
         },
         Err(e) => {
-            tracing::warn!(error = %e, "could not create an ONNX session builder to probe CUDA")
+            tracing::warn!(error = %e, "could not create an ONNX session builder to probe CUDA");
+            false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A requested-but-unavailable CUDA provider must not be reported as a GPU
+    /// (that is what made a CPU-only container disable CodeFormulaV2 and log
+    /// "GPU execution selected").
+    #[test]
+    fn gpu_selected_follows_the_probe_result() {
+        let _ = GPU_ACTIVE.set(false);
+        assert!(!gpu_selected());
     }
 }
