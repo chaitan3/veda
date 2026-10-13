@@ -38,9 +38,9 @@ Read-only: nothing indexed here can be modified through these tools.
 ## Procedure
 
 1. **Check availability once per session** (skip if you already know it's up):
-   run `python3 agent_rag_tools.py stats` — or call `corpus_stats()`. Note
-   `documents`/`chunks` counts. If unreachable, tell the user the `serve`
-   process isn't running; do not retry silently in a loop.
+   call `is_healthy()` (public `GET /health`, no key needed), then
+   `corpus_stats()` for the `documents`/`chunks` counts. If unreachable, tell
+   the user the `serve` process isn't running; do not retry silently in a loop.
 2. **Search** with `search_documents(query=…)`:
    - default to `mode="hybrid"` (semantic + keyword fused);
    - use `mode="bm25"` for exact identifiers, error codes, quoted phrases;

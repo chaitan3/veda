@@ -209,8 +209,10 @@ def corpus_stats() -> dict:
 
 
 def is_healthy() -> bool:
+    """Liveness probe — `GET /health`, which is public and needs no API key
+    (unlike `corpus_stats`, which is authenticated)."""
     try:
-        return corpus_stats().get("status") == "ok"
+        return _request("GET", "/health").get("status") == "ok"
     except Exception:
         return False
 
