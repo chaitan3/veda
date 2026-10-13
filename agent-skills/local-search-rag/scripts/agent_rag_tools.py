@@ -2,7 +2,7 @@
 """Tool wrappers over the local-search HTTP API, shaped for agent tool-calling.
 
 Every function maps 1:1 to an endpoint of the read-only service (see
-docs/PRODUCTION.md). Nothing here mutates the corpus: ingest stays CLI-side,
+docs/ARCHITECTURE.md). Nothing here mutates the corpus: ingest stays CLI-side,
 so these tools are safe to hand to an LLM agent.
 
 Configuration (environment):

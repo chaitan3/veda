@@ -6,6 +6,10 @@ are the harness that decides whether an embedding change (EG2 text/vision, a
 different chunker, a different budget) actually improves retrieval — benchmark
 numbers from model cards are a prior, not a measurement of *this* corpus.
 
+See also: [ARCHITECTURE.md](ARCHITECTURE.md) (the retrieval channels being
+measured) and [DEBUGGING.md](DEBUGGING.md) (cost numbers for the same
+configurations).
+
 ## Quick start
 
 ```bash

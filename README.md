@@ -1,340 +1,240 @@
 # local-search
 
-A local, single-user **text + image search service** over a store of documents
-and images. Ingestion runs as a CLI tool; a read-only HTTP service answers
-search queries. Results fuse keyword (SQLite FTS5 / BM25) and dense vector
-search with Reciprocal Rank Fusion.
+A local, single-user **text + image search service** over your own documents and
+images. Ingest is a CLI tool; a read-only HTTP API answers queries. Results fuse
+keyword search (SQLite FTS5 / BM25) with dense vector search using Reciprocal
+Rank Fusion, and standalone images are searchable by text or by example image.
 
-The design mirrors [docling-rag](https://github.com/docling-project/docling.rs)
-closely — same module layout, same `Embedder` / `VectorStore` / `Retriever`
-seams — while the data model is shaped for the image channel from day one.
+Everything runs on your machine: the default pipeline is local ONNX (docling for
+conversion, bge-small/SigLIP2 for embeddings, optionally EmbeddingGemma 2),
+with no external services required.
 
-## Status
+- **Ingest** PDFs, Office files, HTML, Markdown, text and standalone images.
+- **Search** with four modes — `hybrid` (default), `vector`, `bm25`, `image` —
+  plus query-by-image and file-name matching.
+- **Measure** retrieval quality on your own corpus (`eval` / `eval-gen`).
+- **Serve** a small read-only JSON API with optional API keys and an optional
+  scheduled re-ingest.
 
-**Working:**
+Where to go next: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how it works),
+[docs/EVAL.md](docs/EVAL.md) (measuring quality),
+[docs/DEBUGGING.md](docs/DEBUGGING.md) (logs, performance, troubleshooting).
 
-- **Extraction** via docling.rs: PDF (text layer + layout + TableFormer tables
-  + CodeFormulaV2 code/formula enrichment), DOCX, and PNG/JPEG/… via **OCR**,
-  using the local ONNX pipeline by default or the optional remote **VLM**
-  pipeline.
-- **Execution provider**: CUDA when usable, with an automatic CPU fallback that
-  is reported in the log (see below).
-- **Embeddings**: in-process ONNX text encoders (default bge-small-en-v1.5, or
-  **EmbeddingGemma 2** — 768-d, multilingual, task-prefixed), an
-  OpenAI-compatible llama.cpp endpoint, or a deterministic `hash` embedder.
-  Images get **SigLIP2** (shared image+text space) or **EmbeddingGemma 2
-  vision**; with EG2 on both sides text and images share **one** space and
-  **one** vector index.
-- **Store**: SQLite (documents + chunks + FTS5 + `vec0` vector space(s)), WAL,
-  corpus versioning, per-document stage fingerprints.
-- **Retrieval**: dense KNN over `vec0`, BM25 (FTS5), Hybrid via RRF, and
-  `mode=image` (a kind filter in the unified layout, a second index otherwise);
-  query-by-image. Hybrid also matches **document names**: a query hitting a
-  title or source path contributes that document's chunks, so "find the file
-  called X" works through search (including image-only documents).
-- **Evaluation**: `eval` scores a gold set (recall@k / MRR / nDCG@k per mode)
-  and `eval-gen` mines one from the corpus — the way to compare embedders on
-  *your* data (docs/EVAL.md).
-- **Chunking**: `hybrid` (default) and `hierarchical` via docling's
-  structure-aware chunkers, plus `window` (and the plain-text fallback).
-- **CLI**: `init-db`, `ingest` (`--sync`, `--force`, `--stages`), `query`,
-  `query-image`, `eval`, `eval-gen`, `stats`, `prune`, `download-models`,
-  `serve`.
-- **Service**: `/api/search`, `/api/search/image`, `/api/stats`,
-  `/api/documents`, `/api/documents/{id}`, `/api/media/{chunk_id}`, `/health`;
-  optional API-key auth; optionally **scheduled ingest** while it serves
-  (`LS_INGEST_INTERVAL`).
+## Requirements
 
-**Not yet:** PDF figure extraction, image captioning, Multi-Query/HyDE.
+- **Rust** (edition 2024 toolchain) to build.
+- **Disk**: ~2 GB for the default model set (docling assets + bge-small +
+  SigLIP2); ~4 GB if you also fetch EmbeddingGemma 2.
+- **GPU** (optional): a CUDA 13 + cuDNN 9 runtime for GPU inference. Without it
+  the binary falls back to CPU automatically (slower — see
+  [DEBUGGING.md](docs/DEBUGGING.md#performance)).
+- Linux is the supported platform; PDF rasterization uses a bundled pdfium
+  build fetched with the models.
 
-## Quick start
-
-```bash
-cp .env.example .env            # optional; every key has a default
-
-# 1. fetch the local model set (docling assets + bge-small + SigLIP2, ~2 GB;
-#    add EmbeddingGemma 2 with LS_EMBED_PROVIDER=eg2 / LS_IMAGE_EMBED_PROVIDER=eg2
-#    — `download-models` fetches those too)
-cargo run --release -- download-models
-
-# 2. create the schema and ingest a folder
-cargo run --release -- init-db
-cargo run --release -- ingest ./docs ./more-docs
-cargo run --release -- ingest ./docs ./more-docs --sync   # also drop deleted files
-cargo run --release -- ingest --stages text_embed         # re-embed text only
-cargo run --release -- prune                  # drop docs with no chunks
-
-# 3. query (text, or by example image)
-cargo run --release -- query "mountain lake" --mode hybrid --limit 5
-cargo run --release -- query-image ./photos/sunset.jpg --limit 5
-
-# 3b. measure retrieval (gold set mined from the corpus; see docs/EVAL.md)
-cargo run --release -- eval-gen --out eval/queries.jsonl
-cargo run --release -- eval --queries eval/queries.jsonl --k 1,5,10
-
-# 4. serve the read-only API
-cargo run --release -- serve
-# ...optionally re-ingesting the source folders on a schedule (catch-up run
-# at startup, then every interval; LS_INGEST_SYNC=true also prunes removed
-# files):
-# LS_INGEST_INTERVAL=24h cargo run --release -- serve
-curl 'localhost:8080/api/search?query=mountain+lake&limit=5'
-```
-
-Default end-to-end is fully local/ONNX: docling's ONNX extraction plus the
-in-process bge-small embedder. No network or extra services needed after
-`download-models`.
-
-### Docker
-
-The image compiles the binary inside NVIDIA's CUDA 13 + cuDNN 9 image (so the
-glibc matches) and downloads the models into a volume on first run. GPU runs
-need [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/).
-
-```bash
-docker build -f docker/Dockerfile -t local-search .
-
-# or use the wrapper: builds nothing, just runs with the standard mounts
-# (documents/ + photos/ + data/ + models/ + config/, from the repo root)
-./docker/run-container.sh
-
-# ingest (one-shot; shares the data + model volumes with the server)
-docker run --rm --gpus all \
-  -v local-search-data:/data -v local-search-models:/models \
-  -v /host/documents:/documents:ro local-search ingest
-
-# serve
-docker run -d --name local-search --gpus all -p 8080:8080 \
-  -v local-search-data:/data -v local-search-models:/models \
-  -v /host/documents:/documents:ro local-search serve
-```
-
-Volumes: `/data` (SQLite DB), `/models` (downloaded model tree), `/documents`
-(ingest source), `/config` (optional `.env`). Drop `--gpus all` for a CPU-only
-host. Build with `--build-arg PUID=$(id -u) --build-arg PGID=$(id -g)` to match
-bind-mounted host directories. See `docker/.env.example` and
-[`docs/PRODUCTION.md`](docs/PRODUCTION.md).
-
-
-`ingest` logs each file with its extraction method and chunker, then prints a
-per-type summary of files, chunks and elapsed time:
-
-```text
-INFO ingesting name="report.pdf" method=docling-onnx chunker=hybrid bytes=868
-INFO ingested  name="report.pdf" chunks=1 secs=1.99
-
-summary by type:
-  type       files  chunks   skip   fail       time
-  docx           1       1      0      0      0.10s
-  md             1       1      0      0      0.01s
-  pdf            1       1      0      0      1.99s
-  png            1       1      0      0      1.33s
-  total          4       4      0      0      3.43s
-```
-
-## Architecture
-
-```
-source folder ──ingest CLI──▶ docling convert → chunk → embed → SQLite (docs/chunks/FTS5/vec0)
-        ▲                                                             ▲
-        └── serve can schedule the same ingest (LS_INGEST_INTERVAL)   │
-                                             serve ──▶ /api/search (vector + bm25 → RRF)
-```
-
-- **Documents vs images.** One `Document` (asset) fans out to many `Chunk`
-  fragments. A chunk is `text` or `image`; an image chunk is a standalone image
-  file (content-addressed), served from its source on demand.
-- **One space or two.** By default text (bge, 384-d) and images (SigLIP2,
-  768-d) live in two `vec0` tables and a text query reaches images through
-  SigLIP's shared space. With `LS_EMBED_PROVIDER=eg2` **and**
-  `LS_IMAGE_EMBED_PROVIDER=eg2` both sides produce the same 768-d space, the
-  two tables become **one**, the query is embedded once, and `mode=image` is a
-  kind filter. `/api/stats` reports which layout is active (`image_space`).
-- **Stage-scoped ingest.** Each document records a fingerprint per stage
-  (`extract` / `text_embed` / `image_embed`); `ingest` re-runs only the stages
-  whose configuration or models changed. `--stages` targets specific stages and
-  `--force` forces just those.
-- **Ingest is separate — unless you schedule it.** The `ingest` CLI is the
-  primary path; `serve` can also re-ingest on an interval
-  (`LS_INGEST_INTERVAL`, one background task, one run at a time). Either way
-  every successful ingest bumps a `corpus_version`, the seam for cross-process
-  cache invalidation.
-- **Docling config passthrough.** `DOCLING_*` / `DOCLING_RS_*` are read by
-  docling directly; only RAG-layer settings use `LS_*`.
-
-## Configuration
-
-See `.env.example` for the full list. Key RAG-layer settings:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `LS_DB_PATH` | `data/local-search.db` | SQLite database |
-| `LS_SOURCE_PATH` | `docs` | folder(s) the ingest CLI walks; path-separated |
-| `LS_MODELS_DIR` | `.models` | model tree; fans out to docling's `DOCLING_*` vars |
-| `LS_EXTRACT_PIPELINE` | `onnx` | `onnx` (local) or `vlm` (remote, llama.cpp) |
-| `LS_EXTRACT_CODE_FORMULA` | `true` on CPU / `false` on CUDA | CodeFormulaV2 code/formula enrichment (skipped if models absent) |
-| `LS_EMBED_PROVIDER` | `onnx` | `onnx` \| `eg2` \| `llamacpp` \| `hash` |
-| `LS_IMAGE_EMBED_PROVIDER` | `siglip` | `siglip` \| `eg2` \| `off` \| `hash` — `eg2` + `eg2` unifies the two spaces |
-| `LS_EMBED_DIM` | per provider (`384` onnx, `768` eg2) | overrides the index dimension; warns when it disagrees with the provider |
-| `LS_IMAGE_SOFT_TOKENS` | `280` | EG2 vision budget per image: `70`\|`140`\|`280`\|`560`\|`1120` (quality vs compute) |
-| `LS_INGEST_INTERVAL` | — | `serve` re-ingests every interval (`24h`, `30m`, `90s`); unset = manual |
-| `LS_INGEST_SYNC` | `false` | scheduled runs also drop documents whose source files disappeared |
-| `LS_ONNX_MODEL` | `.models/embed/bge-small-en-v1.5.onnx` | ONNX embedder graph |
-| `LS_ONNX_TOKENIZER` | `.models/embed/tokenizer.json` | ONNX embedder tokenizer |
-| `LS_EG2_TEXT_MODEL` | `.models/eg2/text/model.onnx` | EG2 text graph |
-| `LS_EG2_TOKENIZER` | `.models/eg2/tokenizer.json` | EG2 tokenizer |
-| `LS_EG2_VISION_MODEL` | `.models/eg2/vision/vision_encoder.onnx` | EG2 vision graph |
-| `LS_EG2_PROCESSOR` | `.models/eg2/processor_config.json` | EG2 patch grid / budget |
-| `LS_LLAMACPP_URL` | `http://127.0.0.1:8080/v1` | OpenAI-compatible embeddings |
-| `LS_EMBED_MODEL` | — | model name for `llamacpp` |
-| `LS_CHUNKER` | `hybrid` | `hybrid` \| `hierarchical` \| `window` |
-| `LS_RRF_K` | `60` | RRF constant |
-| `LS_ADDR` | `127.0.0.1:8080` | bind address |
-| `LS_API_KEYS` | — | comma-separated keys; empty disables auth |
-
-### Models
-
-`download-models` fetches docling's native assets (pdfium + layout / PP-OCR /
-TableFormer ONNX) from the docling.rs releases and the embedders from Hugging
-Face into `.models/` and `.pdfium/`: bge-small-en-v1.5 (text, default),
-SigLIP2 (images, default) and EmbeddingGemma 2 (text + vision, ~1.8 GB fp32,
-used by the `eg2` providers). Mirrors: `DOCLING_RS_MODELS_URL`,
-`LS_ONNX_MODELS_URL`, `LS_IMAGE_MODELS_URL`, `LS_EG2_MODELS_URL`. `--no-embed`
-/ `--no-image` / `--no-enrich` / `--no-eg2` skip the text, image,
-code/formula and EmbeddingGemma 2 sets (the container entrypoint passes
-`--no-eg2` unless a provider is set to `eg2`, so default installs stay ~2 GB).
-
-EmbeddingGemma 2 runs **fp32 only** — its model card is explicit that fp16
-returns NaN or silently degraded embeddings.
-
-Docling honours its own per-model overrides — `DOCLING_LAYOUT_ONNX`,
-`DOCLING_OCR_REC_ONNX` / `DOCLING_OCR_DICT`, `DOCLING_TABLEFORMER_*`,
-`DOCLING_RS_OCR_LANG`, `DOCLING_RS_EP`, `DOCLING_RS_FP32`,
-`DOCLING_CHUNK_TOKENIZER` — all unchanged.
-
-### Execution provider (CUDA)
-
-The default build compiles the **CUDA** execution provider and uses docling's
-`auto` selection, so ONNX inference prefers the GPU. It needs a CUDA runtime and
-**cuDNN 9** that match the ONNX Runtime build `ort` downloads (on this machine:
-CUDA 13 + cuDNN 9). If `libcudnn.so` is not loadable, the provider is pinned to
-CPU before any inference and the fallback is logged:
-
-```text
-WARN CUDA is compiled in but the CUDA runtime (libcudnn) is not loadable —
-     CUDA 12 + cuDNN 9 are required. Falling back to CPU for ONNX inference.
-INFO ONNX execution provider (CPU fallback) resolved=Cpu
-```
-
-Setting `DOCLING_RS_EP=cpu` (or `cuda`) explicitly overrides the automatic
-choice; an explicit value is always respected.
-
-### VLM extraction
-
-```bash
-LS_EXTRACT_PIPELINE=vlm
-DOCLING_RS_VLM_ENDPOINT=http://127.0.0.1:8080/v1
-DOCLING_RS_VLM_MODEL=<your-vlm>
-```
-
-Docling renders each page and sends it to the OpenAI-compatible endpoint; the
-returned markup is parsed back into a document. Pages that fail fail the
-document (no silent drops).
-
-## API
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | liveness only (`{"status":"ok"}`), public — corpus details are at `/api/stats` |
-| GET | `/api/search?query=&mode=&limit=` | search (`vector` \| `bm25` \| `hybrid` \| `image`) |
-| POST | `/api/search` | `{"query","mode","limit"}` |
-| GET | `/api/stats` | counts, embedders, active vector layout (`image_space`), extraction pipeline, corpus version |
-| GET | `/api/documents?offset=&limit=&query=` | stored documents (paged; `query` = case-insensitive title/path substring) |
-| GET | `/api/documents/{id}?offset=&limit=` | one document + a bounded, pageable chunk slice |
-| POST | `/api/search/image` | query-by-image: `{"image_base64","limit"}` (needs `LS_IMAGE_EMBED_PROVIDER`) |
-| GET | `/api/media/{chunk_id}` | bytes of an image chunk (from its source document) |
-
-Each search hit carries its `chunk` (including the `ordinal`), its `score`, and
-a hydrated `document` reference (`id`, `title`, `source_uri`, `created_at`), so
-results are self-contained and citable in one call. The reference is
-deliberately compact: `metadata` — which can embed the full converted text — and
-the internal content hash are never sent.
-
-Unknown or stale request options are **rejected** (`400` for query parameters,
-`422` for JSON bodies) rather than ignored, so a typo or a renamed option is
-visible instead of silently changing behaviour.
-
-`/api/documents/{id}` is the **single expansion call**: with no params it returns
-the first 20 chunks, and callers page with `offset`/`next` (capped at 100). An
-offset past the end returns an empty `chunks` list, not an error — so a caller
-can always pass `offset = ordinal - radius` for context around a hit.
-
-Auth is disabled unless `LS_API_KEYS` is set; then send `X-Api-Key`,
-`Authorization: Bearer`, or `?api_key=`.
-
-## Deployment
-
-See [`docs/PRODUCTION.md`](docs/PRODUCTION.md) for the package contents, config,
-systemd unit, backups and upgrade path. Package a release build with:
+## Build
 
 ```bash
 cargo build --release
-scripts/package.sh dist/local-search
+# GPU-less build (no CUDA provider):
+cargo build --release --no-default-features --features docling-extract,onnx-embed
 ```
 
-`scripts/local-search.service` is a systemd unit template. Upgrades need no
-database reset: each document records a per-stage fingerprint, so `ingest`
-re-runs only the stages whose configuration or models changed.
+## Run
 
-## Notes
+```bash
+cp .env.example .env      # optional — every setting has a default
 
-- **Unified space (EG2 both sides).** Text and images are embedded by one model
-  into one 768-d space and one vector index: the query is embedded once and
-  matches both, `mode=vector`/`hybrid` return text *and* images, `mode=image`
-  is a kind filter, and no second copy of the text graph is loaded. Switching
-  the layout (or the dimension) drops the vector tables and forgets the embed
-  stages, so a plain re-ingest re-embeds without re-extracting. EmbeddingGemma 2
-  is ~4.6x slower than bge for text and ~5-28x slower than SigLIP2 for images
-  (budget dependent) — see `examples/eg2_bench.rs` for measured numbers, and
-  `docs/EVAL.md` for how to check what that buys on your corpus.
-- **File names in search.** `mode=hybrid` contributes the chunks of any
-  document whose title or source path contains the query, so a file-name query
-  finds the document (and an image-only document's image chunk) directly.
-  `GET /api/documents?query=` remains the precise name lookup; `mode=bm25` and
-  `mode=vector` search content only.
-- **Scheduled ingest.** `serve` with `LS_INGEST_INTERVAL` (e.g. `24h`) ingests
-  once at startup and then every interval, in one background task; a failed
-  run is logged and retried next tick. Queries stay available throughout.
-  `LS_INGEST_SYNC=true` also drops documents whose files disappeared.
-- **Image search** (SigLIP2, images only for now): **on by default**
-  (`LS_IMAGE_EMBED_PROVIDER=siglip`; set `off` to disable). Standalone
-  PNG/JPG/… get an image chunk in a shared image+text space, so `mode=hybrid`
-  text queries also match images, `mode=image` returns image hits only, and
-  `POST /api/search/image` does query-by-image. Image chunks carry a
-  `media_url` served by `GET /api/media/{chunk_id}` (from the source file;
-  nothing is stored). PDF figure extraction is not implemented yet.
-- **Code/formula enrichment** (CodeFormulaV2): on by default on **CPU**, off
-  when the provider resolves to **CUDA** (`LS_EXTRACT_CODE_FORMULA`). Requires
-  the models fetched by `download-models`; if they're missing the pass is
-  skipped with a warning. Set `LS_EXTRACT_CODE_FORMULA=true` to force it on.
-- **Runtime defaults** (all overridable): `DOCLING_RS_OCR_ORIENTATION=off`
-  (the orientation pass re-runs the recognizer over rotated hypotheses and is a
-  large share of OCR time), and on CUDA `DOCLING_RS_PDF_WORKERS=1` (parallel
-  page workers each build their own CUDA sessions and exhaust GPU memory). Set
-  either explicitly to opt back in. A vendored `docling-onnx` patch additionally
-  applies memory-friendly CUDA defaults (HEURISTIC conv search, capped
-  workspace, `SameAsRequested` arenas) — see `vendor/docling-onnx` and
-  `docs/PRODUCTION.md`.
-- `LS_EMBED_PROVIDER=hash` is deterministic but **not semantic** — for smoke
-  tests only.
-- BM25 scores are zero on very small corpora (FTS5's IDF collapses); ranking
-  still works and the vector channel compensates.
-- The vector index is a `sqlite-vec` `vec0` table (`distance_metric=cosine`),
-  sized by `LS_EMBED_DIM`. It must match the embedder's output; a mismatch is
-  reported at ingest/search. Changing embedder or dimension requires
-  re-ingesting (opening an older database rebuilds the index from the stored
-  embeddings automatically).
-- The llama.cpp server must run in embedding mode for `/v1/embeddings`;
-  query/document prefixes are applied client-side.
-- `examples/rasterize.rs` and `examples/docling_dump.rs` are test helpers, not
-  product surface.
+# 1. fetch the local model set into .models/ (idempotent; re-run after upgrades)
+cargo run --release -- download-models
+
+# 2. create the schema, then ingest one or more folders
+cargo run --release -- init-db
+cargo run --release -- ingest /path/to/documents
+
+# 3. search from the CLI
+cargo run --release -- query "boiler feedwater drum level" --mode hybrid --limit 5
+cargo run --release -- query-image ./photos/pump.jpg --limit 5
+
+# 4. serve the read-only API
+cargo run --release -- serve
+curl 'localhost:8080/api/search?query=boiler+feedwater&limit=5'
+```
+
+`ingest` prints a per-file line and a per-type summary:
+
+```text
+INFO ingesting name="report.pdf" method=docling-onnx chunker=hybrid
+INFO ingested  name="report.pdf" chunks=12 secs=7.31 extract="fingerprint-missing"
+
+summary by type:
+  type       files  chunks   skip   fail       time
+  pdf            1      12      0      0      7.31s
+  total          1      12      0      0      7.31s
+```
+
+Re-running `ingest` is cheap: unchanged files are skipped by content hash, and
+only the stages whose configuration changed re-run (see
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#stage-scoped-ingest)). The service and the
+CLI can run at the same time — the database is in WAL mode and each document is
+committed as it finishes, so queries see the corpus grow.
+
+### Common commands and flags
+
+| command | what it does |
+|---|---|
+| `ingest <paths…>` | ingest one or more folders (or use `LS_SOURCE_PATH`) |
+| `ingest --sync` | also delete documents whose files disappeared — **scoped to the roots given on the command line** |
+| `ingest --force` | re-run the targeted stages even if their fingerprint matches |
+| `ingest --stages extract,text_embed,image_embed` | run only some stages (e.g. re-embed text after switching the text model) |
+| `query "<text>" --mode hybrid\|vector\|bm25\|image --limit N` | search text |
+| `query-image <file> --limit N` | search by an example image |
+| `eval --queries gold.jsonl --modes hybrid,vector,bm25 --k 1,5,10` | score retrieval quality |
+| `eval-gen --out eval/queries.jsonl` | mine a gold set from the corpus |
+| `stats` | corpus counts, embedders, active vector layout, fingerprints |
+| `prune` | drop documents left with no chunks (interrupted ingests) |
+| `download-models [--no-embed\|--no-image\|--no-enrich\|--no-eg2]` | fetch the model set |
+| `serve` | run the read-only API (see below for the optional scheduler) |
+
+Ingest exits with code **2** if any file failed (the errors are in the log).
+
+## Configuration
+
+Settings are environment variables (all prefixed `LS_`, except docling's own
+`DOCLING_*` / `DOCLING_RS_*`, which are passed through unchanged). `dotenvy`
+also loads `.env` from the working directory; **real environment variables win
+over the file**, which matters in containers (see the Docker section).
+
+[`.env.example`](.env.example) documents every option with defaults — it is the
+reference. The settings you are most likely to touch:
+
+| variable | default | purpose |
+|---|---|---|
+| `LS_SOURCE_PATH` | `docs` | folders the ingest CLI walks (path-separated) |
+| `LS_DB_PATH` | `data/local-search.db` | SQLite database (all state) |
+| `LS_ADDR` | `127.0.0.1:8080` | API bind address |
+| `LS_API_KEYS` | — | comma-separated keys; **empty disables authentication** |
+| `LS_MODELS_DIR` | `.models` | where `download-models` puts the model tree |
+| `LS_EMBED_PROVIDER` | `onnx` | text embeddings: `onnx` (bge-small, 384-d), `eg2` (EmbeddingGemma 2, 768-d, multilingual), `llamacpp`, `hash` |
+| `LS_IMAGE_EMBED_PROVIDER` | `siglip` | image embeddings: `siglip` (SigLIP2), `eg2`, `off`, `hash` |
+| `LS_IMAGE_ONLY_PATHS` | — | folders whose images are indexed **without** OCR/text chunks (photo dumps) |
+| `LS_CHUNKER` / `LS_CHUNK_SIZE` | `hybrid` / `300` | how text is split (see below) |
+| `LS_INGEST_INTERVAL` | — | `serve` re-ingests every interval (e.g. `24h`); unset = manual |
+| `LS_INGEST_SYNC` | `false` | scheduled runs also prune documents whose files disappeared |
+
+**Choosing an embedder.** The default pair (bge-small text + SigLIP2 images) is
+the cheap, well-tested option. Setting **both** to `eg2` puts text and images in
+one shared 768-d space and one vector index — a query is embedded once and
+matches both, `mode=image` becomes a filter, and cross-modal quality is markedly
+better; the cost is throughput (EmbeddingGemma 2 is ~4.6× slower for text and
+~5–28× for images than the defaults) and ~1.8 GB of extra models. Measured
+numbers: [DEBUGGING.md](docs/DEBUGGING.md#performance). Switching embedders only
+re-embeds — it never re-extracts.
+
+**Chunk size.** `LS_CHUNK_SIZE` means different things per chunker: `hybrid`
+counts *tokens*, `window` counts *words*, `hierarchical` has no budget at all.
+Anything longer than `LS_EMBED_MAX_TOKENS` (default 512) is truncated, so 300 is
+a safe default for both; dense text (logs, numbers) needs less. Check your own
+files with `cargo run --release --example chunk_audit -- file.pdf`, and set
+`LS_CHUNK_STRICT=true` to make an over-budget configuration a startup error
+instead of a warning.
+
+## Docker
+
+The image compiles the binary inside `nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04`
+so it links the same glibc as the `…-runtime-ubuntu24.04` base — do **not** copy
+a host-built binary into it.
+
+### Build
+
+```bash
+docker build -f docker/Dockerfile -t local-search .
+# match a bind-mounted host directory's ownership:
+docker build -f docker/Dockerfile --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) -t local-search .
+```
+
+### Run
+
+The wrapper script creates the mount folders and runs the service with the
+standard layout (from the repository root, any working directory):
+
+```bash
+./docker/run-container.sh
+```
+
+It is equivalent to:
+
+```bash
+# server
+docker run -d --name local-search --restart unless-stopped --gpus all \
+  -p 8080:8080 \
+  -v "$PWD/data:/data" -v "$PWD/models:/models" \
+  -v "$PWD/documents:/documents:ro" -v "$PWD/photos:/photos:ro" \
+  -e LS_SOURCE_PATH=/documents:/photos -e LS_IMAGE_ONLY_PATHS=/photos \
+  -v "$PWD/config:/config" \
+  local-search serve
+
+# one-off ingest, sharing the same volumes
+docker run --rm --gpus all \
+  -v "$PWD/data:/data" -v "$PWD/models:/models" \
+  -v "$PWD/documents:/documents:ro" local-search ingest
+```
+
+| mount | holds | notes |
+|---|---|---|
+| `/data` | SQLite database | the only mutable state; back this up |
+| `/models` | model tree | downloaded on first run; must be writable |
+| `/documents` | ingest source | mount read-only |
+| `/photos` (or any folder) | image-only source | optional; see `LS_IMAGE_ONLY_PATHS` |
+| `/config` | optional `.env` | container env vars take precedence over it |
+
+Notes for container use:
+
+- **Models**: the entrypoint runs `download-models` on every start (idempotent —
+  present files are skipped, so upgrades fetch only what's new). Set
+  `LS_SKIP_MODEL_DOWNLOAD=1` for a pre-provisioned volume or a
+  remote-VLM/llama.cpp setup. It passes `--no-eg2` unless a provider is `eg2`,
+  so the ~1.8 GB EmbeddingGemma 2 graphs are fetched only when used.
+- **GPU**: `--gpus all` requires nvidia-container-toolkit. Without it the
+  container has no GPU access and logs `CUDA execution provider unavailable …
+  libcuda.so.1` — verify with
+  `docker run --rm --gpus all local-search nvidia-smi`. Drop the flag on a
+  GPU-less host (CPU inference works, just slower).
+- **Non-root**: the entrypoint prepares volumes as root, then drops to
+  `PUID:PGID` (default `1000:1000`).
+- **Configuration**: copy [`docker/.env.example`](docker/.env.example) to the
+  mounted config directory as `.env`. Values passed with `-e` win over the file.
+- **Health**: the image healthcheck polls `GET /health`; `/api/stats` (behind
+  auth) has the details.
+- **Single writer**: SQLite allows one writer — don't run two ingests at once
+  (a scheduled ingest inside `serve` counts as one).
+
+## Deployment
+
+```bash
+cargo build --release
+scripts/package.sh dist/local-search      # binary + native libs + models + templates
+```
+
+The packaged directory is the service's working directory (docling resolves
+`.models/` and `.pdfium/` relative to the CWD). `scripts/local-search.service`
+is a systemd unit template; set `LS_DB_PATH` under `ReadWritePaths` and
+`systemctl enable --now local-search`. With `LS_INGEST_INTERVAL` set the service
+also ingests on its own (one run at a time, catch-up at startup).
+
+All state is the database, so a backup is one file:
+
+```bash
+sqlite3 /var/lib/local-search/app.db ".backup '/backup/app-$(date +%F).db'"
+```
+
+Upgrades need no database reset: schema changes are additive and per-stage
+fingerprints mean only affected stages re-run.
+
+## Status
+
+Working end to end: ingestion (docling ONNX or remote VLM), text and image
+embeddings (bge/SigLIP2 or EmbeddingGemma 2), hybrid retrieval with file-name
+matching, the read-only API with optional auth and scheduled ingest, and the
+evaluation harness. Not implemented: PDF figure extraction, image captioning,
+rerankers/Multi-Query/HyDE, a folder watcher, and metrics/graceful-shutdown
+hooks — see [ARCHITECTURE.md](docs/ARCHITECTURE.md#design-decisions-and-limits).

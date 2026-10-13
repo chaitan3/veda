@@ -84,7 +84,7 @@ COPY --from=builder /out/libonnxruntime_providers_*.so /app/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY docker/.env.example /app/.env.example
 COPY README.md /app/README.md
-COPY docs/PRODUCTION.md /app/docs/PRODUCTION.md
+COPY docs /app/docs
 
 # Numeric UID/GID the service drops to. Override to match a bind-mounted host
 # directory: docker build --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) .

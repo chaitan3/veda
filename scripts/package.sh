@@ -77,9 +77,9 @@ fi
 # 4. config + docs templates.
 [ -f "$ROOT/.env.example" ] && cp -a "$ROOT/.env.example" "$OUT/.env.example"
 [ -f "$ROOT/README.md" ] && cp -a "$ROOT/README.md" "$OUT/README.md"
-if [ -f "$ROOT/docs/PRODUCTION.md" ]; then
+if [ -d "$ROOT/docs" ]; then
   mkdir -p "$OUT/docs"
-  cp -a "$ROOT/docs/PRODUCTION.md" "$OUT/docs/PRODUCTION.md"
+  cp -a "$ROOT"/docs/*.md "$OUT/docs/"
 fi
 [ -f "$ROOT/scripts/local-search.service" ] && \
   cp -a "$ROOT/scripts/local-search.service" "$OUT/local-search.service"
@@ -98,6 +98,6 @@ Next steps on the target host:
   3. ./local-search download-models   # only if you packaged with --no-models
   4. ./local-search init-db
   5. ./local-search ingest /path/to/documents
-  6. ./local-search serve             # see docs/PRODUCTION.md
+  6. ./local-search serve             # see docs/ for architecture, eval, debugging
   7. systemd: copy ./local-search.service to /etc/systemd/system/ and adjust it
 EOF
