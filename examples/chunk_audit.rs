@@ -2,7 +2,7 @@
 // real hybrid chunker, and count each chunk's BPE tokens with the *embedder's*
 // tokenizer — i.e. exactly what the embedder will see.
 use local_search::chunk::Chunker;
-use local_search::config::Config;
+use local_search::config::{Config, EmbedProvider};
 use tokenizers::Tokenizer;
 
 #[tokio::main]

@@ -232,6 +232,25 @@ things to each):
 The embedder's `LS_EMBED_MAX_TOKENS` cap (above) is the backstop for all
 three; set `LS_CHUNK_SIZE` low enough that truncation rarely fires if you care
 about full chunk coverage.
+
+**With `LS_EMBED_PROVIDER=eg2`** (768-d, 8k-token context, fp32) the chunk
+budget and the embedder count *different* tokenizers — the chunker uses the
+chunk tokenizer (30k WordPiece), EG2 a 262k SentencePiece vocab. Measured on
+prose, EG2 tokens ≈ 0.9-1.0x the chunk-token count; on token-dense text
+(numbers, IDs, logs) EG2 can be 1.3x or more. Practical settings:
+
+- `hybrid` (default for PDF/Office): `LS_CHUNK_SIZE=300` (default) is a good
+  fit (~270 EG2 tokens); anything up to ~450 stays under the 512 window.
+- `window` (`.txt`/`.md` passthrough): counts *words*; 300 words ≈ 400-450 EG2
+  tokens for prose, so the default is near the window edge, and dense files can
+  overflow — lower it for log/data dumps.
+- Keep `LS_EMBED_MAX_TOKENS=512`: EG2's 8k context is a capability, not a
+  target — mean pooling dilutes long spans and retrieval granularity drops.
+  If you want longer chunks, raise both (e.g. chunk 600 / max 768) and measure
+  with `eval`.
+- Verify on your own files: `cargo run --release --example chunk_audit --
+  <file>` reports per-chunk token counts with the *configured* embedder's
+  tokenizer (pass a tokenizer path as a second argument to compare).
 - A **matching stage fingerprint always skips**, even when the document has no
   text chunks (scanned or blank pages): extraction is deterministic, so
   re-running it would produce no chunks again. Re-extract triggers are a
