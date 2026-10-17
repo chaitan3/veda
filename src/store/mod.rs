@@ -88,6 +88,18 @@ pub trait VectorStore: Send + Sync {
     /// Every stored `source_uri` (for `--sync` deletion sweeps).
     async fn all_source_uris(&self) -> Result<Vec<String>>;
 
+    /// Cached file identity for one source path (cheap change detection).
+    async fn source_file(&self, uri: &str) -> Result<Option<SourceFile>>;
+
+    /// Record (or refresh) a source file's size/mtime/hash and its document.
+    async fn upsert_source_file(&self, file: &SourceFile) -> Result<()>;
+
+    /// Forget a source path (the file disappeared, or failed a read).
+    async fn delete_source_file(&self, uri: &str) -> Result<()>;
+
+    /// Every cached source file (for `--sync` deletion sweeps).
+    async fn all_source_files(&self) -> Result<Vec<SourceFile>>;
+
     /// Delete one document and all of its chunks, vectors and stage rows.
     async fn delete_document(&self, doc_id: &str) -> Result<()>;
 
@@ -124,6 +136,21 @@ pub trait VectorStore: Send + Sync {
 
     /// How image vectors relate to the text space (drives retrieval wiring).
     fn image_space(&self) -> ImageSpace;
+}
+
+/// Cached file identity for cheap change detection.
+///
+/// `size` + `mtime_ns` gate the expensive path: when both match what was
+/// recorded last time, the stored `hash` is trusted and the file is not read
+/// again. `doc_id` links the path to the document its content resolved to
+/// (dedup means several paths can share one document).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceFile {
+    pub uri: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub hash: String,
+    pub doc_id: Option<String>,
 }
 
 /// How image vectors relate to the text vector space.

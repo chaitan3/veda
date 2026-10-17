@@ -10,7 +10,7 @@
 //! completion without awaiting, which is fine for a single-user local store.
 //! WAL mode lets the out-of-process ingest CLI write while the service reads.
 
-use super::{ImageSpace, VectorStore};
+use super::{ImageSpace, SourceFile, VectorStore};
 use crate::math;
 use crate::model::{Chunk, ChunkKind, Document, Scored, now_rfc3339};
 use crate::{Error, Result};
@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS document_stages (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (doc_id, stage)
 );
+
+-- Cached per-path identity: size + mtime gate the content hash so an
+-- unchanged file is never read again. doc_id links a path to the document its
+-- content resolved to (dedup: several paths can share one document).
+CREATE TABLE IF NOT EXISTS source_files (
+    uri       TEXT PRIMARY KEY,
+    size      INTEGER NOT NULL,
+    mtime_ns  INTEGER NOT NULL,
+    hash      TEXT NOT NULL,
+    doc_id    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_source_files_hash ON source_files(hash);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -692,6 +704,72 @@ impl VectorStore for SqliteStore {
         Ok(out)
     }
 
+    async fn source_file(&self, uri: &str) -> Result<Option<SourceFile>> {
+        let conn = self.lock()?;
+        let file = conn
+            .query_row(
+                "SELECT uri, size, mtime_ns, hash, doc_id FROM source_files WHERE uri = ?1",
+                params![uri],
+                |r| {
+                    Ok(SourceFile {
+                        uri: r.get(0)?,
+                        size: r.get::<_, i64>(1)? as u64,
+                        mtime_ns: r.get(2)?,
+                        hash: r.get(3)?,
+                        doc_id: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(file)
+    }
+
+    async fn upsert_source_file(&self, file: &SourceFile) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO source_files (uri, size, mtime_ns, hash, doc_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(uri) DO UPDATE SET
+                size     = excluded.size,
+                mtime_ns = excluded.mtime_ns,
+                hash     = excluded.hash,
+                doc_id   = excluded.doc_id",
+            params![
+                file.uri,
+                file.size as i64,
+                file.mtime_ns,
+                file.hash,
+                file.doc_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn delete_source_file(&self, uri: &str) -> Result<()> {
+        self.lock()?
+            .execute("DELETE FROM source_files WHERE uri = ?1", params![uri])?;
+        Ok(())
+    }
+
+    async fn all_source_files(&self) -> Result<Vec<SourceFile>> {
+        let conn = self.lock()?;
+        let mut stmt =
+            conn.prepare("SELECT uri, size, mtime_ns, hash, doc_id FROM source_files")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SourceFile {
+                uri: r.get(0)?,
+                size: r.get::<_, i64>(1)? as u64,
+                mtime_ns: r.get(2)?,
+                hash: r.get(3)?,
+                doc_id: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     async fn delete_document(&self, doc_id: &str) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -712,6 +790,10 @@ impl VectorStore for SqliteStore {
         tx.execute("DELETE FROM chunks WHERE doc_id = ?1", params![doc_id])?;
         tx.execute(
             "DELETE FROM document_stages WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
+        tx.execute(
+            "DELETE FROM source_files WHERE doc_id = ?1",
             params![doc_id],
         )?;
         tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])?;
@@ -740,7 +822,7 @@ impl VectorStore for SqliteStore {
         let conn = self.lock()?;
         conn.execute_batch(
             "DELETE FROM chunk_vectors; DELETE FROM chunks_fts; DELETE FROM chunks;
-             DELETE FROM document_stages; DELETE FROM documents;",
+             DELETE FROM document_stages; DELETE FROM source_files; DELETE FROM documents;",
         )?;
         if self.has_split_images() {
             conn.execute("DELETE FROM image_vectors", [])?;

@@ -20,6 +20,20 @@ use std::time::Instant;
 /// Largest embedding batch sent at once.
 const EMBED_BATCH: usize = 32;
 
+/// `(size, mtime_ns)` for a path, or `None` if it cannot be stat'd. Used as the
+/// cheap change gate: when both match the recorded values, the stored content
+/// hash is trusted and the file is not read again.
+fn file_stat(path: &std::path::Path) -> Option<(u64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Some((meta.len(), mtime_ns))
+}
+
 /// Which ingest stages a run targets. Reprocessing is scoped to the stages
 /// whose fingerprint changed; `--force` forces only the targeted ones.
 #[derive(Debug, Clone, Copy)]
@@ -230,19 +244,23 @@ impl Pipeline {
                 file_type(&r.name)
             };
             let started = Instant::now();
-            let bytes = match std::fs::read(&r.path) {
-                Ok(b) => b,
-                Err(e) => {
-                    report.documents_failed += 1;
-                    let stats = report.by_type.entry(kind).or_default();
-                    stats.failed += 1;
-                    stats.secs += started.elapsed().as_secs_f64();
-                    tracing::warn!(uri = %r.uri, error = %e, "cannot read file");
-                    continue;
-                }
+            // Cheap gate: a size+mtime match means the stored hash is trusted
+            // and the file is not read (nor hashed) again.
+            let stat = file_stat(&r.path);
+            let known_hash = match stat {
+                Some((size, mtime_ns)) => self
+                    .store
+                    .source_file(&r.uri)
+                    .await?
+                    .filter(|f| f.size == size && f.mtime_ns == mtime_ns)
+                    .map(|f| f.hash),
+                None => None,
             };
+            let (size, mtime_ns) = stat.unwrap_or((0, 0));
             let outcome = self
-                .ingest_bytes(&r.uri, &r.name, bytes, force, stages, image_only)
+                .ingest_bytes(
+                    &r.uri, &r.name, &r.path, size, mtime_ns, known_hash, force, stages, image_only,
+                )
                 .await;
             let secs = started.elapsed().as_secs_f64();
             let stats = report.by_type.entry(kind).or_default();
@@ -268,14 +286,21 @@ impl Pipeline {
 
         if sync {
             let stored = self.store.all_source_uris().await?;
-            let keep: std::collections::HashSet<&String> = current.iter().collect();
+            let keep: std::collections::HashSet<&str> =
+                current.iter().map(|s| s.as_str()).collect();
             for uri in stored {
                 // Only sweep documents inside the roots we just ingested, so
                 // ingesting one root never deletes another root's documents.
-                if !keep.contains(&uri) && source::uri_under_roots(&uri, &roots) {
+                if !keep.contains(uri.as_str()) && source::uri_under_roots(&uri, &roots) {
                     self.store.delete_documents_by_source(&uri).await?;
                     report.documents_deleted += 1;
                     tracing::info!(uri = %uri, "removed (source file gone)");
+                }
+            }
+            // Also forget cached source-file rows for vanished paths.
+            for f in self.store.all_source_files().await? {
+                if !keep.contains(f.uri.as_str()) && source::uri_under_roots(&f.uri, &roots) {
+                    self.store.delete_source_file(&f.uri).await?;
                 }
             }
             self.store.bump_corpus_version().await?;
@@ -297,7 +322,10 @@ impl Pipeline {
         &self,
         source_uri: &str,
         name: &str,
-        bytes: Vec<u8>,
+        path: &std::path::Path,
+        size: u64,
+        mtime_ns: i64,
+        known_hash: Option<String>,
         force: bool,
         stages: StageSet,
         image_only_folder: bool,
@@ -312,17 +340,20 @@ impl Pipeline {
             self.method_label(name)
         };
         let chunker = format!("{:?}", self.chunker.kind()).to_lowercase();
-        tracing::info!(
-            name = name,
-            uri = source_uri,
-            bytes = bytes.len(),
-            method = %method,
-            policy = if image_only { "image-only" } else { "default" },
-            chunker = %chunker,
-            "ingesting"
-        );
 
-        let hash = content_hash(&bytes);
+        // Resolve the content hash without reading the file when the cheap
+        // (size, mtime) gate matched what we recorded last time. The bytes are
+        // read lazily, only if a stage actually needs them.
+        let mut bytes: Option<Vec<u8>> = None;
+        let hash = match known_hash {
+            Some(h) => h,
+            None => {
+                let b = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+                let h = content_hash(&b);
+                bytes = Some(b);
+                h
+            }
+        };
         let fp = &self.fingerprints;
 
         // Unchanged content reuses the existing document (its id, stage rows and
@@ -356,28 +387,17 @@ impl Pipeline {
         // brand-new image-only document has nothing to drop. The reverse
         // transition needs no code here — a promoted document has no `extract`
         // fingerprint, so the normal stage logic below converts and embeds it.
-        if image_only && !stored_image_only {
-            let had_text_channel = self
+        let had_text_channel = image_only
+            && !stored_image_only
+            && (self
                 .store
                 .document_stage(&doc_id, "extract")
                 .await?
                 .is_some()
-                || self.store.count_text_chunks_for(&doc_id).await? > 0;
-            if had_text_channel {
-                self.store.replace_text_chunks(&doc_id, &[]).await?;
-                self.store.clear_document_stage(&doc_id, "extract").await?;
-                self.store
-                    .clear_document_stage(&doc_id, "text_embed")
-                    .await?;
-                did_work = true;
-                tracing::info!(
-                    name = name,
-                    "folder policy image-only; text channel dropped"
-                );
-            }
-        }
+                || self.store.count_text_chunks_for(&doc_id).await? > 0);
 
-        // --- extract: convert + chunk (coupled, since we cache no conversion)
+        // --- plan the stages before doing any work, so an up-to-date file
+        // stays silent and cheap (no "ingesting" line for a no-op).
         let has_text = self.store.count_text_chunks_for(&doc_id).await? > 0;
         let want_extract =
             !image_only && (stages.wants("extract") || (stages.wants("text_embed") && !has_text));
@@ -397,10 +417,55 @@ impl Pipeline {
         } else {
             ""
         };
+        let extract_will_run = want_extract && !extract_reason.is_empty();
+
+        let text_fp = self.store.document_stage(&doc_id, "text_embed").await?;
+        let text_will_run = !image_only
+            && (stages.wants("text_embed") || extract_will_run)
+            && (extract_will_run
+                || force_text
+                || text_fp.as_deref() != Some(fp.text_embed.as_str()));
+
+        let image_fp = self.store.document_stage(&doc_id, "image_embed").await?;
+        let image_will_run = self.image.is_some()
+            && is_image_name(name)
+            && stages.wants("image_embed")
+            && (force_image || image_fp.as_deref() != Some(fp.image_embed.as_str()));
+
+        if had_text_channel || extract_will_run || text_will_run || image_will_run {
+            tracing::info!(
+                name = name,
+                uri = source_uri,
+                bytes = size,
+                method = %method,
+                policy = if image_only { "image-only" } else { "default" },
+                chunker = %chunker,
+                "processing"
+            );
+        }
+
+        if had_text_channel {
+            self.store.replace_text_chunks(&doc_id, &[]).await?;
+            self.store.clear_document_stage(&doc_id, "extract").await?;
+            self.store
+                .clear_document_stage(&doc_id, "text_embed")
+                .await?;
+            did_work = true;
+            tracing::info!(
+                name = name,
+                "folder policy image-only; text channel dropped"
+            );
+        }
+
+        // --- extract: convert + chunk (coupled, since we cache no conversion)
         let mut extract_ran = false;
-        if want_extract && !extract_reason.is_empty() {
+        if extract_will_run {
+            if bytes.is_none() {
+                bytes = Some(std::fs::read(path).map_err(|e| Error::io(path, e))?);
+            }
+            let raw = bytes.as_ref().expect("bytes loaded above");
             let t = Instant::now();
-            let converted = convert::convert(&self.cfg, name, &bytes)?;
+            let converted = convert::convert(&self.cfg, name, raw)?;
             let parse_secs = t.elapsed().as_secs_f64();
             let t = Instant::now();
             let text_chunks = self.chunk_converted(&doc_id, &converted)?;
@@ -429,7 +494,7 @@ impl Pipeline {
             let words = converted.markdown.split_whitespace().count();
             let title = first_heading(&converted.markdown).unwrap_or_else(|| stem(name));
             let metrics = ProcessingMetrics::compute(
-                bytes.len() as u64,
+                size,
                 converted.pages,
                 words,
                 text_chunks.len(),
@@ -455,11 +520,7 @@ impl Pipeline {
         }
 
         // --- text_embed: (re)embed the stored text chunks in place
-        let text_fp = self.store.document_stage(&doc_id, "text_embed").await?;
-        let run_text = !image_only
-            && (stages.wants("text_embed") || extract_ran)
-            && (extract_ran || force_text || text_fp.as_deref() != Some(fp.text_embed.as_str()));
-        if run_text {
+        if text_will_run {
             let chunks = self.store.text_chunks(&doc_id).await?;
             let mut pairs: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
             for batch in chunks.chunks(EMBED_BATCH) {
@@ -484,31 +545,32 @@ impl Pipeline {
         }
 
         // --- image_embed: one content-addressed image chunk for an image file
-        if let Some(embedder) = &self.image
-            && is_image_name(name)
-        {
-            let image_fp = self.store.document_stage(&doc_id, "image_embed").await?;
-            if stages.wants("image_embed")
-                && (force_image || image_fp.as_deref() != Some(fp.image_embed.as_str()))
-            {
-                let mut vectors = embedder.embed_images(std::slice::from_ref(&bytes)).await?;
-                let vector = vectors
-                    .pop()
-                    .ok_or_else(|| Error::embedding("image embedder returned no vector"))?;
-                // Content-addressed id: stable across reprocessing, so the
-                // image vector is reused rather than recomputed on text changes.
-                let mut chunk = Chunk::new(&doc_id, 0, "", 0);
-                chunk.id = hash.clone();
-                chunk.kind = crate::model::ChunkKind::Image;
-                chunk.ordinal = self.store.count_text_chunks_for(&doc_id).await? as i64;
-                chunk.metadata = serde_json::json!({ "mime": image_mime(name) });
-                self.store.upsert_image_chunk(&chunk, &vector).await?;
-                self.store
-                    .set_document_stage(&doc_id, "image_embed", &fp.image_embed)
-                    .await?;
-                did_work = true;
-                n_chunks += 1;
+        if image_will_run {
+            let embedder = self
+                .image
+                .as_ref()
+                .expect("image_will_run implies a provider");
+            if bytes.is_none() {
+                bytes = Some(std::fs::read(path).map_err(|e| Error::io(path, e))?);
             }
+            let raw = bytes.as_ref().expect("bytes loaded above");
+            let mut vectors = embedder.embed_images(std::slice::from_ref(raw)).await?;
+            let vector = vectors
+                .pop()
+                .ok_or_else(|| Error::embedding("image embedder returned no vector"))?;
+            // Content-addressed id: stable across reprocessing, so the
+            // image vector is reused rather than recomputed on text changes.
+            let mut chunk = Chunk::new(&doc_id, 0, "", 0);
+            chunk.id = hash.clone();
+            chunk.kind = crate::model::ChunkKind::Image;
+            chunk.ordinal = self.store.count_text_chunks_for(&doc_id).await? as i64;
+            chunk.metadata = serde_json::json!({ "mime": image_mime(name) });
+            self.store.upsert_image_chunk(&chunk, &vector).await?;
+            self.store
+                .set_document_stage(&doc_id, "image_embed", &fp.image_embed)
+                .await?;
+            did_work = true;
+            n_chunks += 1;
         }
 
         // Image-only documents never pass through extract, which is what
@@ -528,6 +590,8 @@ impl Pipeline {
                 name = name,
                 "image-only folder but the image embedder is off; file not indexed"
             );
+            self.record_source_file(source_uri, size, mtime_ns, &hash, None)
+                .await?;
             return Ok(IngestOutcome::Skipped);
         }
 
@@ -536,7 +600,9 @@ impl Pipeline {
             // list makes the whole future non-`Send` (it would block running
             // ingest on a spawned task).
             let text_chunks = self.store.count_text_chunks_for(&doc_id).await?;
-            tracing::info!(name = name, text_chunks, "up to date; skipping");
+            tracing::debug!(name = name, text_chunks, "up to date; skipping");
+            self.record_source_file(source_uri, size, mtime_ns, &hash, Some(&doc_id))
+                .await?;
             return Ok(IngestOutcome::Skipped);
         }
 
@@ -553,7 +619,29 @@ impl Pipeline {
             },
             "ingested"
         );
+        self.record_source_file(source_uri, size, mtime_ns, &hash, Some(&doc_id))
+            .await?;
         Ok(IngestOutcome::Ingested(n_chunks))
+    }
+
+    /// Refresh the cheap-change cache for a source path.
+    async fn record_source_file(
+        &self,
+        uri: &str,
+        size: u64,
+        mtime_ns: i64,
+        hash: &str,
+        doc_id: Option<&str>,
+    ) -> Result<()> {
+        self.store
+            .upsert_source_file(&crate::store::SourceFile {
+                uri: uri.to_string(),
+                size,
+                mtime_ns,
+                hash: hash.to_string(),
+                doc_id: doc_id.map(str::to_string),
+            })
+            .await
     }
 
     /// Human-readable extraction method for a file (text passthrough vs a
