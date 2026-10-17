@@ -5,6 +5,8 @@
 //! to expose on loopback. Authentication is optional and disabled when
 //! `LS_API_KEYS` is empty.
 
+use crate::embed::Embedder;
+use crate::embed::image::ImageEmbedder;
 use crate::model::{Chunk, ChunkKind, Document, RetrievalMode, Scored};
 use crate::pipeline::Pipeline;
 use crate::store::ImageSpace;

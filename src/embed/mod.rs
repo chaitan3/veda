@@ -7,6 +7,7 @@
 //! or Gemini backend by design.
 
 pub mod hash;
+pub mod idle;
 pub mod image;
 pub mod llamacpp;
 

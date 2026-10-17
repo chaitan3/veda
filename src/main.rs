@@ -3,6 +3,8 @@
 
 use clap::{Parser, Subcommand};
 use local_search::api::AppState;
+use local_search::embed::Embedder;
+use local_search::embed::image::ImageEmbedder;
 use local_search::pipeline::StageSet;
 use local_search::{Config, Pipeline, RetrievalMode};
 use std::sync::Arc;
@@ -364,28 +366,80 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!("LS_API_KEYS is empty — API authentication is disabled");
             }
             let state = AppState {
-                pipeline,
+                pipeline: pipeline.clone(),
                 api_keys: Arc::new(cfg.api_keys.clone()),
             };
-            let ingest_pipeline = state.pipeline.clone();
             let app = local_search::api::router(state);
             let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
             println!("local-search listening on http://{}", cfg.addr);
-            // Periodic ingest (LS_INGEST_INTERVAL): starts after the listener
-            // is bound, so the API is responsive while the first catch-up run
-            // works through the corpus.
-            if let Some(interval) = cfg.ingest_interval {
+
+            // Shutdown channel: flipped by SIGINT/SIGTERM, consumed by the
+            // scheduled-ingest supervisor (which kills its child) and the
+            // graceful-shutdown future.
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+            // Periodic ingest (LS_INGEST_INTERVAL) runs in a *child process*,
+            // so serve itself never loads docling. The first run is immediate
+            // (catch-up), then every interval.
+            let supervisor = cfg.ingest_interval.map(|interval| {
                 tracing::info!(
                     secs = interval.as_secs(),
                     sync = cfg.ingest_sync,
                     sources = %cfg.source_paths.join(", "),
-                    "scheduled ingest enabled (first run now, then every interval)"
+                    "scheduled ingest enabled in a child process (first run now, then every interval)"
                 );
-                local_search::schedule::spawn(ingest_pipeline, interval, cfg.ingest_sync);
+                local_search::schedule::spawn(cfg.clone(), interval, cfg.ingest_sync, shutdown_rx)
+            });
+
+            // Release the embedding models after the idle window.
+            if cfg.embed_idle.is_some() {
+                let pipeline = pipeline.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        pipeline.reap_idle().await;
+                    }
+                });
             }
-            axum::serve(listener, app).await?;
+
+            let shutdown = async move {
+                shutdown_signal().await;
+                let _ = shutdown_tx.send(true);
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+
+            // Let the supervisor finish killing any in-flight ingest child.
+            if let Some(handle) = supervisor {
+                let _ = handle.await;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Resolve on SIGINT (Ctrl-C) or SIGTERM (docker stop / systemd).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

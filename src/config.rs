@@ -233,6 +233,10 @@ pub struct Config {
     /// Whether the scheduled run also prunes documents whose source files
     /// disappeared (`LS_INGEST_SYNC`, default off).
     pub ingest_sync: bool,
+    /// How long `serve` keeps embedding models resident after the last
+    /// embedding call (`LS_EMBED_IDLE_TIMEOUT`, default `5m`; `off` keeps them
+    /// for the process lifetime). Text and image share one idle window.
+    pub embed_idle: Option<std::time::Duration>,
     /// Turn the "chunk budget exceeds the embedder window" warning into a hard
     /// startup error (`LS_CHUNK_STRICT`, default off). Truncation is silent
     /// quality loss, so a strict deployment may prefer to refuse to start.
@@ -403,6 +407,10 @@ impl Config {
                 None => None,
             },
             ingest_sync: bool_or("LS_INGEST_SYNC", false),
+            embed_idle: match var("LS_EMBED_IDLE_TIMEOUT") {
+                Some(raw) => crate::schedule::parse_interval(&raw).map_err(Error::config)?,
+                None => Some(std::time::Duration::from_secs(300)),
+            },
             chunk_strict: bool_or("LS_CHUNK_STRICT", false),
         })
     }

@@ -5,7 +5,7 @@ use crate::chunk::Chunker;
 use crate::config::{ChunkerKind, Config, EmbedProvider, ExtractPipeline};
 use crate::convert;
 use crate::embed::image::ImageEmbedder;
-use crate::embed::{self, Embedder};
+use crate::embed::{self, Embedder, idle};
 use crate::fingerprint::{self, Fingerprints};
 use crate::metrics::{ProcessingMetrics, Timings};
 use crate::model::{Chunk, Document, RetrievalMode, Scored, content_hash, stem};
@@ -127,9 +127,9 @@ pub struct IngestReport {
 #[derive(Clone)]
 pub struct Pipeline {
     cfg: Config,
-    embedder: Arc<dyn Embedder>,
+    embedder: Arc<idle::IdleEmbedder>,
     /// Image→text embedder; `None` when the image channel is off.
-    image: Option<Arc<dyn ImageEmbedder>>,
+    image: Option<Arc<idle::IdleImageEmbedder>>,
     store: Arc<dyn VectorStore>,
     chunker: Chunker,
     /// Current per-stage fingerprints (compared against each document's rows).
@@ -175,6 +175,11 @@ impl Pipeline {
         let store = store::from_config(cfg).await?;
         let chunker = Chunker::from_config(cfg)?;
         let fingerprints = fingerprint::compute(cfg);
+        // `serve` releases the models after this idle window; the CLI does not
+        // spawn a reaper, so it keeps them for its (short) lifetime.
+        let idle = idle::IdleWindow::new(cfg.embed_idle);
+        let embedder = Arc::new(idle::IdleEmbedder::new(cfg, embedder, idle.clone()));
+        let image = image.map(|e| Arc::new(idle::IdleImageEmbedder::new(cfg, e, idle.clone())));
         Ok(Pipeline {
             cfg: cfg.clone(),
             embedder,
@@ -199,19 +204,36 @@ impl Pipeline {
         &self.store
     }
 
-    pub fn embedder(&self) -> &Arc<dyn Embedder> {
+    pub fn embedder(&self) -> &Arc<idle::IdleEmbedder> {
         &self.embedder
     }
 
     /// The image→text embedder, when the image channel is enabled.
-    pub fn image_embedder(&self) -> Option<&Arc<dyn ImageEmbedder>> {
+    pub fn image_embedder(&self) -> Option<&Arc<idle::IdleImageEmbedder>> {
         self.image.as_ref()
+    }
+
+    /// Release the embedding models if the shared idle window has elapsed.
+    /// Called periodically by `serve`; a no-op for the CLI.
+    pub async fn reap_idle(&self) {
+        self.embedder.reap().await;
+        if let Some(image) = &self.image {
+            image.reap().await;
+        }
     }
 
     /// A retriever over this pipeline's store and embedder.
     pub fn retriever(&self) -> Retriever {
-        Retriever::new(self.store.clone(), self.embedder.clone(), self.cfg.rrf_k)
-            .with_image(self.image.clone())
+        let image: Option<Arc<dyn ImageEmbedder>> = self
+            .image
+            .as_ref()
+            .map(|e| e.clone() as Arc<dyn ImageEmbedder>);
+        Retriever::new(
+            self.store.clone(),
+            self.embedder.clone() as Arc<dyn Embedder>,
+            self.cfg.rrf_k,
+        )
+        .with_image(image)
     }
 
     /// Retrieve images most similar to a query image (image→image).

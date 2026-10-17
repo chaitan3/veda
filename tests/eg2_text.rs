@@ -66,6 +66,7 @@ fn config(model: String, tokenizer: String) -> Config {
         ingest_interval: None,
         ingest_sync: false,
         chunk_strict: false,
+        embed_idle: None,
     }
 }
 

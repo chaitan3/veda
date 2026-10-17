@@ -58,6 +58,7 @@ fn config(db: &str) -> Config {
         ingest_interval: None,
         ingest_sync: false,
         chunk_strict: false,
+        embed_idle: None,
     }
 }
 

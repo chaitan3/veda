@@ -60,6 +60,7 @@ fn config(db: &str, roots: Vec<PathBuf>) -> Config {
         ingest_interval: None,
         ingest_sync: false,
         chunk_strict: false,
+        embed_idle: None,
     }
 }
 

@@ -1,51 +1,105 @@
 //! Periodic ingest while the service runs.
 //!
-//! Enabled with `LS_INGEST_INTERVAL` (e.g. `24h`): `serve` ingests once
+//! Enabled with `LS_INGEST_INTERVAL` (e.g. `24h`): `serve` runs an ingest once
 //! immediately (catch-up) and then every interval, in a single background task
-//! — one ingest at a time by construction, and errors never stop the server.
+//! — one run at a time by construction, and errors never stop the server.
 //! `LS_INGEST_SYNC=true` also drops documents whose source files disappeared
-//! (the same scope as `ingest --sync`: the configured `LS_SOURCE_PATH` roots).
+//! (the same scope as `ingest --sync`).
 //!
-//! Queries stay available throughout: SQLite is in WAL mode, each document is
-//! committed as it finishes, and the ingest task shares the warm pipeline.
+//! The ingest runs in a **separate process** (the same binary, `ingest`
+//! subcommand) rather than sharing the server's warm pipeline. That keeps
+//! docling's models and GPU memory out of `serve` entirely: the child loads
+//! them, ingests, and releases everything on exit. The child inherits the
+//! environment and CWD (so `LS_*` config and `.models/`/`.pdfium/` resolve
+//! identically), and is killed if the service shuts down mid-run.
 
-use crate::pipeline::{Pipeline, StageSet};
-use std::sync::Arc;
+use crate::config::Config;
+use crate::{Error, Result};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
-/// Spawn the scheduled-ingest task. Runs immediately, then every `interval`.
+/// Spawn the scheduled-ingest supervisor. Runs immediately, then every
+/// `interval`, until `shutdown` flips to `true`.
 pub fn spawn(
-    pipeline: Arc<Pipeline>,
+    cfg: Config,
     interval: Duration,
     sync: bool,
+    mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            if *shutdown.borrow() {
+                break;
+            }
             let started = Instant::now();
-            match pipeline.ingest_all(sync, false, StageSet::all()).await {
-                Ok(report) => tracing::info!(
-                    ingested = report.documents_ingested,
-                    skipped = report.documents_skipped,
-                    failed = report.documents_failed,
-                    deleted = report.documents_deleted,
-                    chunks = report.chunks_added,
+            match run_once(&cfg, sync, &mut shutdown).await {
+                Ok(Some(status)) => tracing::info!(
+                    code = status.code(),
                     secs = started.elapsed().as_secs_f64(),
                     "scheduled ingest finished"
                 ),
+                Ok(None) => {
+                    tracing::info!("scheduled ingest stopped (shutdown)");
+                    break;
+                }
                 Err(e) => tracing::warn!(
                     error = %e,
                     secs = started.elapsed().as_secs_f64(),
                     "scheduled ingest failed; will retry next interval"
                 ),
             }
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown.changed() => break,
+            }
         }
     })
 }
 
+/// Run one ingest in a child process, killing it if shutdown arrives mid-run.
+async fn run_once(
+    cfg: &Config,
+    sync: bool,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<std::process::ExitStatus>> {
+    let mut cmd = tokio::process::Command::new(ingest_binary()?);
+    cmd.arg("ingest");
+    cmd.args(&cfg.source_paths);
+    if sync {
+        cmd.arg("--sync");
+    }
+    cmd.stdin(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::Other(format!("spawning the ingest process: {e}")))?;
+    tokio::select! {
+        status = child.wait() => Ok(Some(
+            status.map_err(|e| Error::Other(format!("waiting for the ingest process: {e}")))?
+        )),
+        _ = shutdown.changed() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Ok(None)
+        }
+    }
+}
+
+/// The binary to run for the child ingest: `LS_INGEST_BIN` when set (tests,
+/// unusual deployments), otherwise this process's own executable.
+fn ingest_binary() -> Result<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("LS_INGEST_BIN")
+        && !path.trim().is_empty()
+    {
+        return Ok(path.into());
+    }
+    std::env::current_exe()
+        .map_err(|e| Error::Other(format!("cannot locate the local-search binary: {e}")))
+}
+
 /// Parse `LS_INGEST_INTERVAL`: `<n>s|m|h|d`, a bare number of seconds, or
 /// `off`/empty for "no scheduled ingest".
-pub fn parse_interval(raw: &str) -> Result<Option<Duration>, String> {
+pub fn parse_interval(raw: &str) -> std::result::Result<Option<Duration>, String> {
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() || s == "off" || s == "none" || s == "0" {
         return Ok(None);
