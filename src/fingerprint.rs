@@ -10,6 +10,7 @@ use crate::config::Config;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Fingerprints for the three ingest stages.
 #[derive(Debug, Clone)]
@@ -105,6 +106,96 @@ pub fn compute(cfg: &Config) -> Fingerprints {
             ),
         ]),
     }
+}
+
+/// Identity of everything that can change a *conversion*: the binary build,
+/// the docling/pdfium assets and the `DOCLING_*` environment. A failed
+/// document is retried only when the file changes or this identity changes, so
+/// a rebuilt container (a pdfium fix, a better OCR model) re-attempts it
+/// without touching successfully converted documents.
+pub fn extractor_identity(cfg: &Config) -> String {
+    let lock = load_lock(&cfg.models_dir);
+    let mut parts = vec![
+        format!("version={}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "build={}",
+            option_env!("BUILD_GIT_SHA").unwrap_or("unknown")
+        ),
+        format!("exe={}", exe_id()),
+        format!("pdfium={}", pdfium_id()),
+    ];
+    for name in DOCLING_ENV {
+        if let Ok(value) = std::env::var(name) {
+            parts.push(format!("{name}={value}"));
+        }
+    }
+    for (path, hash) in &lock {
+        if is_extraction_model(path) {
+            parts.push(format!("model:{path}={hash}"));
+        }
+    }
+    parts.sort();
+    fingerprint(&parts)
+}
+
+/// Model files under `<models_dir>` that affect conversion (docling layout,
+/// OCR, TableFormer, the chunk tokenizer and the enrichment models) — the
+/// embedder assets are deliberately excluded.
+fn is_extraction_model(path: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "layout",
+        "ocr_",
+        "ppocr",
+        "en_dict",
+        "tableformer/",
+        "chunk/",
+        "code_formula",
+    ];
+    PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Identity of the pdfium build. It lives at `.pdfium/` (CWD-relative, outside
+/// the models tree and so not in `models.lock`), and a fix there is exactly the
+/// kind of rebuild that should re-attempt failed PDFs. Hashed once per process.
+fn pdfium_id() -> String {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let path = Path::new(".pdfium/lib/libpdfium.so");
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                format!("sha256:{}", hex::encode(&hasher.finalize()[..16]))
+            }
+            Err(_) => match std::fs::metadata(path) {
+                Ok(meta) => format!("size:{}", meta.len()),
+                Err(_) => "missing".to_string(),
+            },
+        }
+    })
+    .clone()
+}
+
+/// Identity of the running binary (size + mtime). Unlike the git sha this also
+/// moves when the image is rebuilt without `.git` present, and stays put across
+/// a plain restart of the same image.
+fn exe_id() -> String {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(
+        || match std::env::current_exe().and_then(|p| std::fs::metadata(p)) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                format!("{}:{}", meta.len(), mtime)
+            }
+            Err(_) => "unknown".to_string(),
+        },
+    )
+    .clone()
 }
 
 /// A short (128-bit) hex digest of the joined parts.

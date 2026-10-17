@@ -10,7 +10,7 @@
 //! completion without awaiting, which is fine for a single-user local store.
 //! WAL mode lets the out-of-process ingest CLI write while the service reads.
 
-use super::{ImageSpace, SourceFile, VectorStore};
+use super::{DocumentFailure, ImageSpace, SourceFile, VectorStore};
 use crate::math;
 use crate::model::{Chunk, ChunkKind, Document, Scored, now_rfc3339};
 use crate::{Error, Result};
@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS source_files (
 );
 CREATE INDEX IF NOT EXISTS idx_source_files_hash ON source_files(hash);
 
+-- Documents that failed a stage: remembered so a run does not retry them until
+-- the file changes or the extractor identity changes (rebuild / new models).
+CREATE TABLE IF NOT EXISTS document_failures (
+    uri          TEXT PRIMARY KEY,
+    size         INTEGER NOT NULL,
+    mtime_ns     INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    stage        TEXT NOT NULL,
+    extractor_id TEXT NOT NULL,
+    error        TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -179,6 +192,19 @@ fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         hash: row.get(3)?,
         metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
         created_at: row.get(5)?,
+    })
+}
+
+fn row_to_failure(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentFailure> {
+    Ok(DocumentFailure {
+        uri: row.get(0)?,
+        size: row.get::<_, i64>(1)? as u64,
+        mtime_ns: row.get(2)?,
+        content_hash: row.get(3)?,
+        stage: row.get(4)?,
+        extractor_id: row.get(5)?,
+        error: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -770,6 +796,84 @@ impl VectorStore for SqliteStore {
         Ok(out)
     }
 
+    async fn document_ids_by_source(&self, source_uri: &str) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT id FROM documents WHERE source_uri = ?1")?;
+        let rows = stmt.query_map(params![source_uri], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    async fn document_failure(&self, uri: &str) -> Result<Option<DocumentFailure>> {
+        let conn = self.lock()?;
+        let failure = conn
+            .query_row(
+                "SELECT uri, size, mtime_ns, content_hash, stage, extractor_id, error, updated_at
+                 FROM document_failures WHERE uri = ?1",
+                params![uri],
+                row_to_failure,
+            )
+            .optional()?;
+        Ok(failure)
+    }
+
+    async fn record_document_failure(&self, failure: &DocumentFailure) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO document_failures
+                (uri, size, mtime_ns, content_hash, stage, extractor_id, error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(uri) DO UPDATE SET
+                size         = excluded.size,
+                mtime_ns     = excluded.mtime_ns,
+                content_hash = excluded.content_hash,
+                stage        = excluded.stage,
+                extractor_id = excluded.extractor_id,
+                error        = excluded.error,
+                updated_at   = excluded.updated_at",
+            params![
+                failure.uri,
+                failure.size as i64,
+                failure.mtime_ns,
+                failure.content_hash,
+                failure.stage,
+                failure.extractor_id,
+                failure.error,
+                failure.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn clear_document_failure(&self, uri: &str) -> Result<()> {
+        self.lock()?
+            .execute("DELETE FROM document_failures WHERE uri = ?1", params![uri])?;
+        Ok(())
+    }
+
+    async fn count_document_failures(&self) -> Result<usize> {
+        let n: i64 = self
+            .lock()?
+            .query_row("SELECT COUNT(*) FROM document_failures", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    async fn all_document_failures(&self) -> Result<Vec<DocumentFailure>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT uri, size, mtime_ns, content_hash, stage, extractor_id, error, updated_at
+             FROM document_failures",
+        )?;
+        let rows = stmt.query_map([], row_to_failure)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     async fn delete_document(&self, doc_id: &str) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -822,7 +926,8 @@ impl VectorStore for SqliteStore {
         let conn = self.lock()?;
         conn.execute_batch(
             "DELETE FROM chunk_vectors; DELETE FROM chunks_fts; DELETE FROM chunks;
-             DELETE FROM document_stages; DELETE FROM source_files; DELETE FROM documents;",
+             DELETE FROM document_stages; DELETE FROM source_files;
+             DELETE FROM document_failures; DELETE FROM documents;",
         )?;
         if self.has_split_images() {
             conn.execute("DELETE FROM image_vectors", [])?;

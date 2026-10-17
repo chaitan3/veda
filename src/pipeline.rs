@@ -113,7 +113,10 @@ pub struct TypeStats {
 pub struct IngestReport {
     pub documents_ingested: usize,
     pub documents_skipped: usize,
+    /// Documents that failed during *this* run (exit code 2 when > 0).
     pub documents_failed: usize,
+    /// Documents whose previous failure was remembered and skipped (not retried).
+    pub documents_failed_known: usize,
     pub chunks_added: usize,
     pub documents_deleted: usize,
     /// Counts and wall time grouped by file extension.
@@ -131,6 +134,9 @@ pub struct Pipeline {
     chunker: Chunker,
     /// Current per-stage fingerprints (compared against each document's rows).
     fingerprints: Fingerprints,
+    /// Identity of the conversion path (build + docling models + pdfium):
+    /// gates whether a failed document is retried.
+    extractor_id: String,
 }
 
 impl Pipeline {
@@ -176,6 +182,7 @@ impl Pipeline {
             store,
             chunker,
             fingerprints,
+            extractor_id: fingerprint::extractor_identity(cfg),
         })
     }
 
@@ -257,9 +264,42 @@ impl Pipeline {
                 None => None,
             };
             let (size, mtime_ns) = stat.unwrap_or((0, 0));
+
+            // A remembered failure is not retried unless the file changed or
+            // the extractor identity changed (a rebuilt container with a fixed
+            // pdfium or a better OCR model).
+            let mut retry_extract = false;
+            if let Some(f) = self.store.document_failure(&r.uri).await? {
+                let unchanged = f.size == size && f.mtime_ns == mtime_ns;
+                if !force && unchanged && f.extractor_id == self.extractor_id {
+                    report.documents_skipped += 1;
+                    report.documents_failed_known += 1;
+                    let stats = report.by_type.entry(kind).or_default();
+                    stats.skipped += 1;
+                    stats.secs += started.elapsed().as_secs_f64();
+                    tracing::debug!(uri = %r.uri, stage = %f.stage, "known failure; not retried");
+                    continue;
+                }
+                retry_extract = f.stage == "extract";
+                tracing::info!(
+                    uri = %r.uri,
+                    reason = if unchanged { "extractor changed" } else { "file changed" },
+                    "retrying previously failed file"
+                );
+            }
+
             let outcome = self
                 .ingest_bytes(
-                    &r.uri, &r.name, &r.path, size, mtime_ns, known_hash, force, stages, image_only,
+                    &r.uri,
+                    &r.name,
+                    &r.path,
+                    size,
+                    mtime_ns,
+                    known_hash,
+                    force,
+                    retry_extract,
+                    stages,
+                    image_only,
                 )
                 .await;
             let secs = started.elapsed().as_secs_f64();
@@ -303,6 +343,12 @@ impl Pipeline {
                     self.store.delete_source_file(&f.uri).await?;
                 }
             }
+            // ... and remembered failures for paths that disappeared.
+            for f in self.store.all_document_failures().await? {
+                if !keep.contains(f.uri.as_str()) && source::uri_under_roots(&f.uri, &roots) {
+                    self.store.clear_document_failure(&f.uri).await?;
+                }
+            }
             self.store.bump_corpus_version().await?;
         }
 
@@ -327,6 +373,10 @@ impl Pipeline {
         mtime_ns: i64,
         known_hash: Option<String>,
         force: bool,
+        // A previously failed conversion is being retried (the extractor
+        // identity changed), so extract must run even if its fingerprint
+        // happens to match.
+        retry_extract: bool,
         stages: StageSet,
         image_only_folder: bool,
     ) -> Result<IngestOutcome> {
@@ -356,27 +406,34 @@ impl Pipeline {
         };
         let fp = &self.fingerprints;
 
-        // Unchanged content reuses the existing document (its id, stage rows and
-        // content-addressed image vectors); changed content replaces the prior
-        // version.
-        let doc_id = match self.store.find_document_by_hash(&hash).await? {
-            Some(id) => id,
-            None => {
-                self.store.delete_documents_by_source(source_uri).await?;
-                let doc = Document::new(source_uri, stem(name), format!("pending:{hash}"));
-                self.store.upsert_document(&doc).await?;
-                doc.id
-            }
+        // Unchanged content reuses the existing document (its id, stage rows
+        // and content-addressed image vectors). New content is *not* inserted
+        // until it has been converted, so a failed conversion never replaces
+        // the previous version; the old documents are removed once the new one
+        // is committed.
+        let existing = self.store.find_document_by_hash(&hash).await?;
+        let created = existing.is_none();
+        let old_ids = if created {
+            self.store.document_ids_by_source(source_uri).await?
+        } else {
+            Vec::new()
         };
-        let mut doc = self
-            .store
-            .get_document(&doc_id)
-            .await?
-            .ok_or_else(|| Error::store("document vanished mid-ingest"))?;
+        let mut doc = match &existing {
+            Some(id) => self
+                .store
+                .get_document(id)
+                .await?
+                .ok_or_else(|| Error::store("document vanished mid-ingest"))?,
+            None => Document::new(source_uri, stem(name), hash.clone()),
+        };
+        let doc_id = doc.id.clone();
+        // Whether the document row exists in the store yet (a created document
+        // is inserted by the first stage that stores something).
+        let mut doc_inserted = !created;
         let stored_image_only =
             doc.metadata.get("folder_policy").and_then(|v| v.as_str()) == Some("image-only");
 
-        let force_extract = force && stages.wants("extract");
+        let force_extract = retry_extract || (force && stages.wants("extract"));
         let force_text = force && stages.wants("text_embed");
         let force_image = force && stages.wants("image_embed");
         let mut did_work = false;
@@ -399,14 +456,18 @@ impl Pipeline {
         // --- plan the stages before doing any work, so an up-to-date file
         // stays silent and cheap (no "ingesting" line for a no-op).
         let has_text = self.store.count_text_chunks_for(&doc_id).await? > 0;
-        let want_extract =
-            !image_only && (stages.wants("extract") || (stages.wants("text_embed") && !has_text));
+        let want_extract = !image_only
+            && (stages.wants("extract")
+                || retry_extract
+                || (stages.wants("text_embed") && !has_text));
         let extract_fp = self.store.document_stage(&doc_id, "extract").await?;
         // Why extract would run — also the skip reason when empty. A matching
         // fingerprint always skips: a document with no text chunks (scanned or
         // blank pages) must not re-convert on every run, conversion being
         // deterministic it would produce no chunks again.
-        let extract_reason = if force_extract {
+        let extract_reason = if retry_extract {
+            "retry-failed"
+        } else if force_extract {
             "forced"
         } else if extract_fp.as_deref() != Some(fp.extract.as_str()) {
             if extract_fp.is_some() {
@@ -465,23 +526,28 @@ impl Pipeline {
             }
             let raw = bytes.as_ref().expect("bytes loaded above");
             let t = Instant::now();
-            let converted = convert::convert(&self.cfg, name, raw)?;
+            let converted = match convert::convert(&self.cfg, name, raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Remember the failure: the next run skips this file until
+                    // it changes or the extractor does. Nothing was inserted,
+                    // so a previous version (if any) is left untouched.
+                    self.record_failure(
+                        source_uri,
+                        size,
+                        mtime_ns,
+                        &hash,
+                        "extract",
+                        &e.to_string(),
+                    )
+                    .await?;
+                    return Err(e);
+                }
+            };
             let parse_secs = t.elapsed().as_secs_f64();
             let t = Instant::now();
             let text_chunks = self.chunk_converted(&doc_id, &converted)?;
             let chunk_secs = t.elapsed().as_secs_f64();
-            self.store
-                .replace_text_chunks(&doc_id, &text_chunks)
-                .await?;
-            // Order matters: drop the text-embed fingerprint *before* the new
-            // extract fingerprint is recorded, so a crash in between leaves the
-            // stage missing (re-embed the fresh chunks) rather than stale.
-            self.store
-                .clear_document_stage(&doc_id, "text_embed")
-                .await?;
-            self.store
-                .set_document_stage(&doc_id, "extract", &fp.extract)
-                .await?;
 
             if text_chunks.is_empty() {
                 tracing::warn!(
@@ -512,7 +578,25 @@ impl Pipeline {
                 "metrics": metrics,
                 "markdown": converted.markdown,
             });
+            // Insert before the chunks (they reference the document); a created
+            // document is only written now that conversion has succeeded.
             self.store.upsert_document(&doc).await?;
+            doc_inserted = true;
+            self.store
+                .replace_text_chunks(&doc_id, &text_chunks)
+                .await?;
+            // Order matters: drop the text-embed fingerprint *before* the new
+            // extract fingerprint is recorded, so a crash in between leaves the
+            // stage missing (re-embed the fresh chunks) rather than stale.
+            self.store
+                .clear_document_stage(&doc_id, "text_embed")
+                .await?;
+            self.store
+                .set_document_stage(&doc_id, "extract", &fp.extract)
+                .await?;
+            // Conversion succeeded: any remembered failure for this path is
+            // resolved.
+            self.store.clear_document_failure(source_uri).await?;
 
             extract_ran = true;
             did_work = true;
@@ -552,6 +636,17 @@ impl Pipeline {
                 .expect("image_will_run implies a provider");
             if bytes.is_none() {
                 bytes = Some(std::fs::read(path).map_err(|e| Error::io(path, e))?);
+            }
+            // A created image-only document must exist before its chunk.
+            if !doc_inserted {
+                doc.title = stem(name);
+                doc.hash = hash.clone();
+                doc.metadata = serde_json::json!({
+                    "source": source_uri,
+                    "folder_policy": "image-only",
+                });
+                self.store.upsert_document(&doc).await?;
+                doc_inserted = true;
             }
             let raw = bytes.as_ref().expect("bytes loaded above");
             let mut vectors = embedder.embed_images(std::slice::from_ref(raw)).await?;
@@ -601,11 +696,25 @@ impl Pipeline {
             // ingest on a spawned task).
             let text_chunks = self.store.count_text_chunks_for(&doc_id).await?;
             tracing::debug!(name = name, text_chunks, "up to date; skipping");
-            self.record_source_file(source_uri, size, mtime_ns, &hash, Some(&doc_id))
+            let stored_doc = if doc_inserted {
+                Some(doc_id.as_str())
+            } else {
+                None
+            };
+            self.record_source_file(source_uri, size, mtime_ns, &hash, stored_doc)
                 .await?;
+            self.store.clear_document_failure(source_uri).await?;
             return Ok(IngestOutcome::Skipped);
         }
 
+        // The new version is committed: drop the documents this path replaced
+        // (they carry a different content hash, so this never touches the new
+        // one).
+        for id in &old_ids {
+            if id != &doc_id {
+                self.store.delete_document(id).await?;
+            }
+        }
         self.store.bump_corpus_version().await?;
         tracing::info!(
             name = name,
@@ -622,6 +731,30 @@ impl Pipeline {
         self.record_source_file(source_uri, size, mtime_ns, &hash, Some(&doc_id))
             .await?;
         Ok(IngestOutcome::Ingested(n_chunks))
+    }
+
+    /// Remember a failed conversion so the next run does not retry it.
+    async fn record_failure(
+        &self,
+        uri: &str,
+        size: u64,
+        mtime_ns: i64,
+        hash: &str,
+        stage: &str,
+        error: &str,
+    ) -> Result<()> {
+        self.store
+            .record_document_failure(&crate::store::DocumentFailure {
+                uri: uri.to_string(),
+                size,
+                mtime_ns,
+                content_hash: hash.to_string(),
+                stage: stage.to_string(),
+                extractor_id: self.extractor_id.clone(),
+                error: error.to_string(),
+                updated_at: crate::model::now_rfc3339(),
+            })
+            .await
     }
 
     /// Refresh the cheap-change cache for a source path.

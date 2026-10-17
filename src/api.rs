@@ -262,6 +262,10 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
     let documents = store.count_documents().await.map_err(|e| e.to_string())?;
     let chunks = store.count_chunks().await.map_err(|e| e.to_string())?;
     let corpus_version = store.corpus_version().await.map_err(|e| e.to_string())?;
+    let failed_documents = store
+        .count_document_failures()
+        .await
+        .map_err(|e| e.to_string())?;
     let fp = pipeline.fingerprints();
     Ok(serde_json::json!({
         "status": "ok",
@@ -281,6 +285,9 @@ async fn stats_json(state: &AppState) -> std::result::Result<serde_json::Value, 
         "documents": documents,
         "chunks": chunks,
         "corpus_version": corpus_version,
+        // Files whose conversion failed and is remembered (not retried until
+        // the file or the extractor changes).
+        "failed_documents": failed_documents,
         "fingerprints": {
             "extract": fp.extract,
             "text_embed": fp.text_embed,

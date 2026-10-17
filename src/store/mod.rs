@@ -100,6 +100,24 @@ pub trait VectorStore: Send + Sync {
     /// Every cached source file (for `--sync` deletion sweeps).
     async fn all_source_files(&self) -> Result<Vec<SourceFile>>;
 
+    /// Ids of every document originating from `source_uri`.
+    async fn document_ids_by_source(&self, source_uri: &str) -> Result<Vec<String>>;
+
+    /// The remembered failure for a source path, if any.
+    async fn document_failure(&self, uri: &str) -> Result<Option<DocumentFailure>>;
+
+    /// Remember (or refresh) a failure so the next run does not retry it.
+    async fn record_document_failure(&self, failure: &DocumentFailure) -> Result<()>;
+
+    /// Forget a source path's failure (it converted, or disappeared).
+    async fn clear_document_failure(&self, uri: &str) -> Result<()>;
+
+    /// Number of remembered failures (surfaced by `/api/stats`).
+    async fn count_document_failures(&self) -> Result<usize>;
+
+    /// Every remembered failure (for `--sync` cleanup).
+    async fn all_document_failures(&self) -> Result<Vec<DocumentFailure>>;
+
     /// Delete one document and all of its chunks, vectors and stage rows.
     async fn delete_document(&self, doc_id: &str) -> Result<()>;
 
@@ -151,6 +169,23 @@ pub struct SourceFile {
     pub mtime_ns: i64,
     pub hash: String,
     pub doc_id: Option<String>,
+}
+
+/// A document that failed a stage, remembered so the run does not retry it.
+///
+/// Retried only when the file changes (`size`/`mtime_ns`) or the extractor
+/// changes (`extractor_id`): a rebuilt container with a fixed pdfium or a
+/// better OCR model re-attempts it, an unchanged one does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentFailure {
+    pub uri: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub content_hash: String,
+    pub stage: String,
+    pub extractor_id: String,
+    pub error: String,
+    pub updated_at: String,
 }
 
 /// How image vectors relate to the text vector space.

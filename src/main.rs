@@ -223,6 +223,12 @@ async fn main() -> anyhow::Result<()> {
                 report.documents_deleted,
                 report.chunks_added
             );
+            if report.documents_failed_known > 0 {
+                println!(
+                    "  ({} known failure(s) skipped; `--force` or a rebuilt container retries them)",
+                    report.documents_failed_known
+                );
+            }
 
             println!("\nsummary by type:");
             println!(
