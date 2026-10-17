@@ -334,6 +334,10 @@ async fn main() -> anyhow::Result<()> {
             println!("extract:        {:?}", cfg.extract);
             println!("documents:      {}", store.count_documents().await?);
             println!("chunks:         {}", store.count_chunks().await?);
+            let failed = store.count_document_failures().await?;
+            if failed > 0 {
+                println!("failed docs:    {failed} (remembered; not retried)");
+            }
             println!("corpus version: {}", store.corpus_version().await?);
             let fp = pipeline.fingerprints();
             println!(

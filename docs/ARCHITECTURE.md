@@ -10,18 +10,22 @@ diagnosing it, [DEBUGGING.md](DEBUGGING.md).
 ```
 source folder ──ingest CLI──▶ docling convert → chunk → embed → SQLite (docs/chunks/FTS5/vec0)
         ▲                                                             ▲
-        └── serve can schedule the same ingest (LS_INGEST_INTERVAL)   │
+        └── serve spawns the ingest CLI as a child process            │
+            (LS_INGEST_INTERVAL; never loads docling in serve)        │
                                              serve ──▶ /api/search (dense + bm25 → RRF)
 ```
 
 - **Ingest is a CLI, the service is read-only.** `local-search ingest` walks
   the source roots, converts each file, chunks it, embeds the chunks and commits
-  per document. `serve` only reads — unless you set `LS_INGEST_INTERVAL`, in
-  which case it runs the same ingest in one background task (one run at a time,
-  catch-up at startup, then every interval).
+  per document. `serve` only reads. With `LS_INGEST_INTERVAL`, `serve` runs the
+  ingest **in a child process** (one at a time: catch-up at startup, then every
+  interval) so it never loads docling itself; the child is killed if the service
+  stops mid-run. `serve` keeps only the query embedders, and releases even those
+  after `LS_EMBED_IDLE_TIMEOUT` with no query (reloaded on demand).
 - **Everything is content-addressed.** A file's SHA-256 is its identity: an
   unchanged file keeps its document id, its stage fingerprints and (for images)
-  its vector, so a re-ingest is cheap and idempotent.
+  its vector, so a re-ingest is cheap and idempotent. A size+mtime cache
+  (`source_files`) means an unchanged file is not even read.
 - **Every successful ingest bumps `corpus_version`** — the seam for
   cross-process cache invalidation (it is returned by every search response and
   by `/api/stats`).
@@ -36,6 +40,8 @@ source folder ──ingest CLI──▶ docling convert → chunk → embed → 
 | `chunk_vectors` | `sqlite-vec` `vec0`, cosine distance — text vectors, plus image vectors in the unified layout |
 | `image_vectors` | `vec0` — image vectors in the two-space layout only |
 | `document_stages` | per document, per stage (`extract`, `text_embed`, `image_embed`): the fingerprint that produced it |
+| `source_files` | per source path: `size`, `mtime_ns`, content `hash`, `doc_id` — the cheap change gate (dedup means several paths can share one document) |
+| `document_failures` | per source path: the failed stage, the error, and the extractor identity — so a bad file is not retried until it or the extractor changes |
 | `meta` | `corpus_version`, the configured dimensions and the active layout marker |
 
 A **document** is an asset; a **chunk** is a retrievable fragment. Text chunks
@@ -61,7 +67,8 @@ same dimension unify, anything else stays split.
 Changing layout (or a dimension) reconciles only what is affected: image
 vectors are dropped or removed from the shared table and the `image_embed` stage
 is forgotten; **text vectors survive** an image-side change. See
-[Upgrades](#upgrades-and-the-database).
+[Stage-scoped ingest](#stage-scoped-ingest) for how the affected stage is
+re-run.
 
 ## Conversion
 
@@ -124,8 +131,24 @@ stages whose fingerprint changed (or that are missing):
 
 `--stages extract,text_embed,image_embed` narrows the run; `--force` forces just
 the targeted stages. Every ingest log line says why extract ran
-(`extract=fingerprint-missing|fingerprint-changed|forced|unchanged`), and skips
-report their chunk count.
+(`extract=fingerprint-missing|fingerprint-changed|retry-failed|forced|unchanged`),
+and skips are silent at `info` (a `debug` line at most).
+
+Two gates run before the fingerprint check, so unchanged files are never read:
+
+- **`source_files` (size + mtime)** — a match means the stored content hash is
+  trusted; the file is not read or hashed. A `touch` with unchanged content
+  still skips (the hash matches). The cache is keyed by path and points at the
+  document its content resolved to, so duplicate content (dedup) is handled.
+- **`document_failures`** — a conversion that failed is remembered and skipped,
+  so the run does not re-pay the docling cost for a bad file. It is retried
+  only when the file changes or the **extractor identity** changes: the binary
+  build (git sha + executable size/mtime, since `.git` is not in the container
+  build context), the docling model hashes (`models.lock`), the pdfium build
+  hash (outside the models tree), and the `DOCLING_*` environment. A rebuilt
+  container therefore re-attempts failures; a plain restart does not. New
+  content is inserted only after conversion succeeds, so a failed conversion
+  never replaces a previously good version.
 
 **Folder policy.** Folders in `LS_IMAGE_ONLY_PATHS` index their image files
 through the image channel only — no conversion, no OCR, no text chunks — and
@@ -134,6 +157,20 @@ from the path on every run, so adding a folder to the list *demotes* its
 documents (text chunks and stages dropped, image vectors kept) and removing it
 *promotes* them (the next plain ingest backfills conversion and text).
 
+## Service lifecycle
+
+`serve` is deliberately thin:
+
+- It loads only the **query embedders** (never docling) and serves the API.
+- Scheduled ingest (`LS_INGEST_INTERVAL`) runs as a **child process** of the
+  same binary — it inherits the environment and CWD, loads docling + embedders,
+  ingests, and exits, releasing all of it. `serve` waits for one run at a time
+  and kills the child on SIGINT/SIGTERM.
+- The embedders are **idle-evicted**: text and image share one window
+  (`LS_EMBED_IDLE_TIMEOUT`, default `5m`), refreshed by any embedding call. An
+  in-flight query holds a reference, so a model is never released mid-query;
+  the next call reloads it. `off` keeps them for the process lifetime.
+
 ## API surface
 
 | Method | Path | Notes |
@@ -141,7 +178,7 @@ documents (text chunks and stages dropped, image vectors kept) and removing it
 | GET | `/health` | liveness only, public |
 | GET/POST | `/api/search` | `query`, `mode`, `limit` (1–100, default 5) |
 | POST | `/api/search/image` | `image_base64`, `limit` |
-| GET | `/api/stats` | counts, embedders, `image_space`, fingerprints, `corpus_version`, `truncated_sequences` |
+| GET | `/api/stats` | counts, embedders, `image_space`, fingerprints, `corpus_version`, `truncated_sequences`, `failed_documents` |
 | GET | `/api/documents` | paged; `query` = case-insensitive title/path substring |
 | GET | `/api/documents/{id}` | one document + a pageable chunk slice (the expansion call) |
 | GET | `/api/media/{chunk_id}` | image bytes, resolved from the source file (nothing is stored) |
@@ -159,8 +196,8 @@ Auth is disabled unless `LS_API_KEYS` is set; then `X-Api-Key`,
 - **Single user, single writer.** SQLite in WAL mode: `serve` reads while an
   ingest writes, but two ingests at once are not supported (a second writer
   waits on the lock).
-- **No folder watcher.** Ingest is explicit (`ingest`), scheduled
-  (`LS_INGEST_INTERVAL`) or external (cron/timer).
+- **No folder watcher.** Ingest is explicit (`ingest`), scheduled in a child
+  process (`LS_INGEST_INTERVAL`) or external (cron/timer).
 - **Static API keys only** — no per-user keys or rotation.
 - **PDF figure extraction is not implemented**; images are indexed only as
   standalone files. No image captioning, no reranker/Multi-Query/HyDE.

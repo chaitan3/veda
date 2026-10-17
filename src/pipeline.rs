@@ -386,6 +386,7 @@ impl Pipeline {
     /// text chunks. The policy is applied per run, and a document whose
     /// stored policy disagrees (the folder was added to or removed from the
     /// list) transitions on the next ingest.
+    #[allow(clippy::too_many_arguments)] // cohesive per-file ingest inputs
     pub async fn ingest_bytes(
         &self,
         source_uri: &str,

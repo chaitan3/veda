@@ -5,11 +5,12 @@ both. For the design behind it, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Reading the logs
 
-`RUST_LOG=info` (the default) prints one line per file plus a summary:
+`RUST_LOG=info` (the default) prints one line per file that actually does work,
+plus a summary. Up-to-date files are silent (a `debug` line at most):
 
 ```text
-INFO ingesting name="report.pdf" method=docling-onnx policy="default" chunker=hybrid
-INFO ingested  name="report.pdf" chunks=12 secs=7.31 extract="fingerprint-missing"
+INFO processing name="report.pdf" uri="…/report.pdf" bytes=8680 method=docling-onnx policy="default" chunker=hybrid
+INFO ingested   name="report.pdf" chunks=12 secs=7.31 extract="fingerprint-missing"
 
 summary by type:
   type       files  chunks   skip   fail       time
@@ -23,9 +24,11 @@ Useful fields:
 |---|---|
 | `method` | `docling-onnx`, `vlm`, or a passthrough label |
 | `policy` | `image-only` for folders in `LS_IMAGE_ONLY_PATHS` |
-| `extract=` | why extract ran: `fingerprint-missing`, `fingerprint-changed`, `forced`, or `unchanged` (didn't run) |
+| `extract=` | why extract ran: `fingerprint-missing`, `fingerprint-changed`, `retry-failed`, `forced`, or `unchanged` (didn't run) |
 | `chunks` | chunks produced or re-embedded; `0` with a warning means the file converted to no text |
-| `skipping` | carries `text_chunks=<n>` so a text-less document is visible |
+
+A skipped file is only logged at `debug` (`up to date; skipping`), so the
+`info` stream shows exactly the documents that were processed.
 
 Other lines worth knowing:
 
@@ -40,8 +43,15 @@ Other lines worth knowing:
   [Chunk size and truncation](#chunk-size-and-truncation).
 - `image vector layout changed; image embeddings will be recomputed` — a
   provider/dimension change; text vectors are kept.
+- `retrying previously failed file … reason="file changed"|"extractor changed"`
+  — a remembered conversion failure is being re-attempted (see
+  [Failed files](#failed-files)).
+- `embedding model released (idle)` / `embedding model loaded` — the
+  `LS_EMBED_IDLE_TIMEOUT` window (see [Idle models](#idle-models)).
 - `scheduled ingest finished …` / `scheduled ingest failed; will retry next
-  interval` — `LS_INGEST_INTERVAL` runs.
+  interval` — the `LS_INGEST_INTERVAL` child process ran.
+- `scheduled ingest stopped (shutdown)` — `serve` is stopping and killed the
+  child mid-run.
 - `LS_API_KEYS is empty — API authentication is disabled` — expected unless you
   set keys.
 
@@ -54,14 +64,67 @@ fingerprint moved:
 |---|---|
 | `fingerprint-missing` | first ingest, or a previous run was interrupted before it completed |
 | `fingerprint-changed` | converter/chunker settings or a `DOCLING_*` variable differs from the recorded one — including running ingest with a *different environment* than last time (host vs container) |
+| `retry-failed` | a remembered conversion failure is being retried after a file/extractor change |
 | `forced` | `--force --stages extract` |
 | *(absent / `unchanged`)* | extract didn't run |
+
+Two cheaper gates sit in front of the fingerprint check, so most unchanged
+files never reach it:
+
+- A **size + mtime** match against the `source_files` cache means the content
+  hash is trusted and the file is not read (or hashed) again. A mere `touch`
+  with the same content still skips (the hash is unchanged).
+- A **remembered failure** (`document_failures`) skips a file whose conversion
+  already failed, without reading it (see [Failed files](#failed-files)).
 
 Text re-embeds are reported the same way: switching the text embedder (or its
 prefixes, dimension or truncation cap) re-embeds text only — no conversion. A
 layout or dimension change drops the affected vectors and forgets that stage
 (see ARCHITECTURE.md, *Upgrades*). `local-search stats` and `/api/stats` show
 the current fingerprints, so you can compare them across environments.
+
+## Failed files
+
+A file that fails to **convert** (a corrupt PDF, a pdfium error) is recorded in
+`document_failures` with the error and the *extractor identity* that failed it.
+The next run skips it without reading or converting it again — otherwise every
+run would re-pay the full docling cost for the same bad file. The CLI reports
+these as `known failure(s) skipped`; `/api/stats` has `failed_documents`.
+
+It is retried when either changes:
+
+- **the file** — size/mtime, then content hash;
+- **the extractor identity** — the binary build (git sha + executable
+  size/mtime), the docling model hashes (`models.lock`), the pdfium build hash,
+  and the `DOCLING_*` environment. So rebuilding the container with a fixed
+  pdfium or a better OCR model re-attempts every failed file, while a plain
+  restart does not.
+
+`ingest --force` (with the extract stage) retries them without any change;
+`ingest --sync` forgets the failures of files that disappeared. A failed
+conversion never replaces a previously good version: new content is only
+inserted once conversion succeeds, and the old document is dropped only after
+the new one is committed. `prune` removes any document left with no chunks.
+
+To clear the whole memory (e.g. after changing the identity by hand):
+
+```bash
+sqlite3 data/local-search.db "DELETE FROM document_failures;"
+```
+
+## Idle models
+
+`serve` keeps the embedding models resident while queries arrive and releases
+them `LS_EMBED_IDLE_TIMEOUT` (default `5m`) after the last embedding call. Text
+and image share one window, so either kind of query refreshes it; `off` keeps
+them for the process lifetime. In-flight queries hold a reference, so a model is
+never released mid-query — the next call after eviction just reloads it (a
+one-off latency cost). This is why a quiet `serve` can show much lower GPU/CPU
+memory than during ingest; see [GPU and memory](#gpu-and-memory).
+
+Scheduled ingest does **not** keep serve's models warm: it runs in a child
+process, which loads its own docling + embedder models and releases them on
+exit.
 
 ## Chunk size and truncation
 
@@ -94,6 +157,17 @@ supports 8k) — raise both together, since longer chunks dilute the embedding.
 instead of a warning.
 
 ## GPU and memory
+
+Where the memory goes depends on the process:
+
+- **`ingest`** (and the scheduled-ingest child) loads docling plus the
+  embedders; its footprint is the model weights plus ORT's arena high-water
+  mark. It releases everything on exit.
+- **`serve`** loads only the embedders (never docling), and releases them
+  `LS_EMBED_IDLE_TIMEOUT` after the last query. A quiet server can therefore
+  sit near zero, and a query after eviction pays a one-off reload. Use
+  `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`
+  to attribute VRAM to the server vs a running ingest child.
 
 The binary applies three defaults at startup unless you set them:
 
@@ -184,11 +258,13 @@ cargo run --release --example eg2_bench -- eg2-vision280 5 1 --shrink
 | `libcuda.so.1: cannot open shared object file` | container without `--gpus all` (or missing nvidia-container-toolkit); else CPU-only host |
 | `CUDA is compiled in but the CUDA runtime is not loadable` | driver (`libcuda.so.1`) or cuDNN 9 missing; the provider is pinned to CPU before inference |
 | intermittent OOM mid-batch | arena creep — the vendored shrinkage handles it; check `DOCLING_RS_DEBUG=1` shows it engaged, and that you are not running two ingests |
-| `database is locked` | two writers (a manual `ingest` plus a scheduled one, or two containers). Writers queue for 5 s (rusqlite's default busy timeout) then fail |
+| `database is locked` | two writers (a manual `ingest` plus the scheduled child, or two containers). Writers queue for 5 s (rusqlite's default busy timeout) then fail |
 | vector/`image` mode returns nothing after a config change | the layout/dimension changed: vectors were dropped and the stage forgotten — run `ingest` to re-embed |
 | a file-name query returns nothing | use `mode=hybrid` (name channel) or `/api/documents?query=`; `bm25`/`vector` search content only |
 | `no results` for a term you know exists | wrong mode for the query shape (quoted phrases in `vector`, prose in `bm25`), or the corpus was never ingested (`/api/stats` shows counts) |
-| ingest exit code 2 | at least one file failed; the per-file errors are in the log |
+| a bad file fails on every run | it shouldn't now — failures are remembered; if it repeats, the file or the extractor identity is changing (see [Failed files](#failed-files)) |
+| ingest exit code 2 | at least one *new* failure this run; remembered failures don't set it. Per-file errors are in the log |
+| first query after a quiet period is slow | the models were idle-evicted and are reloading — expected; raise `LS_EMBED_IDLE_TIMEOUT` or set `off` to keep them |
 
 ## Diagnostic tools
 

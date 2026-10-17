@@ -74,9 +74,11 @@ summary by type:
 
 Re-running `ingest` is cheap: unchanged files are skipped by content hash, and
 only the stages whose configuration changed re-run (see
-[ARCHITECTURE.md](docs/ARCHITECTURE.md#stage-scoped-ingest)). The service and the
-CLI can run at the same time — the database is in WAL mode and each document is
-committed as it finishes, so queries see the corpus grow.
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#stage-scoped-ingest)). A file whose
+conversion fails is remembered and not retried until it changes or the
+container is rebuilt (see [DEBUGGING.md](docs/DEBUGGING.md#failed-files)). The
+service and the CLI can run at the same time — the database is in WAL mode and
+each document is committed as it finishes, so queries see the corpus grow.
 
 ### Common commands and flags
 
@@ -120,6 +122,7 @@ reference. The settings you are most likely to touch:
 | `LS_CHUNKER` / `LS_CHUNK_SIZE` | `hybrid` / `300` | how text is split (see below) |
 | `LS_INGEST_INTERVAL` | — | `serve` re-ingests every interval (e.g. `24h`); unset = manual |
 | `LS_INGEST_SYNC` | `false` | scheduled runs also prune documents whose files disappeared |
+| `LS_EMBED_IDLE_TIMEOUT` | `5m` | `serve` releases the embedding models after this long with no query (`off` keeps them) |
 
 **Choosing an embedder.** The default pair (bge-small text + SigLIP2 images) is
 the cheap, well-tested option. Setting **both** to `eg2` puts text and images in
@@ -206,7 +209,7 @@ Notes for container use:
 - **Health**: the image healthcheck polls `GET /health`; `/api/stats` (behind
   auth) has the details.
 - **Single writer**: SQLite allows one writer — don't run two ingests at once
-  (a scheduled ingest inside `serve` counts as one).
+  (the scheduled ingest child process counts as one).
 
 ## Deployment
 
@@ -219,7 +222,8 @@ The packaged directory is the service's working directory (docling resolves
 `.models/` and `.pdfium/` relative to the CWD). `scripts/local-search.service`
 is a systemd unit template; set `LS_DB_PATH` under `ReadWritePaths` and
 `systemctl enable --now local-search`. With `LS_INGEST_INTERVAL` set the service
-also ingests on its own (one run at a time, catch-up at startup).
+also ingests on its own — in a child process, one run at a time, catch-up at
+startup — so the server itself never loads docling.
 
 All state is the database, so a backup is one file:
 
@@ -234,7 +238,8 @@ fingerprints mean only affected stages re-run.
 
 Working end to end: ingestion (docling ONNX or remote VLM), text and image
 embeddings (bge/SigLIP2 or EmbeddingGemma 2), hybrid retrieval with file-name
-matching, the read-only API with optional auth and scheduled ingest, and the
-evaluation harness. Not implemented: PDF figure extraction, image captioning,
-rerankers/Multi-Query/HyDE, a folder watcher, and metrics/graceful-shutdown
-hooks — see [ARCHITECTURE.md](docs/ARCHITECTURE.md#design-decisions-and-limits).
+matching, the read-only API with optional auth, graceful shutdown, and
+scheduled ingest in a child process, plus the evaluation harness. Not
+implemented: PDF figure extraction, image captioning, rerankers/Multi-Query/
+HyDE, a folder watcher, and a metrics endpoint — see
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#design-decisions-and-limits).

@@ -182,7 +182,7 @@ fn pdfium_id() -> String {
 fn exe_id() -> String {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(
-        || match std::env::current_exe().and_then(|p| std::fs::metadata(p)) {
+        || match std::env::current_exe().and_then(std::fs::metadata) {
             Ok(meta) => {
                 let mtime = meta
                     .modified()
