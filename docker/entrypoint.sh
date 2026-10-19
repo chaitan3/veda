@@ -1,5 +1,5 @@
 #!/bin/sh
-# local-search container entrypoint.
+# veda container entrypoint.
 #
 #   1. Links an optional /config/.env so the binary's dotenvy loader reads it
 #      (dotenvy does not override variables Docker already set, so container
@@ -22,6 +22,15 @@ fi
 mkdir -p /data /documents "$MODELS_DIR/.pdfium"
 if [ ! -e /app/.pdfium ]; then
     ln -s "$MODELS_DIR/.pdfium" /app/.pdfium
+fi
+
+# Old-name database fallback: keep using /data/local-search.db until it is
+# renamed, so an upgrade does not silently start with an empty corpus. An
+# explicit LS_DB_PATH (docker -e or /config/.env) always wins.
+if [ "${LS_DB_PATH:-/data/veda.db}" = "/data/veda.db" ] \
+   && [ ! -e /data/veda.db ] && [ -e /data/local-search.db ]; then
+    echo "[entrypoint] using existing /data/local-search.db; rename it to /data/veda.db when convenient" >&2
+    export LS_DB_PATH=/data/local-search.db
 fi
 
 # Ensure the model tree: docling assets + bge-small + SigLIP2 + EmbeddingGemma 2
@@ -47,14 +56,14 @@ if [ "${LS_SKIP_MODEL_DOWNLOAD:-0}" != "1" ]; then
     fi
     echo "[entrypoint] ensuring model tree in $MODELS_DIR (idempotent)" >&2
     # shellcheck disable=SC2086
-    /app/local-search download-models $eg2_flag
+    /app/veda download-models $eg2_flag
 fi
 
 if [ "$(id -u)" = "0" ]; then
     # The model tree is a few dozen files; hand them to the service user.
     chown -R "$PUID:$PGID" /data "$MODELS_DIR" 2>/dev/null || true
     exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
-        /app/local-search "$@"
+        /app/veda "$@"
 fi
 
-exec /app/local-search "$@"
+exec /app/veda "$@"

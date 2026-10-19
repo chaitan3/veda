@@ -1,4 +1,4 @@
-//! `local-search` CLI: ingest and query a local document store, and serve the
+//! `veda` CLI: ingest and query a local document store, and serve the
 //! read-only search API.
 
 use clap::{Parser, Subcommand};
@@ -12,9 +12,9 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
-    name = "local-search",
+    name = "veda",
     version,
-    about = "Text + image search over a local document store"
+    about = "veda: text + image search over a local document store"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -375,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let app = local_search::api::router(state);
             let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
-            println!("local-search listening on http://{}", cfg.addr);
+            println!("veda listening on http://{}", cfg.addr);
 
             // Shutdown channel: flipped by SIGINT/SIGTERM, consumed by the
             // scheduled-ingest supervisor (which kills its child) and the

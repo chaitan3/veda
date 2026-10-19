@@ -8,7 +8,7 @@
 //! mask. Either way the result is L2-normalized.
 //!
 //! Default model: bge-small-en-v1.5 (384-d). Override with `LS_ONNX_MODEL` and
-//! `LS_ONNX_TOKENIZER`; fetch the defaults with `local-search download-models`.
+//! `LS_ONNX_TOKENIZER`; fetch the defaults with `veda download-models`.
 
 use super::Embedder;
 use crate::config::Config;

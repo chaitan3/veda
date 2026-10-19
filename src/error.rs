@@ -1,4 +1,4 @@
-//! Error type for the local-search service.
+//! Error type for the veda service.
 
 use std::path::PathBuf;
 

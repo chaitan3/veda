@@ -81,7 +81,7 @@ async fn scheduled_ingest_child_picks_up_new_files() {
     // settings so it writes the same database with the offline hash embedder.
     // Safe to set process-wide: this test binary holds a single test.
     unsafe {
-        std::env::set_var("LS_INGEST_BIN", env!("CARGO_BIN_EXE_local-search"));
+        std::env::set_var("LS_INGEST_BIN", env!("CARGO_BIN_EXE_veda"));
         std::env::set_var("LS_DB_PATH", &db);
         std::env::set_var("LS_MODELS_DIR", ".models");
         std::env::set_var("LS_EMBED_PROVIDER", "hash");

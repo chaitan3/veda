@@ -251,6 +251,28 @@ fn var_or(name: &str, default: &str) -> String {
     var(name).unwrap_or_else(|| default.to_string())
 }
 
+/// Default database path, with a rename fallback.
+///
+/// `data/veda.db` is the new default, but an existing `data/local-search.db`
+/// is used (with a warning) until it is moved, so renaming the app never
+/// silently starts an empty database. An explicit `LS_DB_PATH` always wins.
+fn db_path() -> String {
+    const NEW: &str = "data/veda.db";
+    const OLD: &str = "data/local-search.db";
+    if let Some(path) = var("LS_DB_PATH") {
+        return path;
+    }
+    if !std::path::Path::new(NEW).exists() && std::path::Path::new(OLD).exists() {
+        tracing::warn!(
+            old = OLD,
+            new = NEW,
+            "using the existing database under its old name; move it to the new path when convenient"
+        );
+        return OLD.to_string();
+    }
+    NEW.to_string()
+}
+
 /// Parse a boolean env var (`1/true/yes/on` vs `0/false/no/off`), falling back
 /// to `default` when unset or empty.
 fn bool_or(name: &str, default: bool) -> bool {
@@ -348,7 +370,7 @@ impl Config {
         };
 
         Ok(Config {
-            db_path: var_or("LS_DB_PATH", "data/local-search.db"),
+            db_path: db_path(),
             source_paths: parse_path_list(&var_or("LS_SOURCE_PATH", "docs")),
             image_only_paths: parse_path_list(&var_or("LS_IMAGE_ONLY_PATHS", "")),
             models_dir: models_dir.clone(),

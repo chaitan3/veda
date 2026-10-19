@@ -1,4 +1,4 @@
-# local-search
+# veda
 
 A local, single-user **text + image search service** over your own documents and
 images. Ingest is a CLI tool; a read-only HTTP API answers queries. Results fuse
@@ -112,7 +112,7 @@ reference. The settings you are most likely to touch:
 | variable | default | purpose |
 |---|---|---|
 | `LS_SOURCE_PATH` | `docs` | folders the ingest CLI walks (path-separated) |
-| `LS_DB_PATH` | `data/local-search.db` | SQLite database (all state) |
+| `LS_DB_PATH` | `data/veda.db` | SQLite database (all state); an existing `data/local-search.db` is used until renamed |
 | `LS_ADDR` | `127.0.0.1:8080` | API bind address |
 | `LS_API_KEYS` | — | comma-separated keys; **empty disables authentication** |
 | `LS_MODELS_DIR` | `.models` | where `download-models` puts the model tree |
@@ -150,9 +150,9 @@ a host-built binary into it.
 ### Build
 
 ```bash
-docker build -f docker/Dockerfile -t local-search .
+docker build -f docker/Dockerfile -t veda .
 # match a bind-mounted host directory's ownership:
-docker build -f docker/Dockerfile --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) -t local-search .
+docker build -f docker/Dockerfile --build-arg PUID=$(id -u) --build-arg PGID=$(id -g) -t veda .
 ```
 
 ### Run
@@ -168,18 +168,18 @@ It is equivalent to:
 
 ```bash
 # server
-docker run -d --name local-search --restart unless-stopped --gpus all \
+docker run -d --name veda --restart unless-stopped --gpus all \
   -p 8080:8080 \
   -v "$PWD/data:/data" -v "$PWD/models:/models" \
   -v "$PWD/documents:/documents:ro" -v "$PWD/photos:/photos:ro" \
   -e LS_SOURCE_PATH=/documents:/photos -e LS_IMAGE_ONLY_PATHS=/photos \
   -v "$PWD/config:/config" \
-  local-search serve
+  veda serve
 
 # one-off ingest, sharing the same volumes
 docker run --rm --gpus all \
   -v "$PWD/data:/data" -v "$PWD/models:/models" \
-  -v "$PWD/documents:/documents:ro" local-search ingest
+  -v "$PWD/documents:/documents:ro" veda ingest
 ```
 
 | mount | holds | notes |
@@ -200,7 +200,7 @@ Notes for container use:
 - **GPU**: `--gpus all` requires nvidia-container-toolkit. Without it the
   container has no GPU access and logs `CUDA execution provider unavailable …
   libcuda.so.1` — verify with
-  `docker run --rm --gpus all local-search nvidia-smi`. Drop the flag on a
+  `docker run --rm --gpus all veda nvidia-smi`. Drop the flag on a
   GPU-less host (CPU inference works, just slower).
 - **Non-root**: the entrypoint prepares volumes as root, then drops to
   `PUID:PGID` (default `1000:1000`).
@@ -215,20 +215,26 @@ Notes for container use:
 
 ```bash
 cargo build --release
-scripts/package.sh dist/local-search      # binary + native libs + models + templates
+scripts/package.sh dist/veda      # binary + native libs + models + templates
 ```
 
 The packaged directory is the service's working directory (docling resolves
-`.models/` and `.pdfium/` relative to the CWD). `scripts/local-search.service`
-is a systemd unit template; set `LS_DB_PATH` under `ReadWritePaths` and
-`systemctl enable --now local-search`. With `LS_INGEST_INTERVAL` set the service
+`.models/` and `.pdfium/` relative to the CWD). `scripts/veda.service`
+is a systemd unit template (it assumes a `veda` user/group and `/opt/veda`);
+set `LS_DB_PATH` under `ReadWritePaths` and `systemctl enable --now veda`. With `LS_INGEST_INTERVAL` set the service
 also ingests on its own — in a child process, one run at a time, catch-up at
 startup — so the server itself never loads docling.
+
+**Upgrading from `local-search`:** the binary is now `veda`; all `LS_*`
+variables are unchanged. Move `data/local-search.db` to `data/veda.db` when
+convenient — until you do, the old file is still used (with a warning). Replace
+the old unit with `veda.service`
+(`systemctl disable --now local-search; systemctl enable --now veda`).
 
 All state is the database, so a backup is one file:
 
 ```bash
-sqlite3 /var/lib/local-search/app.db ".backup '/backup/app-$(date +%F).db'"
+sqlite3 /var/lib/veda/app.db ".backup '/backup/app-$(date +%F).db'"
 ```
 
 Upgrades need no database reset: schema changes are additive and per-stage

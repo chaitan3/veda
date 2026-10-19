@@ -1,6 +1,6 @@
 # Architecture
 
-How `local-search` is put together: the pipeline, the data model, the two
+How `veda` is put together: the pipeline, the data model, the two
 possible vector layouts, and the retrieval channels. For using it, see
 [../README.md](../README.md); for measuring it, [EVAL.md](EVAL.md); for
 diagnosing it, [DEBUGGING.md](DEBUGGING.md).
@@ -15,7 +15,7 @@ source folder ──ingest CLI──▶ docling convert → chunk → embed → 
                                              serve ──▶ /api/search (dense + bm25 → RRF)
 ```
 
-- **Ingest is a CLI, the service is read-only.** `local-search ingest` walks
+- **Ingest is a CLI, the service is read-only.** `veda ingest` walks
   the source roots, converts each file, chunks it, embeds the chunks and commits
   per document. `serve` only reads. With `LS_INGEST_INTERVAL`, `serve` runs the
   ingest **in a child process** (one at a time: catch-up at startup, then every

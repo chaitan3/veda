@@ -93,8 +93,7 @@ fn ingest_binary() -> Result<std::path::PathBuf> {
     {
         return Ok(path.into());
     }
-    std::env::current_exe()
-        .map_err(|e| Error::Other(format!("cannot locate the local-search binary: {e}")))
+    std::env::current_exe().map_err(|e| Error::Other(format!("cannot locate the veda binary: {e}")))
 }
 
 /// Parse `LS_INGEST_INTERVAL`: `<n>s|m|h|d`, a bare number of seconds, or

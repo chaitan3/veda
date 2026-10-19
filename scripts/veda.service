@@ -1,27 +1,27 @@
-# local-search systemd unit (template — adjust paths and user).
+# veda systemd unit (template — adjust paths and user).
 #
 # Ingestion normally runs separately (see docs/ARCHITECTURE.md), typically from a
 # systemd timer or cron -- or let the service do it itself by setting
 # LS_INGEST_INTERVAL (and optionally LS_INGEST_SYNC=true) in the EnvironmentFile:
-# one background task, a catch-up run at startup, then every interval.
+# a child process, a catch-up run at startup, then every interval.
 
 [Unit]
-Description=local-search (text + image search service)
-Documentation=file:/opt/local-search/docs/ARCHITECTURE.md
+Description=veda (text + image search service)
+Documentation=file:/opt/veda/docs/ARCHITECTURE.md
 After=network.target
 
 [Service]
 Type=simple
-User=locals
-Group=locals
-WorkingDirectory=/opt/local-search
-EnvironmentFile=/opt/local-search/.env
-ExecStart=/opt/local-search/local-search serve
+User=veda
+Group=veda
+WorkingDirectory=/opt/veda
+EnvironmentFile=/opt/veda/.env
+ExecStart=/opt/veda/veda serve
 Restart=on-failure
 RestartSec=2
 
 # All service state is the SQLite database (absolute path in LS_DB_PATH).
-ReadWritePaths=/var/lib/local-search
+ReadWritePaths=/var/lib/veda
 
 # Hardening.
 NoNewPrivileges=true

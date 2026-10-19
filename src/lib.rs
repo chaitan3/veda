@@ -1,4 +1,5 @@
-//! `local-search`: a text + image search service over a local document store.
+//! `veda` (crate `local-search`): a text + image search service over a local
+//! document store.
 //!
 //! Documents (PDF/DOCX/text, OCR for scans) and standalone image files are
 //! ingested by a CLI tool into a SQLite store; a read-only HTTP service answers

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Package local-search for deployment: the binary, the native runtime libraries,
+# Package veda for deployment: the binary, the native runtime libraries,
 # the model tree, and config/docs templates.
 #
 # Usage:
 #   scripts/package.sh [OUT_DIR] [--no-models] [--debug]
 #
-#   OUT_DIR       destination directory (default: dist/local-search)
+#   OUT_DIR       destination directory (default: dist/veda)
 #   --no-models   skip .models/ and .pdfium/ (~650 MB); fetch them on the host
-#                 with `local-search download-models` instead
+#                 with `veda download-models` instead
 #   --debug       package the debug binary instead of the release one
 #
 # The packaged directory is the service's working directory: docling resolves
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="dist/local-search"
+OUT="dist/veda"
 PROFILE="release"
 WITH_MODELS=1
 
@@ -31,7 +31,7 @@ done
 case "$OUT" in /*) ;; *) OUT="$ROOT/$OUT" ;; esac
 
 BINDIR="$ROOT/target/$PROFILE"
-BIN="$BINDIR/local-search"
+BIN="$BINDIR/veda"
 if [ ! -x "$BIN" ]; then
   echo "error: $BIN not found." >&2
   echo "       build it first:  cargo build$( [ "$PROFILE" = release ] && echo ' --release' )" >&2
@@ -43,7 +43,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 # 1. the product binary
-cp -a "$BIN" "$OUT/local-search"
+cp -a "$BIN" "$OUT/veda"
 
 # 2. ONNX Runtime libraries, next to the binary. Only the execution-provider
 #    .so files are shared (the base runtime is linked in statically); the GPU
@@ -67,11 +67,11 @@ if [ "$WITH_MODELS" = 1 ]; then
       cp -aL "$ROOT/$dir" "$OUT/"
       echo "  + $dir"
     else
-      echo "  ! $dir is missing — run: local-search download-models" >&2
+      echo "  ! $dir is missing — run: veda download-models" >&2
     fi
   done
 else
-  echo "  - skipping models (--no-models); run 'local-search download-models' on the host"
+  echo "  - skipping models (--no-models); run 'veda download-models' on the host"
 fi
 
 # 4. config + docs templates.
@@ -81,8 +81,8 @@ if [ -d "$ROOT/docs" ]; then
   mkdir -p "$OUT/docs"
   cp -a "$ROOT"/docs/*.md "$OUT/docs/"
 fi
-[ -f "$ROOT/scripts/local-search.service" ] && \
-  cp -a "$ROOT/scripts/local-search.service" "$OUT/local-search.service"
+[ -f "$ROOT/scripts/veda.service" ] && \
+  cp -a "$ROOT/scripts/veda.service" "$OUT/veda.service"
 
 echo
 echo "contents of $OUT:"
@@ -93,11 +93,11 @@ echo "package size: $(du -sh "$OUT" | cut -f1)"
 cat <<'EOF'
 
 Next steps on the target host:
-  1. Put the package somewhere, e.g. /opt/local-search, and cd into it.
+  1. Put the package somewhere, e.g. /opt/veda, and cd into it.
   2. cp .env.example .env    # set LS_DB_PATH, LS_SOURCE_PATH, LS_API_KEYS
-  3. ./local-search download-models   # only if you packaged with --no-models
-  4. ./local-search init-db
-  5. ./local-search ingest /path/to/documents
-  6. ./local-search serve             # see docs/ for architecture, eval, debugging
-  7. systemd: copy ./local-search.service to /etc/systemd/system/ and adjust it
+  3. ./veda download-models   # only if you packaged with --no-models
+  4. ./veda init-db
+  5. ./veda ingest /path/to/documents
+  6. ./veda serve             # see docs/ for architecture, eval, debugging
+  7. systemd: copy ./veda.service to /etc/systemd/system/ and adjust it
 EOF

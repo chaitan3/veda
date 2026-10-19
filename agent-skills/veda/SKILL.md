@@ -1,23 +1,23 @@
 ---
-name: local-search-rag
-description: Search the user's local document corpus (local-search service) as an agent tool.
+name: veda
+description: Search the user's local document corpus (veda service) as an agent tool.
 version: 1.0.0
 metadata:
   hermes:
     tags: [rag, search, documents, local]
     category: productivity
     config:
-      - key: local-search.url
-        description: Base URL of the local-search HTTP service
+      - key: veda.url
+        description: Base URL of the veda HTTP service
         default: "http://127.0.0.1:8080"
-        prompt: "local-search service URL"
-      - key: local-search.api_key
+        prompt: "veda service URL"
+      - key: veda.api_key
         description: API key if the service has LS_API_KEYS set (leave empty otherwise)
         default: ""
-        prompt: "local-search API key (optional)"
+        prompt: "veda API key (optional)"
 ---
 
-# Local Search RAG
+# Veda RAG
 
 A retrieval layer over the user's own documents — PDFs (including OCR'd
 scans), standalone images, and text files — indexed with hybrid search

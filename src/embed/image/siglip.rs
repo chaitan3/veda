@@ -6,7 +6,7 @@
 //!
 //! Default model: `onnx-community/siglip2-base-patch16-224-ONNX` — 768-d,
 //! 224×224 input, mean/std 0.5, 64-token text. Fetch it with
-//! `local-search download-models`.
+//! `veda download-models`.
 
 use super::ImageEmbedder;
 use crate::config::Config;

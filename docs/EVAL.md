@@ -1,7 +1,7 @@
 # Retrieval evaluation
 
-`local-search eval` scores a **gold set** against the current store, and
-`local-search eval-gen` mines a synthetic one from the corpus. Together they
+`veda eval` scores a **gold set** against the current store, and
+`veda eval-gen` mines a synthetic one from the corpus. Together they
 are the harness that decides whether an embedding change (EG2 text/vision, a
 different chunker, a different budget) actually improves retrieval — benchmark
 numbers from model cards are a prior, not a measurement of *this* corpus.
@@ -14,11 +14,11 @@ configurations).
 
 ```bash
 # 1. Build a gold set from whatever is already ingested.
-LS_DB_PATH=data/local-search.db local-search eval-gen \
+LS_DB_PATH=data/veda.db veda eval-gen \
     --out eval/queries.jsonl --per-doc 3
 
 # 2. Score every retrieval mode.
-LS_DB_PATH=data/local-search.db local-search eval \
+LS_DB_PATH=data/veda.db veda eval \
     --queries eval/queries.jsonl --modes hybrid,vector,bm25 --k 1,5,10
 ```
 
@@ -90,14 +90,14 @@ gold set, and score each DB against it:
 
 ```bash
 # baseline: bge text + SigLIP2 image
-LS_DB_PATH=/tmp/base.db  LS_MODELS_DIR=.models local-search ingest docs photos
+LS_DB_PATH=/tmp/base.db  LS_MODELS_DIR=.models veda ingest docs photos
 # candidate: EG2 text + EG2 vision (phases 1–3)
 LS_DB_PATH=/tmp/eg2.db   LS_MODELS_DIR=.models LS_EMBED_PROVIDER=eg2 \
-    LS_IMAGE_EMBED_PROVIDER=eg2 local-search ingest docs photos
+    LS_IMAGE_EMBED_PROVIDER=eg2 veda ingest docs photos
 
 for db in /tmp/base.db /tmp/eg2.db; do
   echo "== $db"
-  LS_DB_PATH=$db LS_MODELS_DIR=.models local-search eval \
+  LS_DB_PATH=$db LS_MODELS_DIR=.models veda eval \
       --queries eval/queries.jsonl --k 1,5,10
 done
 ```

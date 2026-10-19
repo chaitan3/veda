@@ -80,7 +80,7 @@ files never reach it:
 Text re-embeds are reported the same way: switching the text embedder (or its
 prefixes, dimension or truncation cap) re-embeds text only — no conversion. A
 layout or dimension change drops the affected vectors and forgets that stage
-(see ARCHITECTURE.md, *Upgrades*). `local-search stats` and `/api/stats` show
+(see ARCHITECTURE.md, *Upgrades*). `veda stats` and `/api/stats` show
 the current fingerprints, so you can compare them across environments.
 
 ## Failed files
@@ -109,7 +109,7 @@ the new one is committed. `prune` removes any document left with no chunks.
 To clear the whole memory (e.g. after changing the identity by hand):
 
 ```bash
-sqlite3 data/local-search.db "DELETE FROM document_failures;"
+sqlite3 data/veda.db "DELETE FROM document_failures;"
 ```
 
 ## Idle models
@@ -276,4 +276,4 @@ cargo run --release --example eg2_bench -- eg2-vision280 5 1 --shrink
 | `examples/docling_dump.rs` | dump docling Markdown for one file under different options |
 | `examples/rasterize.rs` | rasterize a PDF's pages (to exercise OCR on a text-less image) |
 | `examples/siglip_probe.rs` | load the SigLIP towers and print dims/cosines |
-| `local-search eval` / `eval-gen` | retrieval quality on your corpus — see [EVAL.md](EVAL.md) |
+| `veda eval` / `eval-gen` | retrieval quality on your corpus — see [EVAL.md](EVAL.md) |

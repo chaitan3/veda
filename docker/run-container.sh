@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run local-search in Docker (image built from docker/Dockerfile).
+# Run veda in Docker (image built from docker/Dockerfile).
 #
 # Mounts live next to the repo root, so the script works from any directory:
-#   docker build -f docker/Dockerfile -t local-search .
+#   docker build -f docker/Dockerfile -t veda .
 #   ./docker/run-container.sh
 #
 # Mounts (point the host side wherever you want):
@@ -35,7 +35,7 @@ cd "$ROOT"
 mkdir -p documents photos data models config
 
 docker run --rm --gpus all \
-  --name local-search \
+  --name veda \
   -p 8080:8080 \
   -e PUID="$(id -u)" \
   -e PGID="$(id -g)" \
@@ -46,4 +46,4 @@ docker run --rm --gpus all \
   -v "$ROOT/data:/data" \
   -v "$ROOT/models:/models" \
   -v "$ROOT/config:/config" \
-  local-search serve
+  veda serve

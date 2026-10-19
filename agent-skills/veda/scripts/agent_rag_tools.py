@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tool wrappers over the local-search HTTP API, shaped for agent tool-calling.
+"""Tool wrappers over the veda HTTP API, shaped for agent tool-calling.
 
 Every function maps 1:1 to an endpoint of the read-only service (see
 docs/ARCHITECTURE.md). Nothing here mutates the corpus: ingest stays CLI-side,
@@ -57,10 +57,10 @@ def _request(method: str, path: str, body: dict | None = None, timeout: float = 
         return payload
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:300]
-        raise RuntimeError(f"local-search {method} {path} -> HTTP {e.code}: {detail}") from e
+        raise RuntimeError(f"veda {method} {path} -> HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
         raise ConnectionError(
-            f"local-search unreachable at {BASE_URL} (is `serve` running?): {e.reason}"
+            f"veda unreachable at {BASE_URL} (is `serve` running?): {e.reason}"
         ) from e
 
 

@@ -207,7 +207,7 @@ pub async fn download_models(
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("local-search/0.1")
+        .user_agent("veda/0.1")
         .build()
         .map_err(|e| Error::Other(format!("http client: {e}")))?;
 
